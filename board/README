@@ -1,0 +1,4 @@
+This fork of buildroot is intended to use in epass project
+Therefore most of the boards are removed from the repository.
+
+You can add those boards back by copying the board directory from the original buildroot repository.
