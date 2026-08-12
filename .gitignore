@@ -16,3 +16,5 @@
 /br.log
 
 __pycache__/
+
+/local.mk
