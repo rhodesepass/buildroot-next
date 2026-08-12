@@ -1,0 +1,8 @@
+config BR2_PACKAGE_HOST_USB_AIO_HANDLER
+	bool "host usb_aio_handler (usbaiohost)"
+	help
+	  PC-side USB client (pyhost) for the usb_aio_handler epass
+	  mode: file transfer, remote command exec and device info
+	  over the custom bulk protocol. Installs `usbaiohost` into
+	  $(HOST_DIR)/bin. Needs libusb-1.0 on the build machine at
+	  runtime.

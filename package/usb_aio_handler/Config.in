@@ -1,0 +1,8 @@
+config BR2_PACKAGE_USB_AIO_HANDLER
+	bool "usb_aio_handler"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	help
+	  All-in-one USB functionfs manager: greeter enumeration +
+	  on-screen function (mtp/epass/fido) + re-enumeration.
+
+	  Local source tree, override via local.mk OVERRIDE_SRCDIR.
