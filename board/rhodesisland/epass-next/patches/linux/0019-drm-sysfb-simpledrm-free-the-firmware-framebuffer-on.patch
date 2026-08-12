@@ -1,0 +1,86 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] drm/sysfb: simpledrm: free the firmware framebuffer on
+ takeover
+
+U-Boot leaves the boot logo in a /reserved-memory carveout that simpledrm
+scans out until the real sun4i-drm stack loads.  Without help that carveout
+stays reserved for the life of the system -- ~1.8M gone on a 64M board.
+
+Let the firmware opt in to getting it back: if the simple-framebuffer node
+carries srgn,free-on-takeover, hand the pages to the page allocator when
+simpledrm is removed (which is exactly the aperture eviction the real DRM
+driver performs while taking over).  Requires the carveout to not be
+no-map, so the pages still have their struct page and linear mapping;
+free_reserved_area() is the same mechanism that frees initrd memory.
+
+The PageReserved check keeps a mis-described carveout (no-map after all,
+or no reserved-memory node) from corrupting the buddy lists -- U-Boot and
+the kernel are separate projects, so treat the FDT as a system boundary.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+
+---
+diff --git a/drivers/gpu/drm/sysfb/simpledrm.c b/drivers/gpu/drm/sysfb/simpledrm.c
+index 7a95d2dac..a56dba54b 100644
+--- a/drivers/gpu/drm/sysfb/simpledrm.c
++++ b/drivers/gpu/drm/sysfb/simpledrm.c
+@@ -3,6 +3,7 @@
+ #include <linux/aperture.h>
+ #include <linux/clk.h>
+ #include <linux/minmax.h>
++#include <linux/mm.h>
+ #include <linux/of_address.h>
+ #include <linux/of_clk.h>
+ #include <linux/of_reserved_mem.h>
+@@ -856,12 +857,51 @@ static int simpledrm_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
++/*
++ * The firmware can mark its framebuffer carveout as disposable: once the
++ * real DRM driver kicks simpledrm out (this remove path), the pages go
++ * back to the page allocator instead of staying reserved forever. Only
++ * works when the /reserved-memory node has no "no-map" -- the pages must
++ * still have their struct page and linear mapping. On a 64M board the
++ * ~1.8M framebuffer is worth the trouble.
++ */
++static void simpledrm_free_fb_on_takeover(struct platform_device *pdev)
++{
++	struct device_node *np = pdev->dev.of_node;
++	struct resource *res;
++	phys_addr_t start, end;
++
++	if (!np || !of_property_read_bool(np, "srgn,free-on-takeover"))
++		return;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res)
++		return;
++
++	/* only whole pages the carveout fully owns */
++	start = PAGE_ALIGN(res->start);
++	end = (res->end + 1) & PAGE_MASK;
++	if (start >= end || !pfn_valid(PHYS_PFN(start)))
++		return;
++
++	/*
++	 * Not a memblock carveout after all (no reserved-memory node, or
++	 * no-map, or already freed): freeing would corrupt the buddy lists.
++	 */
++	if (!PageReserved(pfn_to_page(PHYS_PFN(start))))
++		return;
++
++	free_reserved_area(phys_to_virt(start), phys_to_virt(end), -1,
++			   "simpledrm framebuffer");
++}
++
+ static void simpledrm_remove(struct platform_device *pdev)
+ {
+ 	struct simpledrm_device *sdev = platform_get_drvdata(pdev);
+ 	struct drm_device *dev = &sdev->sysfb.dev;
+ 
+ 	drm_dev_unplug(dev);
++	simpledrm_free_fb_on_takeover(pdev);
+ }
+ 
+ static const struct of_device_id simpledrm_of_match_table[] = {

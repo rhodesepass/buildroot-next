@@ -1,0 +1,200 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (C) 2025 Lukas Schmid <lukas.schmid@netcube.li>
+ *
+ * D1s port of the T113-s3 board. VCC-DRAM comes off AXP209 DCDC2 and must be
+ * at 1.8V for the in-package DDR2 before the DRAM controller is touched; see
+ * CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2.
+ *
+ * sun20i-d1s.dtsi comes from dts/upstream (the Linux devicetree submodule);
+ * only this board file is local, because it is not in upstream Linux.
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+
+#include "sun20i-d1s.dtsi"
+
+/ {
+	model = "Arknights ePass Next (D1s)";
+	compatible = "rhodesisland,epass-next", "allwinner,sun20i-d1s";
+
+	aliases {
+		serial3 = &uart3;
+		spi0 = &spi0;
+	};
+
+	chosen {
+		stdout-path = "serial3:115200n8";
+	};
+
+	/*
+	 * dram_init() on RISC-V is just fdtdec_setup_mem_size_base(), so
+	 * without this node U-Boot comes up believing it has no memory. Booting
+	 * from flash the SPL overwrites it with what the controller actually
+	 * sized, which is the same 64M; the value here is what the FEL path
+	 * gets, since nothing runs the fixup there.
+	 */
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x40000000 0x4000000>;
+	};
+
+	reg_vcc3v3: regulator-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "vcc-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		regulator-always-on;
+		bootph-all;
+	};
+
+	soc {
+		/*
+		 * The C906 CLINT is M-mode only, so nothing in U-Boot or Linux
+		 * ever touches it and the upstream dtsi does not describe it.
+		 * OpenSBI still has to find it to provide SBI TIME and IPI, and
+		 * OpenSBI initialises from whichever device tree the stage that
+		 * loaded it passed -- which here is this one, not Linux's. Leave
+		 * it out and the banner reads "Platform Timer Device: --- @
+		 * 0Hz", SBI_SET_TIMER quietly does nothing, and Linux loses its
+		 * tick about a second into boot with no oops to show for it.
+		 * The Linux board dts carries the same node for the FEL path,
+		 * where OpenSBI is handed that one instead.
+		 */
+		clint: timer@14000000 {
+			compatible = "thead,c900-clint";
+			reg = <0x14000000 0x04000000>;
+			interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
+		};
+	};
+};
+
+&dcxo {
+	clock-frequency = <24000000>;
+};
+
+&mmc0 {
+	pinctrl-0 = <&mmc0_pins>;
+	pinctrl-names = "default";
+	vmmc-supply = <&reg_vcc3v3>;
+	vqmmc-supply = <&reg_vcc3v3>;
+	broken-cd;
+	disable-wp;
+	bus-width = <4>;
+	status = "okay";
+};
+
+/*
+ * Quad wiring, kept in lockstep with the Linux board dts: the dtsi's
+ * spi0_pins covers only the single-lane four, quad also drives PC6 (WP,
+ * becoming IO2) and PC7 (HOLD, becoming IO3). The pads default to 10mA and
+ * this bus is fast; the BSP's 20mA and the pull-ups on CS/WP/HOLD keep a
+ * lane from floating while the controller has it turned around as an input.
+ * The SPL is not affected: its loader muxes PC2..PC5 itself and reads
+ * single-lane.
+ */
+&pio {
+	spi0_quad_pins: spi0-quad-pins {
+		pins = "PC2", "PC4", "PC5";
+		function = "spi0";
+		drive-strength = <20>;
+		bootph-all;
+	};
+
+	spi0_quad_pu_pins: spi0-quad-pu-pins {
+		pins = "PC3", "PC6", "PC7";
+		function = "spi0";
+		drive-strength = <20>;
+		bias-pull-up;
+		bootph-all;
+	};
+};
+
+&spi0 {
+	pinctrl-0 = <&spi0_quad_pins>, <&spi0_quad_pu_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+	bootph-all;
+
+	flash@0 {
+		compatible = "spi-nand";
+		reg = <0>;
+		/*
+		 * The board is intentionally back on its 100MHz QIO baseline.
+		 * Intermittent read corruption remains a hardware follow-up item.
+		 */
+		spi-max-frequency = <100000000>;
+		spi-rx-bus-width = <4>;
+		spi-tx-bus-width = <4>;
+		bootph-all;
+
+		/*
+		 * Must stay identical to the table in the Linux board dts --
+		 * nothing checks that they agree, and DFU derives its alt
+		 * settings from this one.
+		 */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "boot0";
+				reg = <0x0 0x40000>;	/* 256K */
+				read-only;
+			};
+
+			partition@40000 {
+				label = "uboot";
+				reg = <0x40000 0x100000>;	/* 1M */
+				read-only;
+			};
+
+			partition@140000 {
+				label = "bootenv";
+				reg = <0x140000 0x20000>;	/* 128K */
+			};
+
+			partition@160000 {
+				/*
+				 * One partition holding two FITs, the way the
+				 * F1C boards do it and the way the flasher
+				 * expects: dtbs.itb in a 1M slot at the start,
+				 * kernel.itb right after it. Keeping them in
+				 * one partition means one DFU alt setting and
+				 * one image to hand the flasher.
+				 */
+				label = "boot";
+				reg = <0x160000 0xa00000>;	/* 10M */
+			};
+
+			partition@b60000 {
+				label = "rootfs";
+				reg = <0xb60000 0x1c00000>;	/* 28M */
+			};
+
+			partition@2760000 {
+				label = "data";
+				reg = <0x2760000 0x58a0000>;	/* 88.6M */
+			};
+		};
+	};
+};
+
+&uart3 {
+	pinctrl-0 = <&uart3_pb_pins>;
+	pinctrl-names = "default";
+	status = "okay";
+};
+
+&usb_otg {
+	dr_mode = "peripheral";
+	status = "okay";
+};
+
+&usbphy {
+	usb0_vbus-supply = <&reg_vcc3v3>;
+	status = "okay";
+};

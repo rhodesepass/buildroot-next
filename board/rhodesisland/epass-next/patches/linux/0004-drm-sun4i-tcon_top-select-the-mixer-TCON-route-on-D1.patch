@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shirogane Tsumugi <inapp@iccmc.cc>
+Date: Wed, 5 Aug 2026 11:53:24 +0800
+Subject: [PATCH 4/13] drm/sun4i: tcon_top: select the mixer->TCON route on
+ D1/T113
+
+TCON_TOP_PORT_SEL_REG is cleared to 0 on the grounds that some H6 registers
+come up with stray bits set. On D1/T113 that value is not a neutral reset --
+it is a routing selection, and 0 picks the wrong source, which shows up as a
+tinted image rather than an outright failure.
+
+Program 0x20 instead: DE port 0 -> TCON_LCD0, port 1 -> TCON_TV. This matches
+what the BSP does, though it gets there by read-modify-write on the
+individual fields rather than a wholesale write.
+
+Reported-by: John Watts <contact@jookia.org>
+---
+ drivers/gpu/drm/sun4i/sun8i_tcon_top.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_tcon_top.c b/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
+index 87fdac080..a44608211 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
++++ b/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
+@@ -186,7 +186,11 @@ static int sun8i_tcon_top_setup(struct platform_device *pdev)
+ 	 * At least on H6, some registers have some bits set by default
+ 	 * which may cause issues. Clear them here.
+ 	 */
+-	writel(0, regs + TCON_TOP_PORT_SEL_REG);
++	/*
++	 * T113/D1 needs the mixer->TCON routing selected here; leaving this at
++	 * 0 produces a tinted image. (John Watts, 2024-06-29)
++	 */
++	writel(0x20, regs + TCON_TOP_PORT_SEL_REG);
+ 	writel(0, regs + TCON_TOP_GATE_SRC_REG);
+ 
+ 	/*

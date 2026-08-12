@@ -1,0 +1,1166 @@
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 7/7] video: sunxi: add the srgn_splash boot logo command for the D1s
+
+The previous generation showed a logo from the moment U-Boot could scan it
+out and handed the live pipeline to the kernel with a set of driver patches
+that skipped every destructive reset. This board does it the standard way
+instead: srgn_splash brings up the whole D1 display pipeline (DE2 mixer0,
+tcon_top, TCON LCD0 in 8080/DSI mode, the DSI host, the D-PHY) and runs the
+panel's DCS init sequence, then describes the framebuffer to the kernel as a
+/chosen simple-framebuffer node plus a no-map reserved-memory carveout.
+Linux's built-in simpledrm adopts it with zero kernel patches, and the real
+sun4i DRM stack -- built as modules, loaded by the app supervisor -- replaces
+it right before the app draws its first frame. The one thing that cannot be
+avoided without patching the kernel is the ~0.4s blank while the ST7703 goes
+through its mandatory reset and sleep-out; deferring the module load parks
+that blank next to the app's startup instead of the middle of the boot.
+
+Panel parameters live in the merged control FDT (srgn,panel-timing,
+srgn,dsi-lanes, srgn,init-sequence, plus the reset-gpios and backlight pwms
+the tree already carries), so a different screen stays a device tree overlay
+and a logo image, not a U-Boot rebuild.
+
+Register sequences follow the mainline Linux drivers (sun8i_mixer,
+sun4i_tcon, sun6i_mipi_dsi, phy-sun6i-mipi-dphy, ccu-sun20i-d1) rather than
+the Allwinner BSP. The clocking keeps the TCON and the D-PHY in exact
+agreement by deriving both from the same 24 MHz maths: PLL_VIDEO0 runs at
+4x the per-lane bit rate so its /4 tap feeds tcon-lcd0 directly, and the
+D-PHY's own PLL is programmed to the identical rate.
+---
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 43d0ba33..dcac1d4b 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -46,6 +46,9 @@ obj-$(CONFIG_$(PHASE_)NVME) += nvme/
+ obj-$(CONFIG_XEN) += xen/
+ obj-$(CONFIG_$(PHASE_)FPGA) += fpga/
+ obj-$(CONFIG_$(PHASE_)VIDEO) += video/
++# srgn_splash drives the display with raw register writes, no video uclass --
++# it needs the directory without the rest of CONFIG_VIDEO.
++obj-$(CONFIG_SRGN_SPLASH) += video/
+ 
+ obj-y += bus/
+ 
+diff --git a/drivers/video/Kconfig b/drivers/video/Kconfig
+index c2acc131..6e9b1149 100644
+--- a/drivers/video/Kconfig
++++ b/drivers/video/Kconfig
+@@ -1417,4 +1417,15 @@ config SPL_HIDE_LOGO_VERSION
+       Enable this option to hide this information.
+ endif
+ 
++config SRGN_SPLASH
++	bool "srgn_splash boot logo command for D1s MIPI-DSI panels"
++	depends on BOARD_SUNXI && RISCV
++	help
++	  Adds the srgn_splash command, which brings up the D1/D1s display
++	  pipeline (DE2 mixer, TCON, DSI host, D-PHY), runs the panel DCS
++	  init sequence out of the control device tree, scans out an
++	  RGB565 framebuffer, and describes it to the kernel as a standard
++	  simple-framebuffer node so simpledrm keeps the logo alive until
++	  the real DRM stack takes over.
++
+ endmenu
+diff --git a/drivers/video/sunxi/Makefile b/drivers/video/sunxi/Makefile
+index 43216733..b0a805d5 100644
+--- a/drivers/video/sunxi/Makefile
++++ b/drivers/video/sunxi/Makefile
+@@ -5,3 +5,4 @@
+ 
+ obj-$(CONFIG_VIDEO_SUNXI) += sunxi_display.o simplefb_common.o lcdc.o tve_common.o ../videomodes.o
+ obj-$(CONFIG_VIDEO_DE2) += sunxi_de2.o sunxi_dw_hdmi.o simplefb_common.o lcdc.o sunxi_lcd.o
++obj-$(CONFIG_SRGN_SPLASH) += srgn_splash.o
+diff --git a/drivers/video/sunxi/srgn_splash.c b/drivers/video/sunxi/srgn_splash.c
+new file mode 100644
+index 00000000..190d1ce2
+--- /dev/null
++++ b/drivers/video/sunxi/srgn_splash.c
+@@ -0,0 +1,1088 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * srgn_splash - boot logo scanout for the Arknights ePass Next (D1s).
++ *
++ * Brings up the whole D1 display pipeline from cold iron:
++ *
++ *   PLL_VIDEO0 -> tcon-lcd0 clk -> TCON LCD0 (8080/DSI mode)
++ *   PLL_PERIPH0 -> DE clk -> DE2 mixer0 (UI channel, RGB565 scanout)
++ *   mixer0 -> tcon_top -> tcon_lcd0 -> DSI host -> D-PHY -> panel
++ *
++ * then leaves it scanning a caller-provided RGB565 framebuffer and
++ * describes it to the kernel as a standard /chosen simple-framebuffer
++ * node plus a /reserved-memory carveout. Linux simpledrm picks it up;
++ * the real sun4i-drm stack replaces it whenever its modules get loaded.
++ * The carveout deliberately has no "no-map": the pages keep their
++ * struct page and linear mapping, so the srgn,free-on-takeover hook in
++ * simpledrm can hand them back to the page allocator once the takeover
++ * happens (with no-map they would be unmapped and lost for good).
++ *
++ * Panel parameters (timing, lane count, DCS init sequence, reset GPIO)
++ * are read from the merged control FDT so screen variants stay a device
++ * tree overlay, not a U-Boot rebuild. Register sequences follow the
++ * mainline Linux drivers (sun8i_mixer, sun4i_tcon, sun6i_mipi_dsi,
++ * phy-sun6i-mipi-dphy) rather than the Allwinner BSP.
++ *
++ * usage: srgn_splash <fdt addr> <framebuffer addr>
++ */
++
++#include <command.h>
++#include <cpu_func.h>
++#include <env.h>
++#include <fdt_support.h>
++#include <lmb.h>
++#include <linux/delay.h>
++#include <linux/iopoll.h>
++#include <linux/kernel.h>
++#include <linux/libfdt.h>
++#include <linux/log2.h>
++#include <asm/io.h>
++
++/* ---- SoC blocks (D1/D1s) ---------------------------------------- */
++
++#define D1_CCU_BASE		((void __iomem *)0x02001000UL)
++#define D1_PIO_BASE		((void __iomem *)0x02000000UL)
++#define D1_PWM_BASE		((void __iomem *)0x02000c00UL)
++#define D1_DE2_CCU_BASE		((void __iomem *)0x05000000UL)
++#define D1_MIXER0_BASE		((void __iomem *)0x05100000UL)
++#define D1_DSI_BASE		((void __iomem *)0x05450000UL)
++#define D1_DPHY_BASE		((void __iomem *)0x05451000UL)
++#define D1_TCON_TOP_BASE	((void __iomem *)0x05460000UL)
++#define D1_TCON_LCD0_BASE	((void __iomem *)0x05461000UL)
++
++/* main CCU */
++#define CCU_PLL_VIDEO0_CTRL	0x040
++#define CCU_DE_CLK		0x600
++#define CCU_DE_BGR		0x60c
++#define CCU_PWM_BGR		0x7ac
++#define CCU_DPSS_TOP_BGR	0xabc
++#define CCU_DSI_CLK		0xb24
++#define CCU_DSI_BGR		0xb4c
++#define CCU_TCONLCD_CLK		0xb60
++#define CCU_TCONLCD_BGR		0xb7c
++
++#define CCU_BGR_GATE		BIT(0)
++#define CCU_BGR_RST		BIT(16)
++#define CCU_CLK_ON		BIT(31)
++
++/* DE2 clock unit (inside the DE block) */
++#define DE2_CLK_GATE		0x00
++#define DE2_BUS_GATE		0x04
++#define DE2_RST			0x08
++#define DE2_CLK_DIV		0x0c
++
++/* mixer0: DE2 layout, 1 VI + 1 UI channel -> UI channel index 1 */
++#define MIXER_GLOBAL_CTL	0x0
++#define MIXER_GLOBAL_DBUFF	0x8
++#define MIXER_GLOBAL_SIZE	0xc
++#define MIXER_BLD_BASE		0x1000
++#define MIXER_BLD_PIPE_CTL	(MIXER_BLD_BASE + 0x0)
++#define MIXER_BLD_FCOLOR(x)	(MIXER_BLD_BASE + 0x4 + 0x10 * (x))
++#define MIXER_BLD_INSIZE(x)	(MIXER_BLD_BASE + 0x8 + 0x10 * (x))
++#define MIXER_BLD_COORD(x)	(MIXER_BLD_BASE + 0xc + 0x10 * (x))
++#define MIXER_BLD_ROUTE		(MIXER_BLD_BASE + 0x80)
++#define MIXER_BLD_BKCOLOR	(MIXER_BLD_BASE + 0x88)
++#define MIXER_BLD_OUTSIZE	(MIXER_BLD_BASE + 0x8c)
++#define MIXER_BLD_MODE(x)	(MIXER_BLD_BASE + 0x90 + 0x4 * (x))
++#define MIXER_UI_CH		0x3000	/* 0x2000 + 1 * 0x1000 */
++#define MIXER_UI_ATTR		(MIXER_UI_CH + 0x00)
++#define MIXER_UI_SIZE		(MIXER_UI_CH + 0x04)
++#define MIXER_UI_COORD		(MIXER_UI_CH + 0x08)
++#define MIXER_UI_PITCH		(MIXER_UI_CH + 0x0c)
++#define MIXER_UI_TOP_LADDR	(MIXER_UI_CH + 0x10)
++#define MIXER_UI_OVL_SIZE	(MIXER_UI_CH + 0x88)
++
++#define MIXER_FBFMT_RGB565	10
++#define MIXER_BLD_MODE_DEF	0x03010301
++#define MIXER_COLOR_BLACK	0xff000000
++
++/* tcon_top */
++#define TCON_TOP_PORT_SEL	0x1c
++#define TCON_TOP_GATE_SRC	0x20
++#define TCON_TOP_GATE_DSI	BIT(16)
++/* mixer0 -> tcon_lcd0 on D1, same value the kernel-side patch uses */
++#define TCON_TOP_PORT_SEL_D1	0x20
++
++/* TCON (sun4i_tcon.h names) */
++#define TCON_GCTL		0x00
++#define TCON_GCTL_EN			BIT(31)
++#define TCON_GINT0		0x04
++#define TCON0_CTL		0x40
++#define TCON0_CTL_EN			BIT(31)
++#define TCON0_CTL_IF_8080		(1 << 24)
++#define TCON0_DCLK		0x44
++#define TCON0_DCLK_GATE			BIT(31)
++#define TCON0_BASIC0		0x48
++#define TCON0_CPU_IF		0x60
++#define TCON0_CPU_IF_MODE_DSI		(1 << 28)
++#define TCON0_CPU_IF_TRI_FIFO_FLUSH	BIT(16)
++#define TCON0_CPU_IF_TRI_FIFO_EN	BIT(2)
++#define TCON0_CPU_IF_TRI_EN		BIT(0)
++#define TCON0_IO_TRI		0x8c
++#define TCON_ECC_FIFO		0xf8
++#define TCON_ECC_FIFO_EN		BIT(3)
++#define TCON0_CPU_TRI0		0x160
++#define TCON0_CPU_TRI1		0x164
++#define TCON0_CPU_TRI2		0x168
++#define TCON_SAFE_PERIOD	0x1f0
++
++#define TCON_DIV		4	/* SUN6I_DSI_TCON_DIV */
++
++/* DSI host (sun6i_mipi_dsi.c names) */
++#define DSI_CTL			0x000
++#define DSI_CTL_EN			BIT(0)
++#define DSI_BASIC_CTL		0x00c
++#define DSI_BASIC_CTL0		0x010
++#define DSI_BASIC_CTL0_CRC_EN		BIT(17)
++#define DSI_BASIC_CTL0_ECC_EN		BIT(16)
++#define DSI_BASIC_CTL0_INST_ST		BIT(0)
++#define DSI_BASIC_CTL1		0x014
++#define DSI_BASIC_SIZE0		0x018
++#define DSI_BASIC_SIZE1		0x01c
++#define DSI_INST_FUNC(n)	(0x020 + (n) * 0x04)
++#define DSI_INST_FUNC_LANE_CEN		BIT(4)
++#define DSI_INST_LOOP_SEL	0x040
++#define DSI_INST_LOOP_NUM(n)	(0x044 + (n) * 0x10)
++#define DSI_INST_JUMP_SEL	0x048
++#define DSI_INST_JUMP_CFG(n)	(0x04c + (n) * 0x04)
++#define DSI_TRANS_START		0x060
++#define DSI_TRANS_ZERO		0x078
++#define DSI_TCON_DRQ		0x07c
++#define DSI_PIXEL_CTL0		0x080
++#define DSI_PIXEL_PH		0x090
++#define DSI_PIXEL_PF0		0x098
++#define DSI_PIXEL_PF1		0x09c
++#define DSI_SYNC_HSS		0x0b0
++#define DSI_SYNC_HSE		0x0b4
++#define DSI_SYNC_VSS		0x0b8
++#define DSI_SYNC_VSE		0x0bc
++#define DSI_BLK_HSA0		0x0c0
++#define DSI_BLK_HSA1		0x0c4
++#define DSI_BLK_HBP0		0x0c8
++#define DSI_BLK_HBP1		0x0cc
++#define DSI_BLK_HFP0		0x0d0
++#define DSI_BLK_HFP1		0x0d4
++#define DSI_BLK_HBLK0		0x0e0
++#define DSI_BLK_HBLK1		0x0e4
++#define DSI_BLK_VBLK0		0x0e8
++#define DSI_BLK_VBLK1		0x0ec
++#define DSI_CMD_CTL		0x200
++#define DSI_CMD_CTL_RX_OVERFLOW		BIT(26)
++#define DSI_CMD_CTL_RX_FLAG		BIT(25)
++#define DSI_CMD_CTL_TX_FLAG		BIT(9)
++#define DSI_DEBUG_DATA		0x2f8
++#define DSI_CMD_TX(n)		(0x300 + (n) * 0x04)
++
++/* DSI instruction engine IDs */
++#define INST_LP11		0
++#define INST_TBA		1
++#define INST_HSC		2
++#define INST_HSD		3
++#define INST_LPDT		4
++#define INST_HSCEXIT		5
++#define INST_NOP		6
++#define INST_DLY		7
++#define INST_END		15
++
++#define INST_MODE_STOP		0
++#define INST_MODE_TBA		1
++#define INST_MODE_HS		2
++#define INST_MODE_ESCAPE	3
++#define INST_MODE_HSCEXIT	4
++#define INST_MODE_NOP		5
++
++/* MIPI data types */
++#define DT_VSS			0x01
++#define DT_VSE			0x11
++#define DT_HSS			0x21
++#define DT_HSE			0x31
++#define DT_BLANKING		0x19
++#define DT_PIXEL_RGB888		0x3e
++#define DT_DCS_SHORT_WRITE	0x05
++#define DT_DCS_SHORT_WRITE_1	0x15
++#define DT_DCS_LONG_WRITE	0x39
++
++/* D-PHY (phy-sun6i-mipi-dphy.c names, A100/D1 variant) */
++#define DPHY_GCTL		0x00
++#define DPHY_TX_CTL		0x04
++#define DPHY_TX_TIME0		0x10
++#define DPHY_TX_TIME1		0x14
++#define DPHY_TX_TIME2		0x18
++#define DPHY_TX_TIME3		0x1c
++#define DPHY_TX_TIME4		0x20
++#define DPHY_ANA0		0x4c
++#define DPHY_ANA1		0x50
++#define DPHY_ANA1_VTTMODE		BIT(31)
++#define DPHY_ANA2		0x54
++#define DPHY_ANA2_EN_P2S_CPU(n)		(((n) & 0xf) << 24)
++#define DPHY_ANA2_EN_CK_CPU		BIT(4)
++#define DPHY_ANA2_ENIB			BIT(1)
++#define DPHY_ANA3		0x58
++#define DPHY_ANA3_EN_VTTD(n)		(((n) & 0xf) << 28)
++#define DPHY_ANA3_EN_VTTC		BIT(27)
++#define DPHY_ANA3_EN_DIV		BIT(26)
++#define DPHY_ANA3_EN_LDOC		BIT(25)
++#define DPHY_ANA3_EN_LDOD		BIT(24)
++#define DPHY_ANA3_EN_LDOR		BIT(18)
++#define DPHY_ANA4		0x5c
++#define DPHY_ANA4_EN_MIPI		BIT(31)
++#define DPHY_PLL_REG0		0x104
++#define DPHY_PLL_REG0_CP36_EN		BIT(23)
++#define DPHY_PLL_REG0_LDO_EN		BIT(22)
++#define DPHY_PLL_REG0_EN_LVS		BIT(21)
++#define DPHY_PLL_REG0_PLL_EN		BIT(20)
++#define DPHY_PLL_REG0_P(n)		(((n) & 0xf) << 16)
++#define DPHY_PLL_REG0_N(n)		(((n) & 0xff) << 8)
++#define DPHY_PLL_REG0_NDET		BIT(7)
++#define DPHY_PLL_REG0_M0(n)		(((n) & 3) << 4)
++#define DPHY_PLL_REG0_M1(n)		((n) & 0xf)
++#define DPHY_PLL_REG2		0x10c
++#define DPHY_COMBO_REG0		0x110
++#define DPHY_COMBO_REG0_EN_MIPI		BIT(3)
++#define DPHY_COMBO_REG0_EN_COMBOLDO	BIT(1)
++#define DPHY_COMBO_REG0_EN_CP		BIT(0)
++#define DPHY_COMBO_REG2		0x118
++
++/* PIO, D1 "new" layout: 0x30 per port, 4 bits per pin in CFG/DRV */
++#define PIO_PORT(p)		(D1_PIO_BASE + (p) * 0x30)
++#define PIO_CFG(p, pin)		(PIO_PORT(p) + 0x00 + ((pin) / 8) * 4)
++#define PIO_DAT(p)		(PIO_PORT(p) + 0x10)
++#define PIO_DRV(p, pin)		(PIO_PORT(p) + 0x14 + ((pin) / 8) * 4)
++#define PIO_BANK_D		3
++
++#define PIN_FUNC_DSI		4	/* PD0-PD9 */
++#define PIN_FUNC_PWM4		5	/* PD20 */
++#define PIN_FUNC_GPIO_OUT	1
++
++/* D1 PWM block (matches the pwm-sun20i kernel driver) */
++#define PWM_CLK_CFG(pair)	(0x20 + (pair) * 0x4)
++#define PWM_CLK_GATE		0x40
++#define PWM_ENABLE		0x80
++#define PWM_CTL(ch)		(0x100 + (ch) * 0x20)
++#define PWM_CTL_ACT_STA			BIT(8)
++#define PWM_PERIOD(ch)		(0x104 + (ch) * 0x20)
++
++/* ---- panel description parsed out of the control FDT ------------- */
++
++#define SPLASH_MAX_INIT		512
++
++struct splash_panel {
++	/* nominal timings from srgn,panel-timing */
++	u32 pclk_khz;
++	u32 hact, hfp, hslen, hbp;
++	u32 vact, vfp, vslen, vbp;
++	u32 lanes;
++
++	/* derived */
++	u32 htotal, vtotal;
++	u32 hsync_start, hsync_end;
++	u32 vsync_start, vsync_end;
++	u32 hsclk_khz;		/* actual per-lane bit clock after PLL rounding */
++
++	/* [delay_ms len payload...]* out of srgn,init-sequence */
++	const u8 *init;
++	int init_len;
++
++	/* panel reset GPIO (bank/pin within PIO), active low assumed */
++	int rst_bank, rst_pin;
++
++	/* backlight PWM channel + period */
++	int pwm_ch;
++	u32 pwm_period_ns;
++};
++
++static void reg_setclr(void __iomem *addr, u32 set, u32 clr)
++{
++	writel((readl(addr) & ~clr) | set, addr);
++}
++
++/* ---- MIPI packet helpers (ECC + reflected CRC16, kernel crc_ccitt) */
++
++static const u32 dsi_ecc_array[6] = {
++	0x00f12cb7, 0x00f2555b, 0x0074e66d, 0x00b8e38e, 0x00dff0f0, 0x00eeff00,
++};
++
++static u8 dsi_ecc(u32 data)
++{
++	u8 ecc = 0;
++	int i;
++
++	for (i = 0; i < 6; i++) {
++		u32 v = data & dsi_ecc_array[i];
++
++		/* parity of the masked bits */
++		v ^= v >> 16;
++		v ^= v >> 8;
++		v ^= v >> 4;
++		v ^= v >> 2;
++		v ^= v >> 1;
++		ecc |= (v & 1) << i;
++	}
++
++	return ecc;
++}
++
++/* Reflected CRC-16/CCITT (poly 0x8408, init 0xffff), what DSI wants.
++ * U-Boot's lib crc16_ccitt() is the MSB-first variant, so roll our own. */
++static u16 dsi_crc(const u8 *buf, int len)
++{
++	u16 crc = 0xffff;
++	int i, j;
++
++	for (i = 0; i < len; i++) {
++		crc ^= buf[i];
++		for (j = 0; j < 8; j++)
++			crc = (crc >> 1) ^ ((crc & 1) ? 0x8408 : 0);
++	}
++
++	return crc;
++}
++
++static u16 dsi_crc_repeat(u8 pd, int len)
++{
++	u16 crc = 0xffff;
++	int i, j;
++
++	for (i = 0; i < len; i++) {
++		crc ^= pd;
++		for (j = 0; j < 8; j++)
++			crc = (crc >> 1) ^ ((crc & 1) ? 0x8408 : 0);
++	}
++
++	return crc;
++}
++
++static u32 dsi_sync_pkt(u8 dt)
++{
++	u32 val = dt & 0x3f;	/* vc 0, d0 = d1 = 0 */
++
++	return val | dsi_ecc(val) << 24;
++}
++
++static u32 dsi_blk0_pkt(u16 wc)
++{
++	u32 val = DT_BLANKING | (wc & 0xff) << 8 | (wc >> 8) << 16;
++
++	return val | dsi_ecc(val) << 24;
++}
++
++static u32 dsi_blk1_pkt(u16 pd, int len)
++{
++	return (pd & 0xff) | dsi_crc_repeat(pd, len) << 16;
++}
++
++/* ---- FDT parsing -------------------------------------------------- */
++
++static int splash_parse_fdt(void *fdt, struct splash_panel *p)
++{
++	const fdt32_t *prop;
++	const u8 *seq;
++	int node, len, depth = 0;
++
++	/* the panel node is whichever one the screen overlay tagged */
++	for (node = fdt_next_node(fdt, 0, &depth); node >= 0;
++	     node = fdt_next_node(fdt, node, &depth)) {
++		if (fdt_getprop(fdt, node, "srgn,panel-timing", NULL))
++			break;
++	}
++	if (node < 0) {
++		printf("srgn_splash: no srgn,panel-timing in dtb\n");
++		return -1;
++	}
++
++	prop = fdt_getprop(fdt, node, "srgn,panel-timing", &len);
++	if (!prop || len < 9 * (int)sizeof(fdt32_t)) {
++		printf("srgn_splash: bad srgn,panel-timing\n");
++		return -1;
++	}
++	p->pclk_khz = fdt32_to_cpu(prop[0]);
++	p->hact  = fdt32_to_cpu(prop[1]);
++	p->hfp   = fdt32_to_cpu(prop[2]);
++	p->hslen = fdt32_to_cpu(prop[3]);
++	p->hbp   = fdt32_to_cpu(prop[4]);
++	p->vact  = fdt32_to_cpu(prop[5]);
++	p->vfp   = fdt32_to_cpu(prop[6]);
++	p->vslen = fdt32_to_cpu(prop[7]);
++	p->vbp   = fdt32_to_cpu(prop[8]);
++
++	prop = fdt_getprop(fdt, node, "srgn,dsi-lanes", &len);
++	p->lanes = prop ? fdt32_to_cpu(prop[0]) : 4;
++
++	seq = fdt_getprop(fdt, node, "srgn,init-sequence", &p->init_len);
++	if (!seq || p->init_len < 2 || p->init_len > SPLASH_MAX_INIT) {
++		printf("srgn_splash: bad srgn,init-sequence\n");
++		return -1;
++	}
++	p->init = seq;
++
++	/* reset-gpios = <&pio bank pin flags>; phandle assumed to be &pio */
++	prop = fdt_getprop(fdt, node, "reset-gpios", &len);
++	if (!prop || len < 4 * (int)sizeof(fdt32_t)) {
++		printf("srgn_splash: no reset-gpios on panel\n");
++		return -1;
++	}
++	p->rst_bank = fdt32_to_cpu(prop[1]);
++	p->rst_pin = fdt32_to_cpu(prop[2]);
++
++	/* backlight: pwms = <&pwm ch period flags> */
++	p->pwm_ch = -1;
++	node = fdt_node_offset_by_compatible(fdt, -1, "pwm-backlight");
++	if (node >= 0) {
++		prop = fdt_getprop(fdt, node, "pwms", &len);
++		if (prop && len >= 3 * (int)sizeof(fdt32_t)) {
++			p->pwm_ch = fdt32_to_cpu(prop[1]);
++			p->pwm_period_ns = fdt32_to_cpu(prop[2]);
++		}
++	}
++
++	p->hsync_start = p->hact + p->hfp;
++	p->hsync_end = p->hsync_start + p->hslen;
++	p->htotal = p->hsync_end + p->hbp;
++	p->vsync_start = p->vact + p->vfp;
++	p->vsync_end = p->vsync_start + p->vslen;
++	p->vtotal = p->vsync_end + p->vbp;
++
++	return 0;
++}
++
++/* ---- clock tree ---------------------------------------------------- */
++
++static int splash_clocks_on(struct splash_panel *p)
++{
++	u32 hsclk_khz = p->pclk_khz * 24 / p->lanes;	/* RGB888 only */
++	u32 n, val;
++	int ret;
++
++	/*
++	 * PLL_VIDEO0 makes 24 MHz * N; the /4 tap feeds tcon-lcd0. The
++	 * per-lane bit clock therefore snaps to a multiple of 6 MHz;
++	 * the D-PHY PLL below is programmed from the same value so both
++	 * ends agree exactly.
++	 */
++	n = DIV_ROUND_CLOSEST(hsclk_khz * 4, 24000);
++	if (n < 11 || n > 100) {
++		printf("srgn_splash: pixel clock out of range\n");
++		return -1;
++	}
++	p->hsclk_khz = n * 6000;
++
++	val = readl(D1_CCU_BASE + CCU_PLL_VIDEO0_CTRL);
++	val &= ~(0xff << 8 | BIT(1));		/* N field, input div M */
++	val |= (n - 1) << 8;
++	val |= BIT(31) | BIT(30) | BIT(29) | BIT(27); /* EN, LDO, lock_en, gate */
++	writel(val, D1_CCU_BASE + CCU_PLL_VIDEO0_CTRL);
++
++	ret = readl_poll_timeout(D1_CCU_BASE + CCU_PLL_VIDEO0_CTRL, val,
++				 val & BIT(28), 10000);
++	if (ret) {
++		printf("srgn_splash: PLL_VIDEO0 didn't lock\n");
++		return -1;
++	}
++
++	/* DE @ 300 MHz off PLL_PERIPH0(2X) = 1.2 GHz */
++	writel(CCU_BGR_GATE | CCU_BGR_RST, D1_CCU_BASE + CCU_DE_BGR);
++	writel(CCU_CLK_ON | (4 - 1), D1_CCU_BASE + CCU_DE_CLK);
++
++	/* DE2 internal unit: ungate + release mixer0, divider /1 */
++	setbits_le32(D1_DE2_CCU_BASE + DE2_RST, BIT(0));
++	setbits_le32(D1_DE2_CCU_BASE + DE2_BUS_GATE, BIT(0));
++	setbits_le32(D1_DE2_CCU_BASE + DE2_CLK_GATE, BIT(0));
++	clrbits_le32(D1_DE2_CCU_BASE + DE2_CLK_DIV, 0xf);
++
++	/* dpss_top must be alive for tcon_top to answer */
++	writel(CCU_BGR_GATE | CCU_BGR_RST, D1_CCU_BASE + CCU_DPSS_TOP_BGR);
++
++	/* tcon-lcd0 sclk = PLL_VIDEO0(1X) = per-lane bit clock */
++	writel(CCU_BGR_GATE | CCU_BGR_RST, D1_CCU_BASE + CCU_TCONLCD_BGR);
++	writel(CCU_CLK_ON | (0 << 24), D1_CCU_BASE + CCU_TCONLCD_CLK);
++
++	/* DSI mod clock 150 MHz off PLL_PERIPH0(1X) = 600 MHz */
++	writel(CCU_BGR_GATE | CCU_BGR_RST, D1_CCU_BASE + CCU_DSI_BGR);
++	writel(CCU_CLK_ON | (1 << 24) | (4 - 1), D1_CCU_BASE + CCU_DSI_CLK);
++
++	/* PWM bus clock for the backlight */
++	writel(CCU_BGR_GATE | CCU_BGR_RST, D1_CCU_BASE + CCU_PWM_BGR);
++
++	return 0;
++}
++
++/* ---- pinmux -------------------------------------------------------- */
++
++static void pio_set_func(int bank, int pin, int func)
++{
++	void __iomem *reg = PIO_CFG(bank, pin);
++	int shift = (pin % 8) * 4;
++
++	reg_setclr(reg, (u32)func << shift, 0xfU << shift);
++}
++
++static void pio_set_drive(int bank, int pin, int level)
++{
++	void __iomem *reg = PIO_DRV(bank, pin);
++	int shift = (pin % 8) * 4;
++
++	reg_setclr(reg, (u32)level << shift, 0xfU << shift);
++}
++
++static void pio_set_output(int bank, int pin, int value)
++{
++	pio_set_func(bank, pin, PIN_FUNC_GPIO_OUT);
++	reg_setclr(PIO_DAT(bank), value ? BIT(pin) : 0, BIT(pin));
++}
++
++static void splash_pinmux(struct splash_panel *p)
++{
++	int i;
++
++	/* PD0-PD9: DSI pads, drive level 3 (dts asks for 30 mA) */
++	for (i = 0; i <= 9; i++) {
++		pio_set_func(PIO_BANK_D, i, PIN_FUNC_DSI);
++		pio_set_drive(PIO_BANK_D, i, 3);
++	}
++}
++
++/* ---- DE2 mixer ------------------------------------------------------ */
++
++static void splash_mixer_setup(struct splash_panel *p, ulong fb)
++{
++	void __iomem *m = D1_MIXER0_BASE;
++	u32 size = (p->vact - 1) << 16 | (p->hact - 1);
++	int i;
++
++	writel(1, m + MIXER_GLOBAL_CTL);	/* RT_EN */
++
++	writel(MIXER_COLOR_BLACK, m + MIXER_BLD_BKCOLOR);
++	writel(MIXER_COLOR_BLACK, m + MIXER_BLD_FCOLOR(0));
++	for (i = 0; i < 2; i++)			/* 1 VI + 1 UI channel */
++		writel(MIXER_BLD_MODE_DEF, m + MIXER_BLD_MODE(i));
++
++	/* UI channel 1, overlay 0: opaque RGB565 covering the screen */
++	writel(0xff000000 | MIXER_FBFMT_RGB565 << 8 | BIT(1) | BIT(0),
++	       m + MIXER_UI_ATTR);
++	writel(size, m + MIXER_UI_SIZE);
++	writel(0, m + MIXER_UI_COORD);
++	writel(p->hact * 2, m + MIXER_UI_PITCH);
++	writel((u32)fb, m + MIXER_UI_TOP_LADDR);
++	writel(size, m + MIXER_UI_OVL_SIZE);
++
++	/* blender pipe 0 <- channel 1 */
++	writel(1, m + MIXER_BLD_ROUTE);
++	writel(BIT(8) | BIT(0), m + MIXER_BLD_PIPE_CTL);
++	writel(size, m + MIXER_BLD_INSIZE(0));
++	writel(0, m + MIXER_BLD_COORD(0));
++	writel(size, m + MIXER_BLD_OUTSIZE);
++	writel(size, m + MIXER_GLOBAL_SIZE);
++
++	writel(1, m + MIXER_GLOBAL_DBUFF);	/* commit */
++}
++
++/* ---- TCON ------------------------------------------------------------ */
++
++static void splash_tcon_setup(struct splash_panel *p)
++{
++	void __iomem *t = D1_TCON_LCD0_BASE;
++	u32 block_space, start_delay;
++
++	/* route mixer0 -> tcon_lcd0 and feed the DSI src gate */
++	writel(TCON_TOP_PORT_SEL_D1, D1_TCON_TOP_BASE + TCON_TOP_PORT_SEL);
++	setbits_le32(D1_TCON_TOP_BASE + TCON_TOP_GATE_SRC, TCON_TOP_GATE_DSI);
++
++	writel(0, t + TCON_GINT0);
++
++	writel((p->hact - 1) << 16 | (p->vact - 1), t + TCON0_BASIC0);
++	writel(TCON0_CTL_IF_8080, t + TCON0_CTL);
++	writel(TCON_ECC_FIFO_EN, t + TCON_ECC_FIFO);
++	writel(TCON0_CPU_IF_MODE_DSI | TCON0_CPU_IF_TRI_FIFO_FLUSH |
++	       TCON0_CPU_IF_TRI_FIFO_EN | TCON0_CPU_IF_TRI_EN,
++	       t + TCON0_CPU_IF);
++
++	/* dclk = sclk / 4, gate on */
++	writel(TCON0_DCLK_GATE | TCON_DIV, t + TCON0_DCLK);
++
++	block_space = p->htotal * 24 / (TCON_DIV * p->lanes);
++	block_space -= p->hact + 40;
++	writel((block_space - 1) << 16 | (p->hact - 1), t + TCON0_CPU_TRI0);
++	writel(p->vact - 1, t + TCON0_CPU_TRI1);
++
++	start_delay = p->vtotal - p->vact - 10 - 1;
++	start_delay = start_delay * p->htotal * 149;
++	start_delay = start_delay / (p->pclk_khz / 1000) / 8;
++	writel(start_delay << 16 | 10, t + TCON0_CPU_TRI2);
++
++	writel(3000 << 16 | 3, t + TCON_SAFE_PERIOD);
++	writel(0xe0000000, t + TCON0_IO_TRI);
++
++	/* global + channel 0 enable */
++	setbits_le32(t + TCON_GCTL, TCON_GCTL_EN);
++	setbits_le32(t + TCON0_CTL, TCON0_CTL_EN);
++}
++
++/* ---- DSI host --------------------------------------------------------- */
++
++static void dsi_inst_setup(int id, int mode, bool clock, u8 data,
++			   int packet, int escape)
++{
++	writel((u32)mode << 28 | (u32)escape << 24 | (u32)packet << 20 |
++	       (clock ? DSI_INST_FUNC_LANE_CEN : 0) | (data & 0xf),
++	       D1_DSI_BASE + DSI_INST_FUNC(id));
++}
++
++static void dsi_inst_abort(void)
++{
++	clrbits_le32(D1_DSI_BASE + DSI_BASIC_CTL0, DSI_BASIC_CTL0_INST_ST);
++}
++
++static void dsi_inst_commit(void)
++{
++	setbits_le32(D1_DSI_BASE + DSI_BASIC_CTL0, DSI_BASIC_CTL0_INST_ST);
++}
++
++static int dsi_inst_wait(void)
++{
++	u32 val;
++
++	return readl_poll_timeout(D1_DSI_BASE + DSI_BASIC_CTL0, val,
++				  !(val & DSI_BASIC_CTL0_INST_ST), 5000);
++}
++
++enum dsi_start { DSI_START_LPTX, DSI_START_HSC, DSI_START_HSD };
++
++static void dsi_start(enum dsi_start func)
++{
++	u32 sel;
++
++	switch (func) {
++	case DSI_START_LPTX:
++		sel = INST_LPDT << (4 * INST_LP11) |
++		      INST_END << (4 * INST_LPDT);
++		break;
++	case DSI_START_HSC:
++		sel = INST_HSC << (4 * INST_LP11) |
++		      INST_END << (4 * INST_HSC);
++		break;
++	case DSI_START_HSD:
++		sel = INST_NOP << (4 * INST_LP11) |
++		      INST_HSD << (4 * INST_NOP) |
++		      INST_DLY << (4 * INST_HSD) |
++		      INST_NOP << (4 * INST_DLY) |
++		      INST_END << (4 * INST_HSCEXIT);
++		break;
++	}
++
++	writel(sel, D1_DSI_BASE + DSI_INST_JUMP_SEL);
++	dsi_inst_abort();
++	dsi_inst_commit();
++
++	/* once the HS clock runs, LP11 must stop driving the clock lane */
++	if (func == DSI_START_HSC)
++		clrbits_le32(D1_DSI_BASE + DSI_INST_FUNC(INST_LP11),
++			     DSI_INST_FUNC_LANE_CEN);
++}
++
++static int dsi_dcs_write(const u8 *buf, int len)
++{
++	u32 hdr;
++	int i;
++
++	if (dsi_inst_wait())
++		dsi_inst_abort();
++
++	writel(DSI_CMD_CTL_RX_OVERFLOW | DSI_CMD_CTL_RX_FLAG |
++	       DSI_CMD_CTL_TX_FLAG, D1_DSI_BASE + DSI_CMD_CTL);
++
++	if (len <= 2) {
++		hdr = (len == 1) ? DT_DCS_SHORT_WRITE : DT_DCS_SHORT_WRITE_1;
++		hdr |= buf[0] << 8;
++		if (len > 1)
++			hdr |= buf[1] << 16;
++		hdr |= dsi_ecc(hdr) << 24;
++		writel(hdr, D1_DSI_BASE + DSI_CMD_TX(0));
++		writel(4 - 1, D1_DSI_BASE + DSI_CMD_CTL);
++	} else {
++		u8 bounce[SPLASH_MAX_INIT + 2];
++		u16 crc = dsi_crc(buf, len);
++		int total = len + 2;
++
++		hdr = DT_DCS_LONG_WRITE | (len & 0xff) << 8 |
++		      ((len >> 8) & 0xff) << 16;
++		hdr |= dsi_ecc(hdr) << 24;
++		writel(hdr, D1_DSI_BASE + DSI_CMD_TX(0));
++
++		memcpy(bounce, buf, len);
++		bounce[len] = crc & 0xff;
++		bounce[len + 1] = crc >> 8;
++		for (i = 0; i < total; i += 4) {
++			u32 w = bounce[i];
++
++			if (i + 1 < total)
++				w |= bounce[i + 1] << 8;
++			if (i + 2 < total)
++				w |= bounce[i + 2] << 16;
++			if (i + 3 < total)
++				w |= bounce[i + 3] << 24;
++			writel(w, D1_DSI_BASE + DSI_CMD_TX(1 + i / 4));
++		}
++		writel(total + 4 - 1, D1_DSI_BASE + DSI_CMD_CTL);
++	}
++
++	dsi_start(DSI_START_LPTX);
++
++	if (dsi_inst_wait()) {
++		dsi_inst_abort();
++		return -1;
++	}
++
++	return 0;
++}
++
++static void splash_dsi_setup(struct splash_panel *p)
++{
++	void __iomem *d = D1_DSI_BASE;
++	u8 lanes_mask = (1 << p->lanes) - 1;
++	u32 val, wc, delay;
++	u16 hsa, hbp, hfp, hblk;
++	int Bpp = 3;	/* RGB888 */
++
++	writel(DSI_CTL_EN, d + DSI_CTL);
++	writel(DSI_BASIC_CTL0_ECC_EN | DSI_BASIC_CTL0_CRC_EN,
++	       d + DSI_BASIC_CTL0);
++	writel(10, d + DSI_TRANS_START);
++	writel(0, d + DSI_TRANS_ZERO);
++
++	/* instruction engine, verbatim from sun6i_dsi_inst_init() */
++	dsi_inst_setup(INST_LP11, INST_MODE_STOP, true, lanes_mask, 0, 0);
++	dsi_inst_setup(INST_TBA, INST_MODE_TBA, false, 1, 0, 0);
++	dsi_inst_setup(INST_HSC, INST_MODE_HS, true, 0, 0, 0);
++	dsi_inst_setup(INST_HSD, INST_MODE_HS, false, lanes_mask, 0, 0);
++	dsi_inst_setup(INST_LPDT, INST_MODE_ESCAPE, false, 1, 1, 0);
++	dsi_inst_setup(INST_HSCEXIT, INST_MODE_HSCEXIT, true, 0, 0, 0);
++	dsi_inst_setup(INST_NOP, INST_MODE_STOP, false, lanes_mask, 0, 0);
++	dsi_inst_setup(INST_DLY, INST_MODE_NOP, true, lanes_mask, 0, 0);
++	writel(INST_HSCEXIT << 20 | INST_NOP << 16 | 1,
++	       d + DSI_INST_JUMP_CFG(0));
++
++	writel(0xff, d + DSI_DEBUG_DATA);
++
++	/* video start delay */
++	delay = p->vtotal - p->vfp + 1;
++	if (delay > p->vtotal)
++		delay %= p->vtotal;
++	if (!delay)
++		delay = 1;
++	writel((delay & 0x1fff) << 4 | BIT(2) | BIT(1) | BIT(0),
++	       d + DSI_BASIC_CTL1);
++
++	/* non-burst DRQ */
++	val = 0;
++	if (p->hfp > 20) {
++		u32 drq = (p->hfp - 20) * 24 / 32;
++
++		val = BIT(28) | (drq & 0x3ff);
++	}
++	writel(val, d + DSI_TCON_DRQ);
++
++	/* instruction loop */
++	writel(2 << (4 * INST_LP11) | 3 << (4 * INST_DLY),
++	       d + DSI_INST_LOOP_SEL);
++	writel((50 - 1) << 16 | (50 - 1), d + DSI_INST_LOOP_NUM(0));
++	writel((50 - 1) << 16 | (50 - 1), d + DSI_INST_LOOP_NUM(1));
++
++	/* pixel packet: packed RGB888 */
++	wc = p->hact * Bpp;
++	val = DT_PIXEL_RGB888 | (wc & 0xffff) << 8;
++	val |= dsi_ecc(val) << 24;
++	writel(val, d + DSI_PIXEL_PH);
++	writel(0xffff, d + DSI_PIXEL_PF0);
++	writel(0xffff << 16 | 0xffff, d + DSI_PIXEL_PF1);
++	writel(BIT(16) | 8, d + DSI_PIXEL_CTL0);	/* fmt 8 = RGB888 */
++
++	/* sync events and blanking payloads (non-burst with sync pulses) */
++	writel(0, d + DSI_BASIC_CTL);
++	writel(dsi_sync_pkt(DT_HSS), d + DSI_SYNC_HSS);
++	writel(dsi_sync_pkt(DT_HSE), d + DSI_SYNC_HSE);
++	writel(dsi_sync_pkt(DT_VSS), d + DSI_SYNC_VSS);
++	writel(dsi_sync_pkt(DT_VSE), d + DSI_SYNC_VSE);
++
++	writel((p->vbp & 0xfff) << 16 | (p->vslen & 0xfff),
++	       d + DSI_BASIC_SIZE0);
++	writel((p->vtotal & 0xfff) << 16 | (p->vact & 0xfff),
++	       d + DSI_BASIC_SIZE1);
++
++	hsa = max_t(int, 10, p->hslen * Bpp - 10);
++	hbp = max_t(int, 6, p->hbp * Bpp - 6);
++	hfp = max_t(int, 16, p->hfp * Bpp - 16);
++	hblk = max_t(int, 10, (p->htotal - p->hslen) * Bpp - 10);
++
++	writel(dsi_blk0_pkt(hsa), d + DSI_BLK_HSA0);
++	writel(dsi_blk1_pkt(0, hsa), d + DSI_BLK_HSA1);
++	writel(dsi_blk0_pkt(hbp), d + DSI_BLK_HBP0);
++	writel(dsi_blk1_pkt(0, hbp), d + DSI_BLK_HBP1);
++	writel(dsi_blk0_pkt(hfp), d + DSI_BLK_HFP0);
++	writel(dsi_blk1_pkt(0, hfp), d + DSI_BLK_HFP1);
++	writel(dsi_blk0_pkt(hblk), d + DSI_BLK_HBLK0);
++	writel(dsi_blk1_pkt(0, hblk), d + DSI_BLK_HBLK1);
++	writel(dsi_blk0_pkt(0), d + DSI_BLK_VBLK0);
++	writel(dsi_blk1_pkt(0, 0), d + DSI_BLK_VBLK1);
++}
++
++/* ---- D-PHY ------------------------------------------------------------ */
++
++static void splash_dphy_on(struct splash_panel *p)
++{
++	void __iomem *d = D1_DPHY_BASE;
++	u8 lanes_mask = (1 << p->lanes) - 1;
++	unsigned long rate = (unsigned long)p->hsclk_khz * 1000;
++	u32 div, n;
++
++	writel(BIT(28), d + DPHY_TX_CTL);	/* HS_TX_CLK_CONT */
++	writel(10 << 24 | 6 << 16 | 14, d + DPHY_TX_TIME0);
++	writel(10 << 24 | 3 << 16 | 50 << 8 | 7, d + DPHY_TX_TIME1);
++	writel(30, d + DPHY_TX_TIME2);
++	writel(0, d + DPHY_TX_TIME3);
++	writel(3 << 8 | 3, d + DPHY_TX_TIME4);
++
++	/* A100/D1 analog + PLL path */
++	writel(2 << 25 | 4 << 20 | 3 << 17 | 3 << 12 | 1 << 8 | 1 << 10 |
++	       2 << 0 | 3 << 2 | 2 << 4 | 3 << 6, d + DPHY_ANA4);
++	setbits_le32(d + DPHY_ANA2, DPHY_ANA2_EN_CK_CPU);
++	setbits_le32(d + DPHY_ANA2, DPHY_ANA2_ENIB);
++	writel(DPHY_ANA3_EN_LDOR | DPHY_ANA3_EN_LDOC | DPHY_ANA3_EN_LDOD,
++	       d + DPHY_ANA3);
++	writel(4 << 4 | 1 << 2, d + DPHY_ANA0);	/* PLR(4) | SFB(1) */
++	writel(DPHY_COMBO_REG0_EN_CP, d + DPHY_COMBO_REG0);
++
++	/* PLL: 24 MHz * N / div = per-lane bit clock, VCO kept near 2 GHz */
++	div = DIV_ROUND_UP(rate, 264000000UL);	/* order_base_2() by hand */
++	div = 16 >> (div > 1 ? ilog2(div - 1) + 1 : 0);
++	n = rate / 24000000UL * div;
++
++	writel(DPHY_PLL_REG0_CP36_EN | DPHY_PLL_REG0_LDO_EN |
++	       DPHY_PLL_REG0_EN_LVS | DPHY_PLL_REG0_PLL_EN |
++	       DPHY_PLL_REG0_NDET | DPHY_PLL_REG0_P((div - 1) % 8) |
++	       DPHY_PLL_REG0_N(n) | DPHY_PLL_REG0_M0((div - 1) / 8) |
++	       DPHY_PLL_REG0_M1(2), d + DPHY_PLL_REG0);
++	writel(0, d + DPHY_PLL_REG2);	/* no sigma-delta */
++
++	setbits_le32(d + DPHY_ANA4, DPHY_ANA4_EN_MIPI);
++	setbits_le32(d + DPHY_COMBO_REG0,
++		     DPHY_COMBO_REG0_EN_MIPI | DPHY_COMBO_REG0_EN_COMBOLDO);
++	writel(20, d + DPHY_COMBO_REG2);	/* HS_STOP_DLY */
++	udelay(1);
++
++	/* common TX bring-up (sun6i_dphy_tx_power_on tail) */
++	reg_setclr(d + DPHY_ANA3,
++		   DPHY_ANA3_EN_VTTC | DPHY_ANA3_EN_VTTD(lanes_mask),
++		   DPHY_ANA3_EN_VTTD(0xf));
++	udelay(1);
++	setbits_le32(d + DPHY_ANA3, DPHY_ANA3_EN_DIV);
++	udelay(1);
++	setbits_le32(d + DPHY_ANA2, DPHY_ANA2_EN_CK_CPU);
++	udelay(1);
++	setbits_le32(d + DPHY_ANA1, DPHY_ANA1_VTTMODE);
++	reg_setclr(d + DPHY_ANA2, DPHY_ANA2_EN_P2S_CPU(lanes_mask),
++		   DPHY_ANA2_EN_P2S_CPU(0xf));
++
++	writel(((p->lanes - 1) & 3) << 4 | 1, d + DPHY_GCTL);
++}
++
++/* ---- panel ------------------------------------------------------------ */
++
++static int splash_panel_init(struct splash_panel *p)
++{
++	const u8 *seq = p->init;
++	int left = p->init_len;
++
++	/* reset pulse, st7703 style: assert >10ms, deassert, wait >15ms */
++	pio_set_output(p->rst_bank, p->rst_pin, 0);	/* active low */
++	mdelay(12);
++	pio_set_output(p->rst_bank, p->rst_pin, 1);
++	mdelay(18);
++
++	/* srgn,init-sequence = [delay_ms len payload...]* */
++	while (left >= 2) {
++		u8 delay = seq[0];
++		u8 len = seq[1];
++
++		if (!len || len > left - 2) {
++			printf("srgn_splash: malformed init sequence\n");
++			return -1;
++		}
++
++		if (dsi_dcs_write(seq + 2, len)) {
++			printf("srgn_splash: DCS write %02x failed\n", seq[2]);
++			return -1;
++		}
++		if (delay)
++			mdelay(delay);
++
++		seq += 2 + len;
++		left -= 2 + len;
++	}
++
++	return 0;
++}
++
++/* ---- backlight --------------------------------------------------------- */
++
++static void splash_backlight_on(struct splash_panel *p)
++{
++	void __iomem *b = D1_PWM_BASE;
++	u32 cycles;
++
++	if (p->pwm_ch < 0)
++		return;
++
++	pio_set_func(PIO_BANK_D, 20, PIN_FUNC_PWM4);
++
++	/* 24 MHz source, no prescaler: cycles = period / 41.67ns */
++	cycles = p->pwm_period_ns / 42;
++	if (!cycles)
++		cycles = 1;
++
++	writel(0, b + PWM_CLK_CFG(p->pwm_ch / 2));	/* HOSC, div 1 */
++	setbits_le32(b + PWM_CLK_GATE, BIT(p->pwm_ch));
++	writel(PWM_CTL_ACT_STA, b + PWM_CTL(p->pwm_ch));
++	writel((cycles - 1) << 16 | cycles, b + PWM_PERIOD(p->pwm_ch));
++	setbits_le32(b + PWM_ENABLE, BIT(p->pwm_ch));
++}
++
++/* ---- kernel handover ---------------------------------------------------- */
++
++static int splash_fdt_setup(void *fdt, struct splash_panel *p, ulong fb)
++{
++	/* whole pages, so the kernel can free the carveout page by page */
++	u32 size = ALIGN(p->hact * p->vact * 2, 4096);
++	char name[48];
++	int node, chosen, resv, ret;
++
++	ret = fdt_increase_size(fdt, 512);
++	if (ret)
++		return ret;
++
++	/*
++	 * /reserved-memory/splash-fb@...: keep the allocator off the fb.
++	 * No "no-map" on purpose -- see the header comment; the kernel
++	 * frees these pages after the sun4i-drm takeover.
++	 */
++	resv = fdt_path_offset(fdt, "/reserved-memory");
++	if (resv < 0) {
++		resv = fdt_add_subnode(fdt, 0, "reserved-memory");
++		if (resv < 0)
++			return resv;
++		fdt_setprop_u32(fdt, resv, "#address-cells", 1);
++		fdt_setprop_u32(fdt, resv, "#size-cells", 1);
++		fdt_setprop_empty(fdt, resv, "ranges");
++	}
++	snprintf(name, sizeof(name), "splash-fb@%lx", fb);
++	node = fdt_add_subnode(fdt, resv, name);
++	if (node < 0)
++		return node;
++	{
++		fdt32_t reg[2] = { cpu_to_fdt32(fb), cpu_to_fdt32(size) };
++
++		fdt_setprop(fdt, node, "reg", reg, sizeof(reg));
++	}
++
++	/* /chosen/framebuffer@...: what simpledrm binds against */
++	chosen = fdt_path_offset(fdt, "/chosen");
++	if (chosen < 0) {
++		chosen = fdt_add_subnode(fdt, 0, "chosen");
++		if (chosen < 0)
++			return chosen;
++	}
++	snprintf(name, sizeof(name), "framebuffer@%lx", fb);
++	node = fdt_add_subnode(fdt, chosen, name);
++	if (node < 0)
++		return node;
++	fdt_setprop_string(fdt, node, "compatible", "simple-framebuffer");
++	{
++		fdt32_t reg[2] = { cpu_to_fdt32(fb), cpu_to_fdt32(size) };
++
++		fdt_setprop(fdt, node, "reg", reg, sizeof(reg));
++	}
++	fdt_setprop_u32(fdt, node, "width", p->hact);
++	fdt_setprop_u32(fdt, node, "height", p->vact);
++	fdt_setprop_u32(fdt, node, "stride", p->hact * 2);
++	fdt_setprop_string(fdt, node, "format", "r5g6b5");
++	/*
++	 * The takeover hook: tells our simpledrm patch that when the real
++	 * DRM driver evicts it, the fb pages should go back to the page
++	 * allocator instead of staying reserved forever.
++	 */
++	fdt_setprop_empty(fdt, node, "srgn,free-on-takeover");
++
++	/* keep bootm's fdt/initrd placement away from the framebuffer */
++	{
++		phys_addr_t fb_addr = fb;
++
++		lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &fb_addr, size,
++			      LMB_NONE);
++	}
++
++	return 0;
++}
++
++/* ---- command ------------------------------------------------------------ */
++
++static int do_srgn_splash(struct cmd_tbl *cmdtp, int flag, int argc,
++			  char *const argv[])
++{
++	struct splash_panel panel = { };
++	void *fdt;
++	ulong fb;
++
++	if (argc != 3)
++		return CMD_RET_USAGE;
++
++	fdt = (void *)hextoul(argv[1], NULL);
++	fb = hextoul(argv[2], NULL);
++
++	if (fdt_check_header(fdt)) {
++		printf("srgn_splash: no fdt at %p\n", fdt);
++		return CMD_RET_FAILURE;
++	}
++
++	if (splash_parse_fdt(fdt, &panel))
++		return CMD_RET_FAILURE;
++
++	/* make sure the mixer sees the logo, not stale cache lines */
++	flush_dcache_range(fb, fb + panel.hact * panel.vact * 2);
++
++	if (splash_clocks_on(&panel))
++		return CMD_RET_FAILURE;
++
++	splash_pinmux(&panel);
++	splash_mixer_setup(&panel, fb);
++	splash_tcon_setup(&panel);
++	splash_dsi_setup(&panel);
++	splash_dphy_on(&panel);
++
++	if (splash_panel_init(&panel))
++		return CMD_RET_FAILURE;
++
++	dsi_start(DSI_START_HSC);
++	udelay(1000);
++	dsi_start(DSI_START_HSD);
++
++	/* give the pipeline a frame before unblanking the backlight */
++	mdelay(25);
++	splash_backlight_on(&panel);
++
++	if (splash_fdt_setup(fdt, &panel, fb)) {
++		printf("srgn_splash: fdt handover failed (still displaying)\n");
++		return CMD_RET_FAILURE;
++	}
++
++	env_set("splash_active", "1");
++	printf("srgn_splash: %ux%u up, fb at 0x%lx\n",
++	       panel.hact, panel.vact, fb);
++
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(srgn_splash, 3, 0, do_srgn_splash,
++	   "bring up the DSI panel and scan out a splash framebuffer",
++	   "<fdt addr> <fb addr>\n"
++	   "    Panel timing/init come from srgn,* properties in the fdt.\n"
++	   "    Marks the fb as a simple-framebuffer for the kernel."
++);

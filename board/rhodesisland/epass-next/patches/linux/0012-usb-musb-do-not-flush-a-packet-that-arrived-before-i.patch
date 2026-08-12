@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 12/13] usb: musb: do not flush a packet that arrived before its
+ request
+
+musb_ep_restart() flushes the RX FIFO unconditionally when a request is
+queued on an OUT endpoint. That destroys a packet which arrived while no
+request was pending: musb_g_rx() has already returned early on finding an
+empty request list, consuming the only interrupt the packet will ever
+get, so nothing will ever pull it out again. The request then sits on the
+queue waiting for an interrupt that cannot come, and the read blocks
+forever.
+
+Gadgets that always keep a request queued never notice. FunctionFS with
+synchronous read() does: between returning from write() on the IN
+endpoint and issuing the next read() on the OUT endpoint there is a
+sub-millisecond gap, and a host that pipelines its next request into that
+gap loses it. On the ePass boards this hangs the epass function on the
+first exchange after SET_CONFIGURATION and on roughly every request that
+follows a reply.
+
+Check RXPKTRDY first: if a packet is already in the FIFO hand the request
+to rxstate() so it gets picked up. 5.4 called rxstate() here
+unconditionally, which is why the same userspace works on the F1C boards.
+
+Do not flush in the other case either. The datasheet allows writing
+FLUSHFIFO only while RXPKTRDY is set, and on the D1s the write is not
+harmless when it races a reception in progress: with the host streaming
+bulk OUT data, a flush issued between packets occasionally corrupts the
+FIFO pointers, and the next packet then reports RXCOUNT=0 while
+RXPKTRDY and FIFOFULL stay set. rxstate() believes the zero, completes
+the request with actual=0 and the packet is lost, hanging large
+transfers a few times per megabyte. An empty FIFO needs no flushing,
+and a packet mid-flight raises its own interrupt once complete, so the
+whole write is unnecessary; 5.4 never had it. Verified on the ePass
+Next: 14/14 4MB put/get round-trips with matching md5, and the
+RXCOUNT=0 state never reappears in over 3000 packet-before-request
+windows, where before it occurred within every 4MB transfer.
+---
+diff --git a/drivers/usb/musb/musb_gadget.c b/drivers/usb/musb/musb_gadget.c
+index 016d3f3fc..16ae90b58 100644
+--- a/drivers/usb/musb/musb_gadget.c
++++ b/drivers/usb/musb/musb_gadget.c
+@@ -1171,9 +1171,26 @@ void musb_ep_restart(struct musb *musb, struct musb_request *req)
+ 		txstate(musb, req);
+ 	} else {
+ 		csr = musb_readw(epio, MUSB_RXCSR);
+-		csr |= MUSB_RXCSR_FLUSHFIFO | MUSB_RXCSR_P_WZC_BITS;
+-		musb_writew(epio, MUSB_RXCSR, csr);
+-		musb_writew(epio, MUSB_RXCSR, csr);
++		if (csr & MUSB_RXCSR_RXPKTRDY) {
++			/*
++			 * A packet beat the request here: it is already sitting
++			 * in the FIFO, and the interrupt that delivered it has
++			 * been consumed by musb_g_rx() finding no request. No
++			 * further interrupt is coming for it, so flushing would
++			 * drop the packet for good and leave this request
++			 * waiting forever. Hand it to rxstate() instead.
++			 */
++			rxstate(musb, req);
++		}
++		/*
++		 * No FLUSHFIFO when RXPKTRDY is clear: the datasheet allows
++		 * writing FLUSHFIFO only while RXPKTRDY is set, and on this
++		 * IP a flush racing an in-progress reception corrupts the
++		 * FIFO pointers, making the next packet report RXCOUNT=0
++		 * while RXPKTRDY/FIFOFULL stay set. An empty FIFO needs no
++		 * flushing anyway; a packet mid-flight raises its own
++		 * interrupt once complete.
++		 */
+ 	}
+ }
+ 

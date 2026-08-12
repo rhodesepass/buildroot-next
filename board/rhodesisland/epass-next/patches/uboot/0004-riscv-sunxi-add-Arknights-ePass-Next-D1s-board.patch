@@ -1,0 +1,149 @@
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 4/5] riscv: sunxi: add Arknights ePass Next (D1s) board
+
+D1s port of a T113-s3 design. The SoCs are pin compatible, the in-package
+DRAM is not: DDR3 at 1.35V becomes DDR2 at 1.8V, fed from AXP209 DCDC2,
+which powers up around 1.25V. So the PMIC has to be raised before the DRAM
+controller runs, over bit-banged TWI0 since nothing else exists that early.
+That is board-specific rather than something every D1 wants, hence
+CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2.
+
+The board dts is not part of the patch: it lives in the buildroot board
+directory (devicetree/uboot/) and buildroot copies it into arch/riscv/dts/
+at build time via BR2_TARGET_UBOOT_CUSTOM_DTS_PATH, so editing it does not
+require re-patching the tree. It includes sun20i-d1s.dtsi from dts/upstream;
+the Makefile entry for it comes with the platform patch.
+
+Console is UART3 on PB6/PB7 (function 7), which is also what
+SUNXI_SPL_EARLY_UART programs -- xfel writes SRAM as data and never
+invalidates the icache, so configuring the UART from a helper payload
+leaves stale instructions behind at 0x20000.
+---
+diff --git a/configs/epass_next_defconfig b/configs/epass_next_defconfig
+new file mode 100644
+index 00000000..fb5f8962
+--- /dev/null
++++ b/configs/epass_next_defconfig
+@@ -0,0 +1,122 @@
++CONFIG_RISCV=y
++CONFIG_HAS_CUSTOM_SYS_INIT_SP_ADDR=y
++CONFIG_CUSTOM_SYS_INIT_SP_ADDR=0x43e00000
++CONFIG_DEFAULT_DEVICE_TREE="sun20i-d1s-epass-next"
++# 64MB of in-package DDR2 at 528MHz
++CONFIG_DRAM_CLK=528
++# Default is 0x48000, but the BROM's FEL loop keeps its own state in
++# 0x40000-0x48000 (xfel reports its scratchpad at 0x45000). A stack growing
++# down from 0x48000 tramples it, so returning to FEL never works. SPL code ends
++# well below 0x40000, leaving plenty of stack.
++CONFIG_SPL_STACK=0x40000
++# Console is uart3 on PB6/PB7; sunxi UART regs are 4 bytes apart (shift 2)
++CONFIG_DEBUG_UART_BASE=0x02500c00
++CONFIG_DEBUG_UART_CLOCK=24000000
++CONFIG_DRAM_SUNXI_ODT_EN=0x0
++CONFIG_DRAM_SUNXI_TPR0=0x00471992
++CONFIG_DRAM_SUNXI_TPR11=0x0
++CONFIG_DRAM_SUNXI_TPR12=0x0
++CONFIG_DRAM_SUNXI_TPR13=0x34000100
++# DRAM_ZQ is an int, matching the ARM definition; 8092665 == 0x007b7bf9
++CONFIG_DRAM_ZQ=8092665
++CONFIG_TARGET_SUN20I_D1=y
++CONFIG_SPL_RETURN_TO_FEL=y
++CONFIG_SUNXI_SPL_EARLY_UART=y
++CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2=y
++CONFIG_ARCH_RV64I=y
++CONFIG_RISCV_SMODE=y
++# CONFIG_SPL_SMP is not set
++CONFIG_SPL_SYS_MALLOC=y
++CONFIG_SPL_OPENSBI_SCRATCH_OPTIONS=0x0
++# DFU over the OTG port: musb in gadget mode behind the sun4i USB PHY.
++# USB, USB_GADGET and USB_MUSB_SUNXI follow from BOARD_SUNXI and these.
++CONFIG_CMD_DFU=y
++CONFIG_NET_RANDOM_ETHADDR=y
++CONFIG_DFU_MMC=y
++CONFIG_DFU_RAM=y
++# The back end that reaches the SPI NAND. CONFIG_MTD alone is not enough --
++# dfu_alt_info entries of the "part"/"raw" flavour need this to resolve, and
++# without it "dfu 0 mtd spi-nand0" reports "MTD support not available!".
++# This is what makes the board updatable from itself rather than over FEL.
++CONFIG_DFU_MTD=y
++# CONFIG_SYS_I2C_MVTWSI is not set
++CONFIG_DRAM_SUNXI_MR1=0x2
++CONFIG_SUNXI_DRAM_TYPE_DDR2=y
++CONFIG_DEBUG_UART_NS16550=y
++CONFIG_DEBUG_UART_SHIFT=2
++CONFIG_DEBUG_UART_ANNOUNCE=y
++CONFIG_USB_MUSB_GADGET=y
++CONFIG_USB_GADGET_DOWNLOAD=y
++# The default DFU buffer is 8M, which will not come out of a 2M malloc arena
++# on a 64M board -- "dfu_get_buf: Could not memalign 0x800000 bytes". Nothing
++# needs it that big either: the NAND erase block is 128K, so a 1M staging
++# buffer is already eight blocks per write.
++CONFIG_SYS_DFU_DATA_BUF_SIZE=0x100000
++CONFIG_SYS_DFU_MAX_FILE_SIZE=0x100000
++# USB_ETHER defaults to y once BOARD_SUNXI and USB_MUSB_GADGET are on, and it
++# claims the UDC during net init -- "RNDIS ready" in the banner. Only one
++# gadget can be bound at a time, so DFU then has nothing to register on.
++# Nothing here wants networking over USB anyway.
++# CONFIG_USB_ETHER is not set
++# This board boots a FIT from bootcmd and never an EFI payload, so the whole
++# EFI loader is dead weight -- around 100K of u-boot.itb. Turning it off also
++# drops mkeficapsule from the host tools, which otherwise wants gnutls built
++# with PKCS#11 and fails to link in a sanitised build environment such as
++# buildroot's.
++# CONFIG_EFI_LOADER is not set
++
++# The SPI NAND, reachable from U-Boot proper this time. The SPL has its own
++# minimal reader (SPL_SPINAND_SUNXI); this is the full MTD stack, which is
++# what the environment, the kernel FIT and DFU all go through.
++CONFIG_SPI=y
++CONFIG_DM_SPI=y
++CONFIG_SPI_SUNXI=y
++CONFIG_SPI_MEM=y
++CONFIG_MTD=y
++CONFIG_DM_MTD=y
++CONFIG_MTD_SPI_NAND=y
++CONFIG_CMD_MTD=y
++# partitions come from the fixed-partitions node in the board dts, so the
++# offsets live in exactly one place per stage
++CONFIG_MTD_PARTITIONS=y
++CONFIG_CMD_MTDPARTS=y
++
++# The environment stays compiled in and is never written back. The bootenv
++# partition is not U-Boot's storage: it holds a short env.txt naming the board
++# revision and the panel, which bootcmd imports with "env import -t" to pick
++# the right dtb out of the FIT. Keeping the real environment at NOWHERE means
++# a board's identity lives in exactly one place and a stray "saveenv" cannot
++# overwrite it. Same arrangement as the F1C board.
++CONFIG_ENV_IS_NOWHERE=y
++
++# bootcmd is a state machine with conditionals and loops, which the simple
++# parser cannot run -- without this every if/then/fi comes back as "Unknown
++# command" and the whole thing falls through to a failed bootm.
++CONFIG_HUSH_PARSER=y
++
++# The Mostima flashing mailbox: the host flasher leaves a header in DRAM
++# saying "you were started to flash this board, here is its identity", and
++# bootcmd dispatches on it. The address has to survive from the FEL write
++# until bootcmd reads it, which rules out most of the map:
++#
++#   0x40000000  OpenSBI, up to _fw_end at 0x40045000 (PMP-protected)
++#   0x40100000  the mailbox -- this hole is structural, nothing can grow into
++#               it from either side
++#   0x40200000  the kernel's load address
++#   0x41000000+ the FIT/dtb/env scratch addresses from uboot.env
++#   0x42e00000  U-Boot proper, 0x43e00000 its pre-relocation stack
++#   0x44000000  top of DRAM; U-Boot relocates itself just below here, which is
++#               why the mailbox cannot simply go at the end
++CONFIG_CMD_MSTMCHK=y
++CONFIG_MSTMCHK_ADDR=0x40100000
++
++# imxtract pulls a named image out of a FIT; fdt apply layers the screen and
++# option overlays onto the base tree. Both are what bootcmd is built from.
++CONFIG_CMD_XIMG=y
++CONFIG_CMD_FDT=y
++CONFIG_OF_LIBFDT_OVERLAY=y
++
++# The boot logo: srgn_splash lights the DSI panel and hands the framebuffer
++# to the kernel as a simple-framebuffer node, so the logo survives until the
++# real DRM stack loads (which preinit defers to just before the app starts).
++CONFIG_SRGN_SPLASH=y

@@ -1,0 +1,317 @@
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 2/5] sunxi: allow the drivers to build on BOARD_SUNXI
+
+Fourteen driver Kconfigs gate sunxi support on ARCH_SUNXI, which is an ARM
+symbol. Accept BOARD_SUNXI as well so the RISC-V build can reach the same
+drivers. No behavioural change for ARM: mangopi_mq_r and Cubietruck both
+show zero savedefconfig drift.
+---
+diff --git a/drivers/clk/sunxi/Kconfig b/drivers/clk/sunxi/Kconfig
+index 1c1cc827..b9127236 100644
+--- a/drivers/clk/sunxi/Kconfig
++++ b/drivers/clk/sunxi/Kconfig
+@@ -1,6 +1,6 @@
+ config CLK_SUNXI
+ 	bool "Clock support for Allwinner SoCs"
+-	depends on CLK && ARCH_SUNXI
++	depends on CLK && (ARCH_SUNXI || BOARD_SUNXI)
+ 	select DM_RESET
+ 	select SPL_DM_RESET if SPL_CLK
+ 	default y
+@@ -89,7 +89,7 @@ config CLK_SUN8I_H3
+ 
+ config CLK_SUN20I_D1
+ 	bool "Clock driver for Allwinner D1"
+-	default MACH_SUN8I_R528
++	default MACH_SUN8I_R528 || TARGET_SUN20I_D1
+ 	help
+ 	  This enables common clock driver support for platforms based
+ 	  on Allwinner D1 SoC.
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+index 0b5466b3..b5113c90 100644
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -451,7 +451,7 @@ config SANDBOX_GPIO_COUNT
+ 
+ config SUNXI_GPIO
+ 	bool "Allwinner GPIO driver"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	select SPL_STRTO if SPL
+ 	help
+ 	  Support the GPIO device in Allwinner SoCs.
+diff --git a/drivers/i2c/Kconfig b/drivers/i2c/Kconfig
+index 37288a47..99de1506 100644
+--- a/drivers/i2c/Kconfig
++++ b/drivers/i2c/Kconfig
+@@ -684,7 +684,7 @@ config SYS_I2C_STM32F7
+ 
+ config SYS_I2C_SUN6I_P2WI
+ 	bool "Allwinner sun6i P2WI controller"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	help
+ 	  Support for the P2WI (Push/Pull 2 Wire Interface) controller embedded
+ 	  in the Allwinner A31 and A31s SOCs. This interface is used to connect
+@@ -692,7 +692,7 @@ config SYS_I2C_SUN6I_P2WI
+ 
+ config SYS_I2C_SUN8I_RSB
+ 	bool "Allwinner sun8i Reduced Serial Bus controller"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	help
+ 	  Support for Allwinner's Reduced Serial Bus (RSB) controller. This
+ 	  controller is responsible for communicating with various RSB based
+@@ -742,7 +742,7 @@ config SYS_I2C_MV
+ 
+ config SYS_I2C_MVTWSI
+ 	bool "Marvell I2C driver"
+-	depends on ARCH_KIRKWOOD || ARCH_MVEBU || ARCH_SUNXI
++	depends on ARCH_KIRKWOOD || ARCH_MVEBU || ARCH_SUNXI || BOARD_SUNXI
+ 	help
+ 	  Support for Marvell I2C controllers as used on the orion5x and
+ 	  kirkwood SoC families.
+diff --git a/drivers/mmc/Kconfig b/drivers/mmc/Kconfig
+index 6c513328..5d072256 100644
+--- a/drivers/mmc/Kconfig
++++ b/drivers/mmc/Kconfig
+@@ -804,7 +804,7 @@ config ZYNQ_HISPD_BROKEN
+ 
+ config MMC_SUNXI
+ 	bool "Allwinner sunxi SD/MMC Host Controller support"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	default y
+ 	help
+ 	  This selects support for the SD/MMC Host Controller on
+diff --git a/drivers/net/Kconfig b/drivers/net/Kconfig
+index 66661868..51702c32 100644
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -734,7 +734,7 @@ config SUN7I_GMAC_FORCE_TXERR
+ 
+ config SUN4I_EMAC
+ 	bool "Allwinner Sun4i Ethernet MAC support"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	select PHYLIB
+ 	help
+ 	  This driver supports the Allwinner based SUN4I Ethernet MAC.
+diff --git a/drivers/phy/allwinner/Kconfig b/drivers/phy/allwinner/Kconfig
+index bb0bd8d5..ad6ac6a1 100644
+--- a/drivers/phy/allwinner/Kconfig
++++ b/drivers/phy/allwinner/Kconfig
+@@ -3,7 +3,7 @@
+ #
+ config PHY_SUN4I_USB
+ 	bool "Allwinner Sun4I USB PHY driver"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	depends on !MACH_SUN9I
+ 	default n if MACH_SUN8I_V3S
+ 	default y
+@@ -28,7 +28,7 @@ config INITIAL_USB_SCAN_DELAY
+ 
+ config PHY_SUN50I_USB3
+ 	bool "Allwinner sun50i USB3 PHY driver"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	select PHY
+ 	help
+ 	  Enable this to support the USB3 transceiver that is part of
+diff --git a/drivers/pinctrl/sunxi/Kconfig b/drivers/pinctrl/sunxi/Kconfig
+index 54314992..29919973 100644
+--- a/drivers/pinctrl/sunxi/Kconfig
++++ b/drivers/pinctrl/sunxi/Kconfig
+@@ -1,6 +1,6 @@
+ # SPDX-License-Identifier: GPL-2.0
+ 
+-if ARCH_SUNXI
++if ARCH_SUNXI || BOARD_SUNXI
+ 
+ config PINCTRL_SUNXI
+ 	select PINCTRL_FULL
+@@ -136,7 +136,7 @@ config PINCTRL_SUN50I_A100_R
+ 
+ config PINCTRL_SUN20I_D1
+ 	bool "Support for the Allwinner D1/R528 PIO"
+-	default MACH_SUN8I_R528
++	default MACH_SUN8I_R528 || TARGET_SUN20I_D1
+ 	select PINCTRL_SUNXI
+ 
+ config PINCTRL_SUN55I_A523
+diff --git a/drivers/power/Kconfig b/drivers/power/Kconfig
+index 1b06d8a6..b325c800 100644
+--- a/drivers/power/Kconfig
++++ b/drivers/power/Kconfig
+@@ -54,7 +54,7 @@ source "drivers/power/regulator/Kconfig"
+ 
+ choice
+ 	prompt "Select Sunxi PMIC Variant"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	default AXP209_POWER if MACH_SUN4I || MACH_SUN5I || MACH_SUN7I
+ 	default AXP221_POWER if MACH_SUN6I || MACH_SUN8I_A23 || MACH_SUN8I_A33 || MACH_SUN8I_R40
+ 	default AXP818_POWER if MACH_SUN8I_A83T
+@@ -160,7 +160,7 @@ endchoice
+ 
+ config AXP_I2C_ADDRESS
+ 	hex "AXP PMIC I2C address"
+-	depends on ARCH_SUNXI && !SUNXI_NO_PMIC
++	depends on (ARCH_SUNXI || BOARD_SUNXI) && !SUNXI_NO_PMIC
+ 	default 0x36 if AXP305_POWER
+ 	default 0x36 if AXP313_POWER
+ 	default 0x36 if AXP318W_POWER
+diff --git a/drivers/pwm/Kconfig b/drivers/pwm/Kconfig
+index a69fe37c..ba7df920 100644
+--- a/drivers/pwm/Kconfig
++++ b/drivers/pwm/Kconfig
+@@ -115,7 +115,7 @@ config PWM_STM32
+ 
+ config PWM_SUNXI
+ 	bool "Enable support for the Allwinner Sunxi PWM"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	help
+ 	  This PWM is found on H3, A64 and other Allwinner SoCs. It supports a
+ 	  programmable period and duty cycle. A 16-bit counter is used.
+diff --git a/drivers/ram/sunxi/Kconfig b/drivers/ram/sunxi/Kconfig
+index 1775cb0d..d0240c07 100644
+--- a/drivers/ram/sunxi/Kconfig
++++ b/drivers/ram/sunxi/Kconfig
+@@ -1,17 +1,41 @@
++# No prompt: on ARM this is selected by MACH_SUN8I_R528, on RISC-V it is the
++# only DRAM controller there is.
+ config DRAM_SUN20I_D1
+ 	bool
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
++	default BOARD_SUNXI
+ 	help
+ 	  This enables support for the DRAM controller driver covering
+-	  the Allwinner D1/R528/T113s SoCs.
++	  the Allwinner D1/D1s/R528/T113s SoCs.
+ 
+ if DRAM_SUN20I_D1
+ 
++# arch/arm/mach-sunxi/Kconfig defines both of these, but only under ARCH_SUNXI,
++# so they are invisible to the RISC-V build. Keep the type (int) identical to
++# that definition, otherwise Kconfig reports a type clash while parsing.
++config DRAM_CLK
++	int "DRAM clock frequency in MHz"
++	depends on BOARD_SUNXI
++	default 792
++
++config DRAM_ZQ
++	int "DRAM ZQ calibration value"
++	depends on BOARD_SUNXI
++	# 0x007b7bfb, matching the driver's own fallback
++	default 8092667
++
+ config DRAM_SUNXI_ODT_EN
+ 	hex "DRAM ODT EN parameter"
+ 	help
+ 	  ODT EN value from vendor DRAM settings.
+ 
++config DRAM_SUNXI_MR1
++	hex "DRAM MR1 parameter"
++	default 0x42
++	help
++	  MR1 value from vendor DRAM settings. The DDR3 default (0x42) is what
++	  the driver used to hardcode; in-package DDR2 typically wants 0x2.
++
+ config DRAM_SUNXI_TPR0
+ 	hex "DRAM TPR0 parameter"
+ 	help
+diff --git a/drivers/reset/Kconfig b/drivers/reset/Kconfig
+index e7c0870c..42c47117 100644
+--- a/drivers/reset/Kconfig
++++ b/drivers/reset/Kconfig
+@@ -170,7 +170,7 @@ config RESET_NPCM
+ 
+ config RESET_SUNXI
+ 	bool "RESET support for Allwinner SoCs"
+-	depends on DM_RESET && ARCH_SUNXI
++	depends on DM_RESET && (ARCH_SUNXI || BOARD_SUNXI)
+ 	default y
+ 	help
+ 	  This enables support for common reset driver for
+diff --git a/drivers/spi/Kconfig b/drivers/spi/Kconfig
+index cfbedd64..b1370293 100644
+--- a/drivers/spi/Kconfig
++++ b/drivers/spi/Kconfig
+@@ -557,7 +557,7 @@ config SPI_SN_F_OSPI
+ 
+ config SPI_SUNXI
+ 	bool "Allwinner SoC SPI controllers"
+-	default ARCH_SUNXI
++	default ARCH_SUNXI || BOARD_SUNXI
+ 	help
+ 	  Enable the Allwinner SoC SPi controller driver.
+ 
+diff --git a/drivers/usb/gadget/Kconfig b/drivers/usb/gadget/Kconfig
+index 53908782..5a1434f0 100644
+--- a/drivers/usb/gadget/Kconfig
++++ b/drivers/usb/gadget/Kconfig
+@@ -49,7 +49,7 @@ if USB_GADGET
+ config USB_GADGET_MANUFACTURER
+ 	string "Vendor name of the USB device"
+ 	default "NVIDIA" if ARCH_TEGRA
+-	default "Allwinner Technology" if ARCH_SUNXI
++	default "Allwinner Technology" if ARCH_SUNXI || BOARD_SUNXI
+ 	default "Rockchip" if ARCH_ROCKCHIP
+ 	default "U-Boot"
+ 	help
+@@ -59,7 +59,7 @@ config USB_GADGET_MANUFACTURER
+ config USB_GADGET_VENDOR_NUM
+ 	hex "Vendor ID of the USB device"
+ 	default 0x0955 if ARCH_TEGRA
+-	default 0x1f3a if ARCH_SUNXI
++	default 0x1f3a if ARCH_SUNXI || BOARD_SUNXI
+ 	default 0x2207 if ARCH_ROCKCHIP
+ 	default 0x18d1 if ARCH_SNAPDRAGON
+ 	default 0x0
+@@ -71,7 +71,7 @@ config USB_GADGET_VENDOR_NUM
+ config USB_GADGET_PRODUCT_NUM
+ 	hex "Product ID of the USB device"
+ 	default 0x701a if ARCH_TEGRA
+-	default 0x1010 if ARCH_SUNXI
++	default 0x1010 if ARCH_SUNXI || BOARD_SUNXI
+ 	default 0x110a if ROCKCHIP_RV1108
+ 	default 0x110b if ROCKCHIP_RV1126
+ 	default 0x300a if ROCKCHIP_RK3066
+@@ -234,7 +234,7 @@ endif # USB_GADGET_DOWNLOAD
+ config USB_ETHER
+ 	bool "USB Ethernet Gadget"
+ 	depends on NET
+-	default y if ARCH_SUNXI && USB_MUSB_GADGET
++	default y if (ARCH_SUNXI || BOARD_SUNXI) && USB_MUSB_GADGET
+ 	help
+ 	  Creates an Ethernet network device through a USB peripheral
+ 	  controller. This will create a network interface on both the device
+diff --git a/drivers/usb/musb-new/Kconfig b/drivers/usb/musb-new/Kconfig
+index f8daaddc..cda67d21 100644
+--- a/drivers/usb/musb-new/Kconfig
++++ b/drivers/usb/musb-new/Kconfig
+@@ -77,7 +77,7 @@ config USB_MUSB_PIC32
+ 
+ config USB_MUSB_SUNXI
+ 	bool "Enable sunxi OTG / DRC USB controller"
+-	depends on ARCH_SUNXI
++	depends on ARCH_SUNXI || BOARD_SUNXI
+ 	depends on PHY_SUN4I_USB
+ 	select USB_MUSB_PIO_ONLY
+ 	default y
+diff --git a/drivers/watchdog/Kconfig b/drivers/watchdog/Kconfig
+index 9ea617f1..115f3eb5 100644
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -426,7 +426,7 @@ config WDT_STARFIVE
+ 
+ config WDT_SUNXI
+ 	bool "Allwinner sunxi watchdog timer support"
+-	depends on WDT && ARCH_SUNXI
++	depends on WDT && (ARCH_SUNXI || BOARD_SUNXI)
+ 	default y
+ 	help
+ 	  Enable support for the watchdog timer in Allwinner sunxi SoCs.

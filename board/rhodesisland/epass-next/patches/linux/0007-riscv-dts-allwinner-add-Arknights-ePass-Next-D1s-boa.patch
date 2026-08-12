@@ -1,0 +1,656 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 7/13] riscv: dts: allwinner: add Arknights ePass Next (D1s)
+ board
+
+D1s port of the T113-s3 board. The SoCs are pin compatible but the
+in-package DRAM is not: T113-s3 has DDR3 (1.35V), D1s has DDR2 (1.8V),
+fed from AXP209 DCDC2 -- reg_dcdc2 must agree with what the SPL programmed
+or the supply drops when the PMIC driver probes.
+
+Also adds the ve/pwm nodes the upstream D1 dtsi does not carry yet;
+addresses and IRQs are from the D1-H manual (VE 0x01c0e000 irq 81,
+PWM 0x02000c00 irq 34).
+
+No iommu node, deliberately: with DE translated the output collapses into
+full-screen vertical stripes as soon as a second mixer channel fetches,
+with no fault raised, and no prefetch/OOO/wbuf/auto-gating setting changes
+it. The vendor kernels for D1 and T113 both pin DE to bypass (iommus
+flag 0), so this is a configuration nobody validated on this silicon.
+Scanout memory comes from CMA (cma=32M) instead -- half the RAM, but CMA
+pages stay available to movable allocations while the decoder is idle, and
+the F1C platform needed that much to keep cedrus fed under load.
+
+Two nodes exist purely to keep the kernel's tick alive, and both are needed:
+
+  - A clint node. The C906 CLINT is M-mode only, so Linux never touches it
+    and the SoC dtsi does not describe it -- but OpenSBI has to find it to
+    provide SBI TIME. Without the node it reports "Platform Timer Device:
+    --- @ 0Hz" and SBI_SET_TIMER silently does nothing.
+
+  - timer@2050000 disabled. Its clockevent rating (350) beats the riscv/SBI
+    one (100), so it wins the tick device, but it sits on PLIC irq 59, which
+    never fires on this board.
+
+Either one alone leaves jiffies frozen about a second into boot. Nothing
+oopses and no hung task is reported -- the CPU keeps running, mdelay() still
+works since it spins on a CSR -- but every msleep() blocks forever. That
+strands the DSI panel in st7703_enable(), keeps fbcon from starting and
+leaves getty without a prompt, all of which look like unrelated bugs.
+---
+diff --git a/arch/riscv/boot/dts/allwinner/Makefile b/arch/riscv/boot/dts/allwinner/Makefile
+index 1c91be38e..538b8e1b0 100644
+--- a/arch/riscv/boot/dts/allwinner/Makefile
++++ b/arch/riscv/boot/dts/allwinner/Makefile
+@@ -8,4 +8,5 @@ dtb-$(CONFIG_ARCH_SUNXI) += sun20i-d1-lichee-rv-dock.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun20i-d1-lichee-rv.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun20i-d1-mangopi-mq-pro.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun20i-d1-nezha.dtb
++dtb-$(CONFIG_ARCH_SUNXI) += sun20i-d1s-epass-next.dtb
+ dtb-$(CONFIG_ARCH_SUNXI) += sun20i-d1s-mangopi-mq.dtb
+diff --git a/arch/riscv/boot/dts/allwinner/sun20i-d1s-epass-next.dts b/arch/riscv/boot/dts/allwinner/sun20i-d1s-epass-next.dts
+new file mode 100644
+index 000000000..c79b5a2b8
+--- /dev/null
++++ b/arch/riscv/boot/dts/allwinner/sun20i-d1s-epass-next.dts
+@@ -0,0 +1,600 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Copyright (C) 2025 Lukas Schmid <lukas.schmid@netcube.li>
++ *
++ * D1s port of the T113-s3 board. The two SoCs are pin compatible, but the
++ * in-package DRAM is not: T113-s3 carries DDR3 (1.35V), D1s carries DDR2
++ * (1.8V). AXP209 DCDC2 feeds VCC-DRAM, so it must be raised accordingly --
++ * the SPL does this before touching the DRAM controller, and reg_dcdc2 below
++ * must agree with it or the supply drops the moment the PMIC driver probes.
++ */
++
++/dts-v1/;
++
++#include "sun20i-d1s.dtsi"
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dt-bindings/interrupt-controller/irq.h>
++#include <dt-bindings/input/input.h>
++#include <dt-bindings/clock/sun20i-d1-ccu.h>
++#include <dt-bindings/reset/sun20i-d1-ccu.h>
++
++/ {
++	model = "Arknights ePass Next (D1s)";
++	compatible = "rhodesisland,epass-next", "allwinner,sun20i-d1s";
++
++	aliases {
++		serial3 = &uart3;
++	};
++
++	chosen {
++		stdout-path = "serial3:115200n8";
++		/*
++		 * earlycon: with CONFIG_VT off there is no console at all until
++		 * the 8250 driver probes, which is several seconds in.
++		 *
++		 * clk_ignore_unused/pd_ignore_unused: the DRAM controller was
++		 * brought up by the SPL and no driver claims its clocks, so
++		 * clk_disable_unused() would switch them off underneath us.
++		 *
++		 * This is the FEL bring-up command line: the rootfs is the
++		 * initramfs linked into the image, because the SPI NAND is not
++		 * populated. Booting from NAND means U-Boot passing instead
++		 *
++		 *   rootwait ro root=ubi0:rootfs rootfstype=ubifs
++		 *   ubi.mtd=rootfs ubi.mtd=data ubi.fm_autoconvert=1
++		 *   init=/preinit
++		 *
++		 * where the order of the two ubi.mtd= is what makes rootfs ubi0
++		 * and data ubi1; preinit then mounts ubi1:rootfs_data by name.
++		 */
++		bootargs = "earlycon console=tty0 console=ttyS3,115200n8 clk_ignore_unused pd_ignore_unused cma=32M";
++	};
++
++	memory@40000000 {
++		device_type = "memory";
++		reg = <0x40000000 0x4000000>;	/* 64M in-package DDR2 */
++	};
++
++	reg_vcc5v: regulator-5v {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc-5v";
++		regulator-min-microvolt = <5000000>;
++		regulator-max-microvolt = <5000000>;
++		regulator-always-on;
++	};
++
++	reg_vcc3v3: regulator-3v3 {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc-3v3";
++		regulator-min-microvolt = <3300000>;
++		regulator-max-microvolt = <3300000>;
++		regulator-always-on;
++		vin-supply = <&reg_vcc5v>;
++	};
++
++	reg_vcc_core: regulator-core {
++		compatible = "regulator-fixed";
++		regulator-name = "vcc-core";
++		regulator-min-microvolt = <900000>;
++		regulator-max-microvolt = <900000>;
++		vin-supply = <&reg_vcc3v3>;
++	};
++
++	backlight: backlight {
++		compatible = "pwm-backlight";
++		pwms = <&pwm 4 50000 0>;
++		brightness-levels = <0 4 8 16 32 64 128 196 220 255>;
++		default-brightness-level = <9>;
++		power-supply = <&reg_vcc3v3>;
++	};
++
++	gpio-keys {
++		compatible = "gpio-keys";
++
++		switch-1 {
++			label = "sw1";
++			linux,code = <KEY_1>;
++			gpios = <&pio 6 6 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
++		};
++
++		switch-2 {
++			label = "sw2";
++			linux,code = <KEY_2>;
++			gpios = <&pio 6 7 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
++		};
++
++		switch-3 {
++			label = "sw3";
++			linux,code = <KEY_3>;
++			gpios = <&pio 6 8 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
++		};
++
++		switch-4 {
++			label = "sw4";
++			linux,code = <KEY_4>;
++			gpios = <&pio 6 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
++		};
++	};
++};
++
++/*
++ * Nodes the upstream D1/D1s dtsi does not carry yet. Addresses and interrupt
++ * numbers are from the D1-H user manual (sec. 3.1 memory map and the interrupt
++ * source table): VE 0x01c0e000/8K irq 81, IOMMU 0x02010000/64K irq 80,
++ * PWM 0x02000c00/1K irq 34.
++ */
++&{/soc} {
++	pwm: pwm@2000c00 {
++		compatible = "allwinner,sun20i-d1-pwm";
++		reg = <0x2000c00 0x400>;
++		interrupts = <SOC_PERIPHERAL_IRQ(34) IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&ccu CLK_BUS_PWM>, <&dcxo>, <&ccu CLK_APB0>;
++		clock-names = "bus", "hosc", "apb";
++		resets = <&ccu RST_BUS_PWM>;
++		#pwm-cells = <3>;
++		status = "disabled";
++	};
++
++	/*
++	 * The C906 CLINT lives in M-mode, so Linux never touches it and the
++	 * mainline SoC dtsi does not describe it. OpenSBI does need it: without
++	 * a node it finds no timer device ("Platform Timer Device: --- @ 0Hz"),
++	 * SBI_SET_TIMER silently does nothing, and the kernel loses its tick a
++	 * second into boot -- jiffies freeze and every msleep() never returns.
++	 */
++	clint: timer@14000000 {
++		compatible = "thead,c900-clint";
++		reg = <0x14000000 0x04000000>;
++		interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
++	};
++
++	/*
++	 * No iommu node. The D1 has one, but with DE translated the picture
++	 * collapses into full-screen vertical stripes as soon as a second
++	 * mixer channel starts fetching -- no fault ever raised, and no
++	 * prefetch/OOO/wbuf/auto-gating knob changes it. The vendor kernels
++	 * for both D1 and T113 pin DE to bypass (iommus flag 0), so DE behind
++	 * the IOMMU is a configuration nobody has ever validated on this
++	 * silicon. With DE stuck on physical addresses the VE must stay on
++	 * them too (its frames are scanned out directly), which makes the
++	 * IOMMU useless here; scanout memory comes from CMA instead.
++	 */
++
++	ve: video-codec@1c0e000 {
++		compatible = "allwinner,sun20i-d1-video-engine";
++		reg = <0x1c0e000 0x2000>;
++		/*
++		 * PLIC 82 (D1-H manual 中断源表: 80=IOMMU, 81=保留, 82=VE;
++		 * BSP 的 sun20iw1p1.dtsi 同样是 <&plic0 82>)。
++		 * SOC_PERIPHERAL_IRQ(nr) = nr + 16, 所以这里要写 66 而不是 82 ——
++		 * 填 81 会注册到 PLIC 97 那个空号上, 中断永远不来: VE 每帧都解完
++		 * 但驱动收不到完成通知, 全靠 cedrus watchdog 2s 后 reset, 表现为
++		 * "frame processing timed out!" + 每帧 src/dst 双 ERROR。
++		 */
++		interrupts = <SOC_PERIPHERAL_IRQ(66) IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&ccu CLK_BUS_VE>, <&ccu CLK_VE>, <&ccu CLK_MBUS_VE>;
++		clock-names = "ahb", "mod", "ram";
++		resets = <&ccu RST_BUS_VE>;
++		status = "disabled";
++	};
++
++	/*
++	 * The rotate engine sitting inside G2D at +0x28000. This is the very
++	 * same IP the mainline sun8i-rotate driver already handles on A83T and
++	 * A64, where it lives in the DE instead; the register map is identical
++	 * field for field and is documented in the DE2.0 spec section 5.13.
++	 * The D1 DE does not have it -- its DE2 clock controller exposes no
++	 * CLK_ROT/RST_ROT, and the vendor DE driver rotates framebuffers by
++	 * calling into G2D (disp2/disp/fb_g2d_rot.c).
++	 *
++	 * The second reg range is the G2D TOP block. Only bit 1 there is ours
++	 * (rotate gating and soft reset); bit 0 is the G2D mixer, which has no
++	 * driver and is deliberately left in reset.
++	 *
++	 * PLIC 105 = G2D (D1-H manual interrupt vector table; BSP
++	 * sun20iw1p1.dtsi agrees). SOC_PERIPHERAL_IRQ(nr) = nr + 16, hence 89 --
++	 * same trap as the ve node above.
++	 *
++	 * No iommus: G2D has no scatter-gather, buffers must be physically
++	 * contiguous, which is what CMA gives us.
++	 */
++	g2d_rotate: rotate@5438000 {
++		compatible = "allwinner,sun20i-d1-g2d-rotate";
++		reg = <0x5438000 0x1000>,	/* rotate engine */
++		      <0x5410000 0x10>;		/* G2D TOP */
++		interrupts = <SOC_PERIPHERAL_IRQ(89) IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&ccu CLK_BUS_G2D>, <&ccu CLK_G2D>, <&ccu CLK_MBUS_G2D>;
++		clock-names = "bus", "mod", "mbus";
++		resets = <&ccu RST_BUS_G2D>;
++		/*
++		 * 300 MHz is what the vendor driver picks. g2d_clk has no
++		 * CLK_SET_RATE_PARENT (ccu-sun20i-d1.c), so this only selects a
++		 * divider and will not disturb the video PLL driving the panel:
++		 * pll-periph0-2x is 1200 MHz, M=4 lands exactly on 300 MHz.
++		 */
++		assigned-clocks = <&ccu CLK_G2D>;
++		assigned-clock-rates = <300000000>;
++		status = "disabled";
++	};
++
++	/*
++	 * The audio codec is one IP with two halves at adjacent addresses:
++	 * the digital DAC/ADC and FIFOs at 0x2030000, and the analog side
++	 * -- PGA, headphone amp, mic bias -- at 0x2030300. They are two
++	 * nodes because they are two drivers, sun4i-codec and
++	 * sun20i-d1-codec-analog, tied together by the phandle below.
++	 *
++	 * Unlike the older SoCs the analog half is plain MMIO here, not the
++	 * ADDA-PR indirect register bus, which is why sun8i-codec-analog
++	 * does not drive it.
++	 *
++	 * Both DMA names point at DRQ 7: the codec has one request line and
++	 * the direction is chosen by which FIFO the channel is pointed at.
++	 */
++	codec: codec@2030000 {
++		#sound-dai-cells = <0>;
++		compatible = "allwinner,sun20i-d1-codec";
++		reg = <0x2030000 0x300>;
++		interrupts = <SOC_PERIPHERAL_IRQ(25) IRQ_TYPE_LEVEL_HIGH>;
++		clocks = <&ccu CLK_BUS_AUDIO>, <&ccu CLK_AUDIO_ADC>,
++			 <&ccu CLK_AUDIO_DAC>;
++		clock-names = "apb", "adc", "dac";
++		resets = <&ccu RST_BUS_AUDIO>;
++		dmas = <&dma 7>, <&dma 7>;
++		dma-names = "rx", "tx";
++		allwinner,codec-analog-controls = <&codec_analog>;
++		status = "disabled";
++	};
++
++	codec_analog: codec-analog@2030300 {
++		compatible = "allwinner,sun20i-d1-codec-analog";
++		reg = <0x2030300 0xd00>;
++		status = "disabled";
++	};
++};
++
++&cpu0 {
++	cpu-supply = <&reg_vcc_core>;
++};
++
++&dcxo {
++	clock-frequency = <24000000>;
++};
++
++&pio {
++	vcc-pb-supply = <&reg_vcc3v3>;
++	vcc-pc-supply = <&reg_vcc3v3>;
++	vcc-pd-supply = <&reg_vcc3v3>;
++	vcc-pe-supply = <&reg_vcc3v3>;
++	vcc-pf-supply = <&reg_vcc3v3>;
++	vcc-pg-supply = <&reg_vcc3v3>;
++
++	/omit-if-no-ref/
++	i2c0_pb_pins: i2c0-pb-pins {
++		pins = "PB2", "PB3";
++		function = "i2c0";
++	};
++
++	/omit-if-no-ref/
++	pwm4_pd_pin: pwm4-pd-pin {
++		pins = "PD20";
++		function = "pwm4";
++	};
++
++	/*
++	 * The dtsi's spi0_pins is CLK/CS/MOSI/MISO only, which is all a
++	 * single-lane bus needs. Quad also drives PC6 (WP, becoming IO2) and
++	 * PC7 (HOLD, becoming IO3); both mux to spi0 at the same function
++	 * value as the other four, so one group covers the whole bus.
++	 *
++	 * The drive strength is not cosmetic: the pads come out of reset at
++	 * 10mA and this bus runs at 100MHz. The BSP sets 20mA here, and pulls
++	 * up CS/WP/HOLD so a lane is never floating while the controller has
++	 * it configured as an input between bursts.
++	 */
++	spi0_quad_pins: spi0-quad-pins {
++		pins = "PC2", "PC4", "PC5";
++		function = "spi0";
++		drive-strength = <20>;
++	};
++
++	spi0_quad_pu_pins: spi0-quad-pu-pins {
++		pins = "PC3", "PC6", "PC7";
++		function = "spi0";
++		drive-strength = <20>;
++		bias-pull-up;
++	};
++};
++
++&i2c0 {
++	pinctrl-0 = <&i2c0_pb_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	axp209: pmic@34 {
++		compatible = "x-powers,axp209";
++		reg = <0x34>;
++		interrupt-parent = <&pio>;
++		interrupts = <1 4 IRQ_TYPE_EDGE_FALLING>; /* PB4 */
++		interrupt-controller;
++		#interrupt-cells = <1>;
++
++		/*
++		 * PEK is wired to the panel's "0" key, not a power button, so
++		 * the driver must report KEY_0 instead of its fixed KEY_POWER.
++		 */
++		x-powers,pek-keycode = <KEY_0>;
++
++		axp_adc: adc {
++			compatible = "x-powers,axp209-adc";
++			#io-channel-cells = <1>;
++		};
++
++		axp_gpio: gpio {
++			compatible = "x-powers,axp209-gpio";
++			gpio-controller;
++			#gpio-cells = <2>;
++		};
++
++		regulators {
++			x-powers,dcdc-freq = <1500>;
++
++			/*
++			 * VCC-DRAM. The D1s has in-package DDR2, which wants
++			 * 1.8V -- NOT the 1.35V the T113-s3's DDR3 used. This
++			 * must match what the SPL programmed, otherwise the
++			 * regulator core drops it back and the DRAM dies.
++			 */
++			reg_dcdc2: dcdc2 {
++				regulator-name = "vcc-dram";
++				regulator-min-microvolt = <1800000>;
++				regulator-max-microvolt = <1800000>;
++				regulator-always-on;
++			};
++
++			reg_dcdc3: dcdc3 {
++				regulator-name = "vcc-3v3-pmic";
++				regulator-min-microvolt = <3300000>;
++				regulator-max-microvolt = <3300000>;
++				regulator-always-on;
++			};
++
++			reg_ldo1: ldo1 {
++				regulator-name = "vcc-rtc";
++				regulator-always-on;
++				regulator-min-microvolt = <1300000>;
++				regulator-max-microvolt = <1300000>;
++			};
++
++			reg_ldo2: ldo2 {
++				regulator-name = "avcc";
++			};
++
++			reg_ldo3: ldo3 {
++				regulator-name = "ldo3";
++			};
++
++			reg_ldo4: ldo4 {
++				regulator-name = "ldo4";
++			};
++
++			reg_ldo5: ldo5 {
++				regulator-name = "ldo5";
++				status = "disabled";
++			};
++		};
++	};
++};
++
++&pwm {
++	pinctrl-0 = <&pwm4_pd_pin>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++/* --- display: DE2.0 -> mixer0 -> tcon_top -> tcon_lcd0 -> dsi --- */
++&de {
++	status = "okay";
++};
++
++&tcon_top {
++	status = "okay";
++};
++
++&tcon_lcd0 {
++	status = "okay";
++};
++
++&dphy {
++	status = "okay";
++};
++
++&dsi {
++	/* DSI is a bus: the panel's reg is a virtual channel, not an address */
++	#address-cells = <1>;
++	#size-cells = <0>;
++
++	pinctrl-0 = <&dsi_4lane_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	panel@0 {
++		compatible = "rhodesisland,epassnext-panel";
++		reg = <0>;
++		backlight = <&backlight>;
++		iovcc-supply = <&reg_vcc3v3>;
++		vcc-supply = <&reg_vcc3v3>;
++		reset-gpios = <&pio 3 21 GPIO_ACTIVE_LOW>; /* PD21 */
++		rotation = <0>;
++	};
++};
++
++/* --- video decode --- */
++&ve {
++	status = "okay";
++};
++
++&g2d_rotate {
++	status = "okay";
++};
++
++/* --- audio --- */
++&codec {
++	/*
++	 * "Headphone" is the card-level jack widget, "HP" the analog half's
++	 * output. Everything else on the codec -- line in, mic2, the DMICs --
++	 * is not wired on this board, and fully_routed keeps those paths
++	 * powered down.
++	 */
++	allwinner,audio-routing = "Headphone", "HP";
++	status = "okay";
++};
++
++&codec_analog {
++	status = "okay";
++};
++
++&mmc0 {
++	pinctrl-0 = <&mmc0_pins>;
++	pinctrl-names = "default";
++	vmmc-supply = <&reg_vcc3v3>;
++	/*
++	 * broken-cd rather than cd-gpios: the slot's detect pin is not wired
++	 * to the SoC, so the core has to poll for a card instead.
++	 */
++	broken-cd;
++	disable-wp;
++	bus-width = <4>;
++	status = "okay";
++};
++
++&spi0 {
++	pinctrl-0 = <&spi0_quad_pins>, <&spi0_quad_pu_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++
++	flash@0 {
++		compatible = "spi-nand";
++		reg = <0>;
++		/*
++		 * The board is intentionally back on its 100MHz QIO baseline.
++		 * Intermittent UBIFS read corruption and the follow-up tests are
++		 * recorded in docs/ubifs-transient-read-followup.md.
++		 */
++		spi-max-frequency = <100000000>;
++
++		/*
++		 * Without these the bus width never leaves 1: spi->mode gets
++		 * SPI_RX_QUAD/SPI_TX_QUAD from nowhere else, spi_mem_supports_op
++		 * then rejects every x2/x4 entry in the chip's variant table,
++		 * and spinand silently settles on the 1S-1S-1S read. The
++		 * controller has had the QUAD_EN bit wired up all along.
++		 */
++		spi-rx-bus-width = <4>;
++		spi-tx-bus-width = <4>;
++
++		/*
++		 * 128MB, 2K page, 128K erase block; every boundary below is a
++		 * whole number of erase blocks.
++		 *
++		 * rootfs and data are deliberately separate MTD partitions
++		 * rather than two volumes of one UBI device: reflashing writes
++		 * rootfs and never touches data, which is what makes an upgrade
++		 * keep the user's data. rootfs carries a read-only UBIFS that
++		 * is the overlay lower; data carries the writable upper and
++		 * work directories. See preinit.
++		 *
++		 * Keep this table identical to the one in the U-Boot board dts
++		 * -- nothing checks that they agree.
++		 */
++		partitions {
++			compatible = "fixed-partitions";
++			#address-cells = <1>;
++			#size-cells = <1>;
++
++			partition@0 {
++				label = "boot0";
++				reg = <0x0 0x40000>;	/* 256K */
++				read-only;
++			};
++
++			partition@40000 {
++				label = "uboot";
++				/* u-boot.itb: OpenSBI fw_dynamic + U-Boot */
++				reg = <0x40000 0x100000>;	/* 1M */
++				read-only;
++			};
++
++			partition@140000 {
++				/* one erase block, holding env.txt */
++				label = "bootenv";
++				reg = <0x140000 0x20000>;	/* 128K */
++			};
++
++			partition@160000 {
++				/*
++				 * One partition holding two FITs, the way the
++				 * F1C boards do it and the way the flasher
++				 * expects: dtbs.itb in a 1M slot at the start,
++				 * kernel.itb right after it. Keeping them in
++				 * one partition means one DFU alt setting and
++				 * one image to hand the flasher.
++				 */
++				label = "boot";
++				reg = <0x160000 0xa00000>;	/* 10M */
++			};
++
++			partition@b60000 {
++				/* ubi0, one 24M volume: the read-only system */
++				label = "rootfs";
++				reg = <0xb60000 0x1c00000>;	/* 28M */
++			};
++
++			partition@2760000 {
++				/* ubi1, rootfs_data: overlay upper + work */
++				label = "data";
++				reg = <0x2760000 0x58a0000>;	/* 88.6M */
++			};
++		};
++	};
++};
++
++&uart3 {
++	pinctrl-0 = <&uart3_pb_pins>;
++	pinctrl-names = "default";
++	status = "okay";
++};
++
++&usb_otg {
++	dr_mode = "peripheral";
++	status = "okay";
++};
++
++&usbphy {
++	usb0_vbus-supply = <&reg_vcc5v>;
++	usb1_vbus-supply = <&reg_vcc5v>;
++	status = "okay";
++};
++
++&ehci1 {
++	status = "okay";
++};
++
++&ohci1 {
++	status = "okay";
++};
++
++&wdt {
++	status = "okay";
++};
++
++/*
++ * The sunxi timer's clockevent outranks the riscv/SBI one (350 vs 100), so it
++ * wins the tick device -- but it sits on PLIC irq 59, which never fires on this
++ * board. jiffies then freeze a second into boot and every msleep() hangs, with
++ * no oops and no hung-task report to show for it. Use SBI_SET_TIMER instead.
++ */
++&timer {
++	status = "disabled";
++};

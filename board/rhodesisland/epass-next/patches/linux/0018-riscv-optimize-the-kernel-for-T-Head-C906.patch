@@ -1,0 +1,61 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] riscv: optimize the kernel for T-Head C906
+
+The ePass Next kernel is a non-portable D1s image and always runs on a
+T-Head C906.  Allow GCC to use the core's scalar vendor extensions and tune
+instruction selection and scheduling for its pipeline.  Keep floating-point
+and vector instructions out of kernel C code as required by the RISC-V kernel.
+
+xtheadmemidx makes reg+reg addresses legitimate, which used to leak into
+the uaccess inline asm "m" operands and produce instructions the assembler
+rejects (e.g. "sb zero,a0,s5,0"); that is fixed by the companion patch
+switching those asm memory operands to the "A" constraint.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+
+---
+diff --git a/arch/riscv/Kconfig.vendor b/arch/riscv/Kconfig.vendor
+index 3c1f92e40..e3f6e471f 100644
+--- a/arch/riscv/Kconfig.vendor
++++ b/arch/riscv/Kconfig.vendor
+@@ -54,6 +54,18 @@ config RISCV_ISA_VENDOR_EXT_THEAD
+ 
+ 	  If you don't know what to do here, say Y.
+ 
++config RISCV_TUNE_THEAD_C906
++	bool "Optimize the kernel for T-Head C906"
++	depends on NONPORTABLE
++	depends on ARCH_RV64I
++	depends on RISCV_ISA_C
++	depends on RISCV_ISA_VENDOR_EXT_THEAD
++	depends on $(cc-option,-mtune=thead-c906)
++	help
++	  Allow the compiler to emit the T-Head scalar extensions implemented by
++	  the C906 and tune instruction selection and scheduling for that core.
++	  The resulting kernel will not run on a generic RV64 processor.
++
+ config RISCV_ISA_XTHEADVECTOR
+ 	bool "xtheadvector extension support"
+ 	depends on RISCV_ISA_VENDOR_EXT_THEAD
+diff --git a/arch/riscv/Makefile b/arch/riscv/Makefile
+index ce0cc737f..8e2c46351 100644
+--- a/arch/riscv/Makefile
++++ b/arch/riscv/Makefile
+@@ -88,6 +88,17 @@ export KBUILD_BASE_ISA
+ # matching non-v and non-multi-letter extensions out with the filter ([^v_]*)
+ KBUILD_CFLAGS += $(KBUILD_BASE_ISA)
+ 
++thead-c906-march := rv64imac_zicsr_zifencei_xtheadba_xtheadbb_xtheadbs
++thead-c906-march := $(thead-c906-march)_xtheadcmo_xtheadcondmov_xtheadfmemidx
++# xtheadmemidx makes reg+reg addresses legitimate, which would leak into
++# inline asm "m" operands whose templates hard-code base mnemonics; the
++# uaccess/word-at-a-time asm uses the "A" constraint to keep them out.
++thead-c906-march := $(thead-c906-march)_xtheadmac_xtheadmemidx_xtheadmempair_xtheadsync
++
++ifeq ($(CONFIG_RISCV_TUNE_THEAD_C906),y)
++KBUILD_CFLAGS += -march=$(thead-c906-march) -mtune=thead-c906
++endif
++
+ KBUILD_AFLAGS += -march=$(riscv-march-y)
+ 
+ # For C code built with floating-point support, exclude V but keep F and D.

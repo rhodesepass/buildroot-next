@@ -1,0 +1,156 @@
+#!/bin/sh
+#
+# epass app supervisor
+#
+# app exit code protocol:
+#   0 - clean exit, stop supervising
+#   1 - remount SD card, restart app
+#   2 - run staged /tmp/appstart (self update), restart app
+#   3 - power off
+#   4 - launch system_maintenance (SD format UI), then remount + restart app
+#   5 - run srgn_config, restart app
+#   * - crash (incl. 128+N killed by signal), auto restart
+
+APP_DIR=/root
+PIDFILE=/var/run/epass_app.pid
+SYSTEM_MAINTENANCE=/app/system_maintenance/system_maintenance
+QUICK_START=/app/quick_start/quick_start
+QUICK_START_DONE=/etc/.quick_start_done
+
+log() {
+    echo "epass_app: $*" > /dev/kmsg
+}
+
+# 不能读 /sys/class/drm/card0-*/modes:FBDEV_EMULATION 关了,app 自己
+# 打开 DRM 之前没人 probe connector,modes 恒为空
+#
+# 面板挂在 DSI 总线下(soc/dsi@*/panel@0),不是 F1C 那种根节点 /panel
+panel_mode() {
+    for f in /proc/device-tree/soc/*/panel@*/compatible; do
+        [ -e "$f" ] || continue
+        tr '\0' '\n' < "$f" | head -n 1
+        return
+    done
+}
+
+pick_app() {
+    case "$(panel_mode)" in
+        rhodesisland,epassnext-panel) echo "$APP_DIR/app_720" ;;
+        *) echo "$APP_DIR/app_360" ;;
+    esac
+}
+
+# 挂载逻辑收进 /usr/sbin/sdmount(与 mdev 热插拔共用, flock 串行化);
+# app 自己按 /proc/mounts 判断 /sd 是否可用，不再传参
+remount_sd() {
+    /usr/sbin/sdmount remount > /dev/null 2>&1
+}
+
+supervise() {
+    cd "$APP_DIR" || exit 1
+
+    APP=$(pick_app)
+    log "panel mode '$(panel_mode)', using $APP"
+
+    if [ ! -f "$APP" ]; then
+        log "$APP missing, switching to MTP"
+        usbaioctl select mtp
+        exit 1
+    fi
+
+    remount_sd
+
+    # 显示交接: 到这里为止屏幕一直由内建的 simpledrm 撑着 U-Boot 的 logo
+    # (simple-framebuffer 节点), 真正的 sun4i 驱动编成了模块, 现在才加载 --
+    # 面板复位重初始化那 ~0.4s 黑屏因此贴着 app 首帧, 而不是落在 boot 中间。
+    # 组件驱动先注册, 最后 sun4i-drm 主驱动进来 bind 整条流水线并踢掉
+    # simpledrm(card0 号会被复用, app 打开的还是 card0)。
+    # 没有 splash 时这些 modprobe 也一样要做, 顺序无所谓, 失败单独容忍。
+    for m in panel-sitronix-st7703 phy-sun6i-mipi-dphy sun8i-tcon-top \
+             sun8i-mixer sun4i-tcon sun6i-mipi-dsi sun4i-drm; do
+        modprobe "$m" 2> /dev/null
+    done
+    # bind 是异步的(component framework), 等 DSI 接上再放 app 进去,
+    # 免得首启动打开 /dev/dri/card0 扑空; 3s 等不到就不拦了
+    n=0
+    while [ ! -e /sys/class/drm/card0-DSI-1 ] && [ "$n" -lt 30 ]; do
+        sleep 0.1
+        n=$((n + 1))
+    done
+
+    # 首次开机：SD 已挂载，再跑 quick_start，之后才进主 app。
+    # 二进制不在(epass_applications 还没搬过来)时不落标记,
+    # 免得包到位以后首次开机流程被永久跳过
+    if [ ! -f "$QUICK_START_DONE" ] && [ -x "$QUICK_START" ]; then
+        log "first boot: starting $QUICK_START"
+        "$QUICK_START"
+        log "quick_start finished (exit $?)"
+        touch "$QUICK_START_DONE"
+    fi
+
+    while true; do
+        # 不能无条件 chmod: overlayfs 上对 lower 文件 setattr 会整文件
+        # copy-up 进 upper, 之后刷 lower 就更新不到这个 app 了
+        [ -x "$APP" ] || chmod +x "$APP" 2> /dev/null
+        log "starting $APP"
+        "$APP" > /dev/null 2>&1
+        ret=$?
+        case "$ret" in
+            0)
+                log "clean exit"
+                break
+                ;;
+            1)
+                remount_sd
+                ;;
+            2)
+                log "running /tmp/appstart"
+                chmod +x /tmp/appstart 2> /dev/null
+                /tmp/appstart
+                ;;
+            3)
+                log "poweroff requested"
+                poweroff
+                break
+                ;;
+            4)
+                if [ -x "$SYSTEM_MAINTENANCE" ]; then
+                    log "starting $SYSTEM_MAINTENANCE"
+                    "$SYSTEM_MAINTENANCE"
+                else
+                    log "$SYSTEM_MAINTENANCE missing"
+                fi
+                remount_sd
+                ;;
+            5)
+                command -v srgn_config > /dev/null && srgn_config
+                ;;
+            *)
+                log "app crashed (exit $ret), restarting"
+                sleep 2
+                ;;
+        esac
+    done
+    rm -f "$PIDFILE"
+}
+
+case "$1" in
+    start)
+        supervise &
+        echo $! > "$PIDFILE"
+        ;;
+    stop)
+        [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2> /dev/null
+        rm -f "$PIDFILE"
+        killall app_360 app_720 system_maintenance quick_start 2> /dev/null
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac

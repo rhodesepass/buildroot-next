@@ -1,0 +1,453 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 8/13] drm/sun4i: expose the D1 UI channel's four overlays as
+ planes
+
+The D1 mixer has one VI and one UI channel, so a compositor sees just two
+planes. But a DE2 UI channel drives four overlays of its own, composited
+inside the channel ahead of the blender, each with its own position,
+buffer and alpha. Splitting them out turns the panel pipeline into five
+planes (1 VI + 4 UI) for the cost of UI scaling: the channel has a single
+scaler, so with more than one overlay exposed scaling is refused in
+atomic_check and the scaler is forced off.
+
+The register semantics come from the BSP's de_rtmx_calc_chnrect(), and
+none of them are what the single-overlay driver wrote:
+
+  - OVL_SIZE is the bounding box of all enabled overlays in the channel,
+    not the screen size;
+  - each overlay's LAYER_COORD is relative to that bounding box, not to
+    the CRTC;
+  - the blender input coordinate/size for the channel are the bounding
+    box's position and size.
+
+With one full-screen layer at (0,0) all four values coincide, which is
+how the old code survived every full-screen test and fell apart the
+moment a second overlay landed at an offset.
+
+Overlay z-order inside the channel is fixed by the hardware
+(overlay3 > overlay2 > ... , DE2.0 spec figure 5-4), so the split planes
+get immutable zpos.
+
+Verified on the 720x1280 panel with three offset 256x256 ARGB8888
+rectangles on overlays 0-2 over a full-screen primary: positions,
+patterns and per-pixel alpha all correct.
+---
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 4071ab38b..b33fc0f10 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -258,18 +258,35 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
+ 	u32 bld_base = sun8i_blender_base(mixer);
+ 	struct regmap *bld_regs = sun8i_blender_regmap(mixer);
++	int ui_ovl = max(mixer->cfg->lay_cfg.ui_ovl_num, 1);
+ 	struct drm_plane_state *plane_state;
+ 	struct drm_plane *plane;
+ 	u32 route = 0, pipe_en = 0;
++	struct sun8i_chan_rect {
++		struct sun8i_layer *layer;
++		int x1, y1, x2, y2;
++		int zpos;
++	} chan[SUN8I_MIXER_MAX_CHANNELS] = { };
++	int i;
+ 
+ 	DRM_DEBUG_DRIVER("Committing changes\n");
+ 
++	/*
++	 * Overlays sharing a channel are composited before the blender, into a
++	 * window that is only as large as the overlays actually in use, and
++	 * they are positioned relative to that window rather than to the
++	 * screen. So the channel geometry has to be derived from all of its
++	 * live overlays at once -- collect the bounding box first, then write
++	 * the per-overlay and per-channel registers from it. This mirrors the
++	 * BSP's de_rtmx_calc_chnrect().
++	 */
+ 	drm_for_each_plane(plane, state->dev) {
+ 		struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
+-		int w, h, x, y, zpos;
++		struct sun8i_chan_rect *c;
+ 		bool enable;
+ 
+-		if (!(plane->possible_crtcs & drm_crtc_mask(crtc)))
++		if (!(plane->possible_crtcs & drm_crtc_mask(crtc)) ||
++		    layer->channel >= SUN8I_MIXER_MAX_CHANNELS)
+ 			continue;
+ 
+ 		plane_state = drm_atomic_get_new_plane_state(state, plane);
+@@ -277,26 +294,83 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 			plane_state = plane->state;
+ 
+ 		enable = plane_state->crtc && plane_state->visible;
+-		zpos = plane_state->normalized_zpos;
+-		x = plane_state->dst.x1;
+-		y = plane_state->dst.y1;
+-		w = drm_rect_width(&plane_state->dst);
+-		h = drm_rect_height(&plane_state->dst);
+ 
+-		DRM_DEBUG_DRIVER("  plane %d: chan=%d ovl=%d en=%d zpos=%d x=%d y=%d w=%d h=%d\n",
+-				 plane->base.id, layer->index, layer->overlay,
+-				 enable, zpos, x, y, w, h);
++		DRM_DEBUG_DRIVER("  plane %d: chan=%d ovl=%d en=%d dst=" DRM_RECT_FMT "\n",
++				 plane->base.id, layer->channel, layer->overlay,
++				 enable, DRM_RECT_ARG(&plane_state->dst));
+ 
+ 		if (!enable)
+ 			continue;
+ 
+-		/* Route layer to pipe based on zpos */
+-		route |= layer->index << SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(zpos);
++		c = &chan[layer->channel];
++		if (!c->layer) {
++			c->layer = layer;
++			c->zpos = plane_state->normalized_zpos;
++			c->x1 = plane_state->dst.x1;
++			c->y1 = plane_state->dst.y1;
++			c->x2 = plane_state->dst.x2;
++			c->y2 = plane_state->dst.y2;
++		} else {
++			c->x1 = min(c->x1, plane_state->dst.x1);
++			c->y1 = min(c->y1, plane_state->dst.y1);
++			c->x2 = max(c->x2, plane_state->dst.x2);
++			c->y2 = max(c->y2, plane_state->dst.y2);
++		}
++	}
++
++	/* Place each overlay inside its channel's window. */
++	if (ui_ovl > 1) {
++		drm_for_each_plane(plane, state->dev) {
++			struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
++			struct sun8i_chan_rect *c;
++
++			if (!(plane->possible_crtcs & drm_crtc_mask(crtc)) ||
++			    layer->channel >= SUN8I_MIXER_MAX_CHANNELS ||
++			    layer->type != SUN8I_LAYER_TYPE_UI)
++				continue;
++
++			c = &chan[layer->channel];
++			if (!c->layer)
++				continue;
++
++			plane_state = drm_atomic_get_new_plane_state(state, plane);
++			if (!plane_state)
++				plane_state = plane->state;
++			if (!plane_state->crtc || !plane_state->visible)
++				continue;
++
++			sun8i_ui_layer_set_coord(layer,
++						 plane_state->dst.x1 - c->x1,
++						 plane_state->dst.y1 - c->y1);
++		}
++	}
++
++	for (i = 0; i < SUN8I_MIXER_MAX_CHANNELS; i++) {
++		struct sun8i_chan_rect *c = &chan[i];
++		int w, h, zpos;
++
++		if (!c->layer)
++			continue;
++
++		w = c->x2 - c->x1;
++		h = c->y2 - c->y1;
++
++		/*
++		 * One pipe per channel. zpos cannot choose it once several
++		 * planes share a channel -- they would fight over the same
++		 * pipe -- so the stacking order is fixed by channel index.
++		 */
++		zpos = ui_ovl > 1 ? i : c->zpos;
++
++		if (ui_ovl > 1 && c->layer->type == SUN8I_LAYER_TYPE_UI)
++			sun8i_ui_layer_set_ovl_size(c->layer, w, h);
++
++		route |= i << SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(zpos);
+ 		pipe_en |= SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
+ 
+ 		regmap_write(bld_regs,
+ 			     SUN8I_MIXER_BLEND_ATTR_COORD(bld_base, zpos),
+-			     SUN8I_MIXER_COORD(x, y));
++			     SUN8I_MIXER_COORD(c->x1, c->y1));
+ 		regmap_write(bld_regs,
+ 			     SUN8I_MIXER_BLEND_ATTR_INSIZE(bld_base, zpos),
+ 			     SUN8I_MIXER_SIZE(w, h));
+@@ -316,9 +390,12 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ {
+ 	struct drm_plane **planes;
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
+-	int plane_cnt = mixer->cfg->ui_num + mixer->cfg->vi_num;
++	int ui_ovl = max(mixer->cfg->lay_cfg.ui_ovl_num, 1);
++	int ui_planes = mixer->cfg->ui_num * ui_ovl;
++	int plane_cnt = ui_planes + mixer->cfg->vi_num;
+ 	enum drm_plane_type type;
+ 	unsigned int phy_index;
++	bool have_primary = false;
+ 	int i;
+ 
+ 	planes = devm_kcalloc(drm->dev, plane_cnt + 1, sizeof(*planes), GFP_KERNEL);
+@@ -328,10 +405,19 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ 	for (i = 0; i < mixer->cfg->vi_num; i++) {
+ 		struct sun8i_layer *layer;
+ 
+-		if (i == 0 && !mixer->cfg->ui_num)
++		/*
++		 * Planes stack in creation order, VI channels underneath the UI
++		 * ones, so plane 0 is the bottom of the screen. Put the primary
++		 * there when we can: with several UI overlays in play the old
++		 * choice of "first UI plane" would leave the primary sandwiched
++		 * between overlays it cannot move away from.
++		 */
++		if (i == 0 && (!mixer->cfg->ui_num || ui_ovl > 1)) {
+ 			type = DRM_PLANE_TYPE_PRIMARY;
+-		else
++			have_primary = true;
++		} else {
+ 			type = DRM_PLANE_TYPE_OVERLAY;
++		}
+ 
+ 		phy_index = i;
+ 		if (mixer->cfg->de_type == SUN8I_MIXER_DE33)
+@@ -349,25 +435,29 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ 		planes[i] = &layer->plane;
+ 	}
+ 
+-	for (i = 0; i < mixer->cfg->ui_num; i++) {
++	for (i = 0; i < ui_planes; i++) {
+ 		unsigned int index = mixer->cfg->vi_num + i;
++		unsigned int chan = i / ui_ovl;
++		unsigned int overlay = i % ui_ovl;
+ 		struct sun8i_layer *layer;
+ 
+-		if (i == 0)
++		if (i == 0 && !have_primary) {
+ 			type = DRM_PLANE_TYPE_PRIMARY;
+-		else
++			have_primary = true;
++		} else {
+ 			type = DRM_PLANE_TYPE_OVERLAY;
++		}
+ 
+-		phy_index = index;
++		phy_index = mixer->cfg->vi_num + chan;
+ 		if (mixer->cfg->de_type == SUN8I_MIXER_DE33)
+-			phy_index = mixer->cfg->map[index];
++			phy_index = mixer->cfg->map[phy_index];
+ 
+ 		layer = sun8i_ui_layer_init_one(drm, type, mixer->engine.regs,
+-						index, phy_index, plane_cnt,
++						index, phy_index, overlay,
++						plane_cnt,
+ 						&mixer->cfg->lay_cfg);
+ 		if (IS_ERR(layer)) {
+-			dev_err(drm->dev, "Couldn't initialize %s plane\n",
+-				i ? "overlay" : "primary");
++			dev_err(drm->dev, "Couldn't initialize UI plane\n");
+ 			return ERR_CAST(layer);
+ 		}
+ 
+@@ -801,6 +891,12 @@ static const struct sun8i_mixer_cfg sun20i_d1_mixer0_cfg = {
+ 		.scaler_mask	= 0x3,
+ 		.scanline_yuv	= 2048,
+ 		.de2_fcc_alpha	= 1,
++		/*
++		 * Only two channels here, so without this a compositor gets two
++		 * planes total. Splitting the UI channel into its four overlays
++		 * costs UI scaling and buys three more planes.
++		 */
++		.ui_ovl_num	= SUN8I_UI_MAX_OVERLAYS,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+ 	.mod_rate	= 297000000,
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+index e2f83301a..8b43182f9 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -32,6 +32,9 @@
+ #define DE3_MIXER_UNIT_SIZE			0x3000
+ 
+ #define DE2_BLD_BASE				0x1000
++/* Largest channel count across supported mixers (DE33 maps up to 6). */
++#define SUN8I_MIXER_MAX_CHANNELS		6
++
+ #define DE2_CH_BASE				0x2000
+ #define DE2_CH_SIZE				0x1000
+ 
+@@ -175,6 +178,11 @@ enum sun8i_mixer_type {
+  * @scaline_yuv: size of a scanline for VI scaler for YUV formats.
+  * @de2_fcc_alpha: use FCC for missing DE2 VI alpha capability
+  *	Most DE2 cores has FCC. If number of VI planes is one, enable this.
++ * @ui_ovl_num: overlays exposed per UI channel, as separate DRM planes. 0 or 1
++ *	keeps the historical one-plane-per-channel behaviour. Above that the
++ *	channel's single scaler can no longer serve them, so the planes are
++ *	bought with scaling -- only worth it where planes are the scarce
++ *	resource.
+  */
+ struct sun8i_layer_cfg {
+ 	unsigned int	vi_scaler_num;
+@@ -183,6 +191,7 @@ struct sun8i_layer_cfg {
+ 	unsigned int	de_type;
+ 	unsigned int	scanline_yuv;
+ 	unsigned int	de2_fcc_alpha : 1;
++	int		ui_ovl_num;
+ };
+ 
+ /**
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+index 72c92203a..e07be1032 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+@@ -88,6 +88,23 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ 	regmap_write(layer->regs,
+ 		     SUN8I_MIXER_CHAN_UI_LAYER_SIZE(ch_base, layer->overlay),
+ 		     insize);
++
++	if (layer->cfg->ui_ovl_num > 1) {
++		/*
++		 * Position and window size depend on the other overlays in this
++		 * channel, so sun8i_mixer_commit() writes them once it has seen
++		 * them all.
++		 *
++		 * The scaler stays off -- it cannot be shared between overlays
++		 * -- but it has to be turned off explicitly: sun8i_mixer_init()
++		 * only clears up to DE2_MIXER_UNIT_SIZE (0x6000) and the UI
++		 * scaler lives at 0x40000, so out of reset it holds whatever it
++		 * holds.
++		 */
++		sun8i_ui_scaler_enable(layer, false);
++		return;
++	}
++
+ 	regmap_write(layer->regs,
+ 		     SUN8I_MIXER_CHAN_UI_OVL_SIZE(ch_base),
+ 		     insize);
+@@ -145,6 +162,29 @@ static void sun8i_ui_layer_update_buffer(struct sun8i_layer *layer,
+ 		     lower_32_bits(dma_addr));
+ }
+ 
++void sun8i_ui_layer_set_coord(struct sun8i_layer *layer, int x, int y)
++{
++	u32 ch_base = sun8i_channel_base(layer);
++
++	DRM_DEBUG_DRIVER("UI channel %d overlay %d at %d,%d in window\n",
++			 layer->channel, layer->overlay, x, y);
++
++	regmap_write(layer->regs,
++		     SUN8I_MIXER_CHAN_UI_LAYER_COORD(ch_base, layer->overlay),
++		     SUN8I_MIXER_COORD(x, y));
++}
++
++void sun8i_ui_layer_set_ovl_size(struct sun8i_layer *layer, int w, int h)
++{
++	u32 ch_base = sun8i_channel_base(layer);
++
++	DRM_DEBUG_DRIVER("UI channel %d window %dx%d\n",
++			 layer->channel, w, h);
++
++	regmap_write(layer->regs, SUN8I_MIXER_CHAN_UI_OVL_SIZE(ch_base),
++		     SUN8I_MIXER_SIZE(w, h));
++}
++
+ static int sun8i_ui_layer_atomic_check(struct drm_plane *plane,
+ 				       struct drm_atomic_state *state)
+ {
+@@ -174,7 +214,9 @@ static int sun8i_ui_layer_atomic_check(struct drm_plane *plane,
+ 	min_scale = DRM_PLANE_NO_SCALING;
+ 	max_scale = DRM_PLANE_NO_SCALING;
+ 
+-	if (layer->cfg->scaler_mask & BIT(layer->channel)) {
++	/* The channel's one scaler cannot be shared between its overlays. */
++	if (layer->cfg->ui_ovl_num <= 1 &&
++	    layer->cfg->scaler_mask & BIT(layer->channel)) {
+ 		min_scale = SUN8I_UI_SCALER_SCALE_MIN;
+ 		max_scale = SUN8I_UI_SCALER_SCALE_MAX;
+ 	}
+@@ -249,7 +291,7 @@ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 					    enum drm_plane_type type,
+ 					    struct regmap *regs,
+ 					    int index, int phy_index,
+-					    int plane_cnt,
++					    int overlay, int plane_cnt,
+ 					    const struct sun8i_layer_cfg *cfg)
+ {
+ 	struct sun8i_layer *layer;
+@@ -262,7 +304,7 @@ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 	layer->type = SUN8I_LAYER_TYPE_UI;
+ 	layer->index = index;
+ 	layer->channel = phy_index;
+-	layer->overlay = 0;
++	layer->overlay = overlay;
+ 	layer->regs = regs;
+ 	layer->cfg = cfg;
+ 
+@@ -283,8 +325,18 @@ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 		return ERR_PTR(ret);
+ 	}
+ 
+-	ret = drm_plane_create_zpos_property(&layer->plane, index,
+-					     0, plane_cnt - 1);
++	/*
++	 * With several overlays per channel the stacking order is wired into
++	 * the hardware -- channels stack by index, overlays by index within a
++	 * channel -- so advertising a writable zpos would be a promise we
++	 * cannot keep.
++	 */
++	if (cfg->ui_ovl_num > 1)
++		ret = drm_plane_create_zpos_immutable_property(&layer->plane,
++							       index);
++	else
++		ret = drm_plane_create_zpos_property(&layer->plane, index,
++						     0, plane_cnt - 1);
+ 	if (ret) {
+ 		dev_err(drm->dev, "Couldn't add zpos property\n");
+ 		return ERR_PTR(ret);
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.h b/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
+index 1581ffc6d..6377ce7c5 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
+@@ -46,13 +46,26 @@
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_LAYER		((1) << 1)
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_COMBINED	((2) << 1)
+ 
++/*
++ * A UI channel drives up to four overlays. They are composited by the channel
++ * itself -- ahead of the blender -- so they cost no blender pipe, and priority
++ * inside the channel is fixed at overlay3 > overlay2 > overlay1 > overlay0
++ * (DE2.0 spec, figure 5-4). Each has its own position and alpha, but the
++ * channel has only one scaler, so exposing more than one costs scaling.
++ */
++#define SUN8I_UI_MAX_OVERLAYS			4
++
+ struct sun8i_mixer;
+ struct sun8i_layer;
+ 
++void sun8i_ui_layer_set_coord(struct sun8i_layer *layer, int x, int y);
++void sun8i_ui_layer_set_ovl_size(struct sun8i_layer *layer, int w, int h);
++
+ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 					    enum drm_plane_type type,
+ 					    struct regmap *regs,
+ 					    int index, int phy_index,
++					    int overlay,
+ 					    int plane_cnt,
+ 					    const struct sun8i_layer_cfg *cfg);
+ #endif /* _SUN8I_UI_LAYER_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index cd8d6c2da..3da6c9c76 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -436,8 +436,13 @@ struct sun8i_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
+ 		}
+ 	}
+ 
+-	ret = drm_plane_create_zpos_property(&layer->plane, index,
+-					     0, plane_cnt - 1);
++	/* See the matching comment in sun8i_ui_layer_init_one(). */
++	if (cfg->ui_ovl_num > 1)
++		ret = drm_plane_create_zpos_immutable_property(&layer->plane,
++							       index);
++	else
++		ret = drm_plane_create_zpos_property(&layer->plane, index,
++						     0, plane_cnt - 1);
+ 	if (ret) {
+ 		dev_err(drm->dev, "Couldn't add zpos property\n");
+ 		return ERR_PTR(ret);
+-- 

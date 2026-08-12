@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:01 2001
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 14/14] phy: sun4i-usb: apply the D1 factory efuse trim to the
+ phy
+
+On the D1/T113 the mainline driver takes the siddq_in_base branch, which
+only clears SIDDQ and sets VBUSVLDEXT. The per-chip factory calibration
+that the BSP applies in usbc_new_phy_init() -- an impedance trim and a
+TX/common-mode trim burned into the SID efuse at 0x218 -- is never
+written, so the phy runs on reset defaults. That is an analog-quality
+gap (eye diagram, output impedance), not a functional bug on the boards
+tested so far, but it is chip-dependent by nature.
+
+Port the BSP sequence: the D1-generation serial write protocol into the
+phy internal registers (clock on phyctl bit0, attach on bit1, data on
+bit7, address in phyctl[15:8], LSB first -- the pre-D1 protocol in
+sun4i_usb_phy_write() no longer applies), the unconditional clear of
+phy reg 0x1c, and the efuse-conditional trim writes: bit16 gates the
+whole thing, bit17 picks iref (0x60=1, tx->0x61, res->0x44) or vref
+(0x60=0, res->0x44, com->0x36) mode. The efuse word is read directly
+from the SID block; hardcoding the address avoids inventing a dts
+binding for a value only this SoC config uses.
+---
+diff --git a/drivers/phy/allwinner/phy-sun4i-usb.c b/drivers/phy/allwinner/phy-sun4i-usb.c
+index e2fbf8ccf..3fae091ba 100644
+--- a/drivers/phy/allwinner/phy-sun4i-usb.c
++++ b/drivers/phy/allwinner/phy-sun4i-usb.c
+@@ -106,6 +106,7 @@ struct sun4i_usb_phy_cfg {
+ 	bool needs_phy2_siddq;
+ 	bool siddq_in_base;
+ 	bool poll_vbusen;
++	bool efuse_tp_cal;
+ 	int missing_phys;
+ };
+ 
+@@ -114,6 +115,7 @@ struct sun4i_usb_phy_data {
+ 	const struct sun4i_usb_phy_cfg *cfg;
+ 	enum usb_dr_mode dr_mode;
+ 	spinlock_t reg_lock; /* guard access to phyctl reg */
++	u32 usb_efuse;
+ 	int num_phys;
+ 	struct sun4i_usb_phy {
+ 		struct phy *phy;
+@@ -226,6 +228,79 @@ static void sun4i_usb_phy_write(struct sun4i_usb_phy *phy, u32 addr, u32 data,
+ 	spin_unlock_irqrestore(&phy_data->reg_lock, flags);
+ }
+ 
++/*
++ * The D1/T113 phy internal registers no longer speak the protocol of
++ * sun4i_usb_phy_write() above: the address still goes into phyctl[15:8],
++ * but the clock moved to bit0, the attach strobe to bit1 and the data
++ * bit to bit7, one bit per clock, LSB first. Taken from the BSP's
++ * usbc_new_phyx_tp_write(). Byte-wide read-modify-writes keep
++ * SIDDQ(bit3)/VBUSVLDEXT(bit5) in the low phyctl byte untouched.
++ */
++static void sun20i_d1_phy_tp_write(struct sun4i_usb_phy_data *data,
++				   int addr, int val, int len)
++{
++	void __iomem *phyctl = data->base + data->cfg->phyctl_offset;
++	u8 temp;
++	int j;
++
++	for (j = 0; j < len; j++) {
++		temp = readb(phyctl);
++		writeb(temp | BIT(1), phyctl);
++
++		writeb(addr + j, phyctl + 1);
++
++		temp = readb(phyctl);
++		writeb(temp & ~BIT(0), phyctl);
++
++		temp = readb(phyctl);
++		temp &= ~BIT(7);
++		temp |= (val & 0x1) << 7;
++		writeb(temp, phyctl);
++
++		writeb(temp | BIT(0), phyctl);
++		writeb(temp, phyctl);
++
++		temp = readb(phyctl);
++		writeb(temp & ~BIT(1), phyctl);
++
++		val >>= 1;
++	}
++}
++
++/*
++ * Write the factory trim values from the efuse into the phy, mirroring
++ * the BSP's usbc_new_phy_init(). In the efuse word (SID 0x218): bit16 =
++ * trim burned, bit17 = iref/vref mode select, bit[21:18] = impedance
++ * trim -> phy reg 0x44, bit[24:22] = TX/common-mode trim -> 0x61 or
++ * 0x36. The BSP clears phy reg 0x1c unconditionally without saying
++ * why; copied as-is.
++ */
++static void sun20i_d1_phy_efuse_cal(struct sun4i_usb_phy_data *data)
++{
++	u32 ef = data->usb_efuse;
++	unsigned long flags;
++
++	spin_lock_irqsave(&data->reg_lock, flags);
++
++	sun20i_d1_phy_tp_write(data, 0x1c, 0x0, 3);
++
++	if (ef & BIT(16)) {
++		if (ef & BIT(17)) {
++			/* iref mode */
++			sun20i_d1_phy_tp_write(data, 0x60, 0x1, 1);
++			sun20i_d1_phy_tp_write(data, 0x61, (ef >> 22) & 0x7, 3);
++			sun20i_d1_phy_tp_write(data, 0x44, (ef >> 18) & 0xf, 4);
++		} else {
++			/* vref mode */
++			sun20i_d1_phy_tp_write(data, 0x60, 0x0, 1);
++			sun20i_d1_phy_tp_write(data, 0x44, (ef >> 18) & 0xf, 4);
++			sun20i_d1_phy_tp_write(data, 0x36, (ef >> 22) & 0x7, 3);
++		}
++	}
++
++	spin_unlock_irqrestore(&data->reg_lock, flags);
++}
++
+ static void sun4i_usb_phy_passby(struct sun4i_usb_phy *phy, int enable)
+ {
+ 	struct sun4i_usb_phy_data *phy_data = to_sun4i_usb_phy_data(phy);
+@@ -333,6 +408,9 @@ static int sun4i_usb_phy_init(struct phy *_phy)
+ 			val |= PHY_CTL_VBUSVLDEXT;
+ 			val &= ~PHY_CTL_SIDDQ;
+ 			writel(val, data->base + data->cfg->phyctl_offset);
++
++			if (data->cfg->efuse_tp_cal)
++				sun20i_d1_phy_efuse_cal(data);
+ 		}
+ 	} else {
+ 		/* Enable USB 45 Ohm resistor calibration */
+@@ -739,6 +817,24 @@ static int sun4i_usb_phy_probe(struct platform_device *pdev)
+ 	if (IS_ERR(data->base))
+ 		return PTR_ERR(data->base);
+ 
++	if (data->cfg->efuse_tp_cal) {
++		/*
++		 * The D1 USB trim word lives in the SID efuse area at
++		 * 0x03006000+0x200+0x18. ioremap it directly instead of
++		 * going through an nvmem cell: that saves a dtsi binding,
++		 * and only the D1 config sets this flag anyway.
++		 */
++		void __iomem *sid = ioremap(0x03006218, 4);
++
++		if (sid) {
++			data->usb_efuse = readl(sid);
++			iounmap(sid);
++		}
++		dev_info(dev, "usb efuse %08x: %s\n", data->usb_efuse,
++			 !(data->usb_efuse & BIT(16)) ? "no phy trim burned" :
++			 (data->usb_efuse & BIT(17)) ? "iref trim" : "vref trim");
++	}
++
+ 	data->id_det_gpio = devm_gpiod_get_optional(dev, "usb0_id_det",
+ 						    GPIOD_IN);
+ 	if (IS_ERR(data->id_det_gpio)) {
+@@ -985,6 +1081,7 @@ static const struct sun4i_usb_phy_cfg sun20i_d1_cfg = {
+ 	.hci_phy_ctl_clear = PHY_CTL_SIDDQ,
+ 	.phy0_dual_route = true,
+ 	.siddq_in_base = true,
++	.efuse_tp_cal = true,
+ };
+ 
+ static const struct sun4i_usb_phy_cfg sun50i_a64_cfg = {

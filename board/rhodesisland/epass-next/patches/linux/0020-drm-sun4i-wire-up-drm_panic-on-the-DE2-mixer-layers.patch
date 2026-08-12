@@ -1,0 +1,42 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] drm/sun4i: wire up drm_panic on the DE2 mixer layers
+
+DRM_PANIC only works on planes that expose their scanout buffer to the
+panic handler via get_scanout_buffer.  simpledrm already does, so a panic
+lands on the screen for as long as the firmware framebuffer is up -- but
+once S01app modprobes sun4i-drm and it takes over, panics go dark again.
+
+The DE2 layers scan out of plain CMA dumb buffers (drm_gem_dma, linear,
+kernel-mapped at creation), which is exactly the case the generic
+drm_fb_dma_get_scanout_buffer helper handles, so hooking it up is all
+that is needed.  The panic handler checks the framebuffer format at draw
+time and skips planes it cannot draw on (e.g. a C8 indexed layer), so
+advertising the hook on every layer is safe.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+
+---
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+index 05ff64646..34db94ca3 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+@@ -276,6 +276,7 @@ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+ static const struct drm_plane_helper_funcs sun8i_ui_layer_helper_funcs = {
+ 	.atomic_check	= sun8i_ui_layer_atomic_check,
+ 	.atomic_update	= sun8i_ui_layer_atomic_update,
++	.get_scanout_buffer = drm_fb_dma_get_scanout_buffer,
+ };
+ 
+ static const struct drm_plane_funcs sun8i_ui_layer_funcs = {
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index ea6c228f1..7ed4a63fd 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -303,6 +303,7 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ static const struct drm_plane_helper_funcs sun8i_vi_layer_helper_funcs = {
+ 	.atomic_check	= sun8i_vi_layer_atomic_check,
+ 	.atomic_update	= sun8i_vi_layer_atomic_update,
++	.get_scanout_buffer = drm_fb_dma_get_scanout_buffer,
+ };
+ 
+ static const struct drm_plane_funcs sun8i_vi_layer_funcs = {

@@ -1,0 +1,2281 @@
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 1/5] riscv: sunxi: add the RISC-V platform glue for D1
+
+Upstream already carries everything D1-specific below the platform line --
+clk_d1, dram_sun20i_d1, the pinctrl and SPI variants, the USB PHY, and the
+whole sun20i device tree set in dts/upstream. What is missing is the sunxi
+platform layer itself on RISC-V: all of it lives in arch/arm/mach-sunxi/
+Kconfig behind ARCH_SUNXI, which a RISC-V build never sources.
+
+Rather than move that Kconfig somewhere shared -- which would touch every
+ARM sunxi defconfig -- add board/sunxi/Kconfig.riscv, sourced only from
+arch/riscv/Kconfig, declaring BOARD_SUNXI as the RISC-V counterpart of
+ARCH_SUNXI. Symbols common to both are simply declared in both places;
+Kconfig merges same-named symbols as long as the types agree.
+
+board-riscv.c is the board layer: eGON/TOC0 header parsing, boot source
+detection, DRAM bring-up from the SPL, early PMIC setup, the handover back
+to FEL, environment placement and FIT configuration matching.
+
+The start.S changes are fifteen lines of call sites. The assembly itself
+lives in asm/arch-sunxi/fel.h behind four macros that expand to nothing off
+sunxi, so qemu, th1520 and k230 are unaffected -- an unconditional early
+UART init hardcoding D1's UART3 would have broken all of them. Both the
+early UART and the FEL handover are Kconfig-gated, and the macros
+additionally require XPL_BUILD so that U-Boot proper carries neither
+fel_stash nor return_to_fel.
+
+The SPL stack goes to 0x40000 rather than the default 0x48000: the BROM
+keeps its FEL state in 0x40000-0x48000 (xfel reports the scratchpad at
+0x45000). That needs SPL_HAVE_INIT_STACK, which is why common/spl/Kconfig
+lets BOARD_SUNXI take the SPL_SHARES_INIT_SP_ADDR=n path -- otherwise the
+SPL would use CUSTOM_SYS_INIT_SP_ADDR, which points into DRAM that does not
+exist yet when the SPL runs.
+
+No Linux device trees are copied. scripts/Makefile.lib puts
+dts/upstream/src/riscv/allwinner/ on dtc's include path unconditionally, so
+a local board dts resolves sun20i-d1s.dtsi from the submodule. The file is
+named sunxi-u-boot.dtsi so that CONFIG_SYS_SOC="sunxi" makes
+u_boot_dtsi_options pick it up automatically.
+
+board_usb_init() is here for the same reason. musb-new registers its gadget
+from the driver's probe, driver model only probes on demand, and with
+DM_USB_GADGET off the only thing udc_device_get_by_index() has to probe with
+is board_usb_init() -- which board/sunxi/board.c never needed because ARM
+gets there another way. Without it "dfu" fails with "Controller
+uninitialized". Turning DM_USB_GADGET on is not the alternative: musb_register()
+only handles MUSB_PERIPHERAL while it is off.
+
+spl_spinand_sunxi.c is the other half of being able to boot at all. The BROM
+reads the SPL out of a SPI NAND, but nothing in U-Boot can read the *next*
+stage from one: spl_spi.c probes for a JEDEC SPI NOR, and spl_spi_sunxi.c is
+NOR-only and ARM-only. Boards whose only medium is SPI NAND -- which the D1s
+designs are -- stop dead in the SPL without it. The register sequences follow
+Allwinner's own boot0, minus its sample-delay calibration (running the bus
+from the 24MHz oscillator lands in the case where there is nothing to tune)
+and minus quad/dual reads and two-plane addressing.
+
+env_get_location() gains ENVL_MTD for the same reason: SPI NAND arrives as
+BOOT_DEVICE_NAND but is reached through the MTD stack, and without a match
+there the function returns ENVL_UNKNOWN, which board_f() cannot recover from.
+---
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index ad758912..4490a2d4 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -54,6 +54,15 @@ config TARGET_STARFIVE_VISIONFIVE2
+ 	bool "Support StarFive VisionFive2 Board"
+ 	select BOARD_LATE_INIT
+ 
++config TARGET_SUN20I_D1
++	bool "Support Allwinner D1/D1s Boards"
++	select BOARD_SUNXI
++	select GENERIC_RISCV
++	select MMC_SUNXI_HAS_NEW_MODE
++	select SUNXI_GEN_NCAT2
++	select SUNXI_NEW_PINCTRL
++	select THEAD_C906
++
+ config TARGET_TH1520_LPI4A
+ 	bool "Support Sipeed's TH1520 Lichee PI 4A Board"
+ 	select SYS_CACHE_SHIFT_6
+@@ -121,6 +130,7 @@ source "board/sophgo/milkv_duo/Kconfig"
+ source "board/sophgo/licheerv_nano/Kconfig"
+ source "board/spacemit/bananapi-f3/Kconfig"
+ source "board/starfive/visionfive2/Kconfig"
++source "board/sunxi/Kconfig.riscv"
+ source "board/thead/th1520_lpi4a/Kconfig"
+ source "board/xilinx/mbv/Kconfig"
+ 
+@@ -136,6 +146,7 @@ source "arch/riscv/cpu/jh7110/Kconfig"
+ source "arch/riscv/cpu/k1/Kconfig"
+ source "arch/riscv/cpu/k230/Kconfig"
+ source "arch/riscv/cpu/th1520/Kconfig"
++source "arch/riscv/cpu/thead/Kconfig"
+ 
+ # architecture-specific options below
+ 
+diff --git a/arch/riscv/cpu/start.S b/arch/riscv/cpu/start.S
+index 7bafdfd3..bf7c903b 100644
+--- a/arch/riscv/cpu/start.S
++++ b/arch/riscv/cpu/start.S
+@@ -16,6 +16,16 @@
+ #include <asm/encoding.h>
+ #include <generated/asm-offsets.h>
+ 
++#ifdef CONFIG_BOARD_SUNXI
++#include <asm/arch/fel.h>
++#else
++#define SUNXI_EARLY_UART_INIT
++#define SUNXI_FEL_STASH_DEFINE
++#define SUNXI_FEL_STASH_SAVE
++#define SUNXI_FEL_RETURN_DEFINE
++#define SUNXI_FEL_ENTER_DEFINE
++#endif
++
+ #ifdef CONFIG_32BIT
+ #define LREG			lw
+ #define SREG			sw
+@@ -36,9 +46,13 @@
+ secondary_harts_relocation_error:
+ 	.ascii "Relocation of secondary harts has failed, error %d\n"
+ 
++SUNXI_FEL_STASH_DEFINE
++
+ .section .text
+ .globl _start
+ _start:
++	SUNXI_FEL_STASH_SAVE
++	SUNXI_EARLY_UART_INIT
+ #if CONFIG_IS_ENABLED(RISCV_MMODE)
+ 	csrr	a0, CSR_MHARTID
+ #endif
+@@ -463,3 +477,6 @@ secondary_hart_loop:
+ #endif
+ 
+ 	j	secondary_hart_loop
++
++SUNXI_FEL_RETURN_DEFINE
++SUNXI_FEL_ENTER_DEFINE
+diff --git a/arch/riscv/cpu/thead/Kconfig b/arch/riscv/cpu/thead/Kconfig
+new file mode 100644
+index 00000000..273cfd36
+--- /dev/null
++++ b/arch/riscv/cpu/thead/Kconfig
+@@ -0,0 +1,9 @@
++# SPDX-License-Identifier: GPL-2.0+
++
++config THEAD_C906
++	bool
++	select SYS_CACHE_SHIFT_6
++
++config THEAD_E906
++	bool
++	select SYS_CACHE_SHIFT_5
+diff --git a/arch/riscv/cpu/thead/Makefile b/arch/riscv/cpu/thead/Makefile
+new file mode 100644
+index 00000000..556aa842
+--- /dev/null
++++ b/arch/riscv/cpu/thead/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0+
++
++obj-y += cache.o
++obj-y += cpu.o
++obj-y += dram.o
+diff --git a/arch/riscv/cpu/thead/cache.c b/arch/riscv/cpu/thead/cache.c
+new file mode 100644
+index 00000000..38e20c2e
+--- /dev/null
++++ b/arch/riscv/cpu/thead/cache.c
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: GPL-2.0+
++
++#include <cpu_func.h>
++#include <asm/cache.h>
++#include <asm/csr.h>
++#include <linux/bitops.h>
++
++#include "thead_csr.h"
++
++#define THEAD_SYNC_I		".long 0x01a0000b"
++#define THEAD_DCACHE_CIALL	".long 0x0030000b"
++#define THEAD_DCACHE_CIPA_A0	".long 0x02b5000b"
++#define THEAD_DCACHE_IALL	".long 0x0020000b"
++#define THEAD_DCACHE_IPA_A0	".long 0x02a5000b"
++#define THEAD_ICACHE_IPA_A0	".long 0x0385000b"
++
++static inline void sync_i(void)
++{
++	asm volatile (THEAD_SYNC_I ::: "memory");
++}
++
++void flush_dcache_all(void)
++{
++	asm volatile (THEAD_DCACHE_CIALL ::: "memory");
++	sync_i();
++}
++
++void flush_dcache_range(unsigned long start, unsigned long end)
++{
++	register ulong addr asm ("a0") = start & -CONFIG_SYS_CACHELINE_SIZE;
++
++	for (; addr < end; addr += CONFIG_SYS_CACHELINE_SIZE)
++		asm volatile (THEAD_DCACHE_CIPA_A0 :: "r" (addr) : "memory");
++	sync_i();
++}
++
++void invalidate_dcache_all(void)
++{
++	asm volatile (THEAD_DCACHE_IALL ::: "memory");
++	sync_i();
++}
++
++void invalidate_dcache_range(unsigned long start, unsigned long end)
++{
++	register ulong addr asm ("a0") = start & -CONFIG_SYS_CACHELINE_SIZE;
++
++	for (; addr < end; addr += CONFIG_SYS_CACHELINE_SIZE)
++		asm volatile (THEAD_DCACHE_IPA_A0 :: "r" (addr) : "memory");
++	sync_i();
++}
++
++void invalidate_icache_range(unsigned long start, unsigned long end)
++{
++	register ulong addr asm ("a0") = start & -CONFIG_SYS_CACHELINE_SIZE;
++
++	for (; addr < end; addr += CONFIG_SYS_CACHELINE_SIZE)
++		asm volatile (THEAD_ICACHE_IPA_A0 :: "r" (addr) : "memory");
++	sync_i();
++}
++
++#if CONFIG_IS_ENABLED(RISCV_MMODE)
++
++void icache_enable(void)
++{
++	invalidate_icache_all();
++	csr_set(CSR_MHCR, MHCR_IE);
++}
++
++void icache_disable(void)
++{
++	csr_clear(CSR_MHCR, MHCR_IE);
++}
++
++int icache_status(void)
++{
++	return csr_read(CSR_MHCR) & MHCR_IE;
++}
++
++void dcache_enable(void)
++{
++	invalidate_dcache_all();
++	csr_set(CSR_MHCR, MHCR_DE);
++}
++
++void dcache_disable(void)
++{
++	flush_dcache_all();
++	csr_clear(CSR_MHCR, MHCR_DE);
++}
++
++int dcache_status(void)
++{
++	return csr_read(CSR_MHCR) & MHCR_DE;
++}
++
++#endif
+diff --git a/arch/riscv/cpu/thead/cpu.c b/arch/riscv/cpu/thead/cpu.c
+new file mode 100644
+index 00000000..b994967a
+--- /dev/null
++++ b/arch/riscv/cpu/thead/cpu.c
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2018, Bin Meng <bmeng.cn@gmail.com>
++ */
++
++#include <irq_func.h>
++#include <asm/cache.h>
++#include <asm/csr.h>
++#include <linux/bitops.h>
++
++#include "thead_csr.h"
++
++/*
++ * cleanup_before_linux() is called just before we call linux
++ * it prepares the processor for linux
++ *
++ * we disable interrupt and caches.
++ */
++int cleanup_before_linux(void)
++{
++	disable_interrupts();
++
++	cache_flush();
++
++	return 0;
++}
++
++void harts_early_init(void)
++{
++	if (!CONFIG_IS_ENABLED(RISCV_MMODE))
++		return;
++
++	csr_set(CSR_MXSTATUS, MXSTATUS_THEADISAEE | MXSTATUS_MM);
++	if (IS_ENABLED(CONFIG_THEAD_C906)) {
++		csr_set(CSR_MHCR,
++			MHCR_BTB_C906 | MHCR_BPE | MHCR_RS | MHCR_WB | MHCR_WA);
++		csr_set(CSR_MHINT, MHINT_IWPE | MHINT_IPLD | MHINT_DPLD);
++	}
++	if (IS_ENABLED(CONFIG_THEAD_E906)) {
++		csr_set(CSR_MHCR,
++			MHCR_BTB_E906 | MHCR_BPE | MHCR_RS | MHCR_WB | MHCR_WA);
++	}
++}
+diff --git a/arch/riscv/cpu/thead/dram.c b/arch/riscv/cpu/thead/dram.c
+new file mode 100644
+index 00000000..91007c0a
+--- /dev/null
++++ b/arch/riscv/cpu/thead/dram.c
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2018, Bin Meng <bmeng.cn@gmail.com>
++ */
++
++#include <fdtdec.h>
++#include <init.h>
++#include <asm/global_data.h>
++#include <linux/sizes.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++int dram_init(void)
++{
++	return fdtdec_setup_mem_size_base();
++}
++
++int dram_init_banksize(void)
++{
++	return fdtdec_setup_memory_banksize();
++}
+diff --git a/arch/riscv/cpu/thead/thead_csr.h b/arch/riscv/cpu/thead/thead_csr.h
+new file mode 100644
+index 00000000..96d35208
+--- /dev/null
++++ b/arch/riscv/cpu/thead/thead_csr.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++
++#ifndef _THEAD_CSR_H_
++#define _THEAD_CSR_H_
++
++#define CSR_MXSTATUS		0x7c0
++#define CSR_MHCR		0x7c1
++#define CSR_MCOR		0x7c2
++#define CSR_MHINT		0x7c5
++
++#define MXSTATUS_THEADISAEE	BIT(22) /* T-HEAD ISA extensions enable */
++#define MXSTATUS_MM		BIT(15) /* misaligned access enable */
++
++#define MHCR_IE			BIT(0)	/* icache enable */
++#define MHCR_DE			BIT(1)	/* dcache enable */
++#define MHCR_WA			BIT(2)	/* dcache write allocate */
++#define MHCR_WB			BIT(3)	/* dcache write back */
++#define MHCR_RS			BIT(4)	/* return stack enable */
++#define MHCR_BPE		BIT(5)	/* branch prediction enable */
++#define MHCR_BTB_C906		BIT(6)	/* branch target prediction enable */
++#define MHCR_WBR		BIT(8)	/* write burst enable */
++#define MHCR_BTB_E906		BIT(12) /* branch target prediction enable */
++
++#define MHINT_DPLD		BIT(2)	/* dcache prefetch enable */
++#define MHINT_AMR_PAGE		(0x0 << 3)
++#define MHINT_AMR_LIMIT_3	(0x1 << 3)
++#define MHINT_AMR_LIMIT_64	(0x2 << 3)
++#define MHINT_AMR_LIMIT_128	(0x3 << 3)
++#define MHINT_IPLD		BIT(8)	/* icache prefetch enable */
++#define MHINT_IWPE		BIT(9)	/* icache way prediction enable */
++#define MHINT_D_DIS_PREFETCH_2	(0x0 << 13)
++#define MHINT_D_DIS_PREFETCH_4	(0x1 << 13)
++#define MHINT_D_DIS_PREFETCH_8	(0x2 << 13)
++#define MHINT_D_DIS_PREFETCH_16	(0x3 << 13)
++#define MHINT_AEE		BIT(20) /* accurate exception enable */
++
++#endif /* _THEAD_CSR_H_ */
+diff --git a/arch/riscv/dts/Makefile b/arch/riscv/dts/Makefile
+index 8e591cb7..7fb9685b 100644
+--- a/arch/riscv/dts/Makefile
++++ b/arch/riscv/dts/Makefile
+@@ -10,6 +10,7 @@ dtb-$(CONFIG_TARGET_LICHEERV_NANO) += sg2002-licheerv-nano-b.dtb
+ dtb-$(CONFIG_TARGET_QEMU_VIRT) += qemu-virt32.dtb qemu-virt64.dtb
+ dtb-$(CONFIG_TARGET_OPENPITON_RISCV64) += openpiton-riscv64.dtb
+ dtb-$(CONFIG_TARGET_SIPEED_MAIX) += k210-maix-bit.dtb
++dtb-$(CONFIG_TARGET_SUN20I_D1) += sun20i-d1s-epass-next.dtb
+ dtb-$(CONFIG_TARGET_XILINX_MBV) += xilinx-mbv32.dtb
+ dtb-$(CONFIG_TARGET_XILINX_MBV) += xilinx-mbv64.dtb
+ dtb-$(CONFIG_TARGET_XILINX_MBV) += xilinx-binman.dtb
+diff --git a/arch/riscv/dts/sunxi-u-boot.dtsi b/arch/riscv/dts/sunxi-u-boot.dtsi
+new file mode 100644
+index 00000000..964d0cf6
+--- /dev/null
++++ b/arch/riscv/dts/sunxi-u-boot.dtsi
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * Picked up automatically for any sunxi board, because CONFIG_SYS_SOC is
++ * "sunxi" (see u_boot_dtsi_options in scripts/Makefile.lib).
++ *
++ * The SPL device tree is built by keeping only the nodes marked bootph-all,
++ * so everything the SPL touches before DRAM is up has to be listed here:
++ * the CCU, the DRAM controller, the pinctrl and the console UART.
++ */
++
++#include "binman.dtsi"
++
++/ {
++	cpus {
++		bootph-all;
++	};
++
++	soc {
++		bootph-all;
++	};
++};
++
++&binman {
++	u-boot-sunxi-with-spl {
++		filename = "u-boot-sunxi-with-spl.bin";
++		pad-byte = <0xff>;
++
++		blob@0 {
++			/*
++			 * This value matches SYS_MMCSD_RAW_MODE_U_BOOT_SECTOR
++			 * and SYS_SPI_U_BOOT_OFFS if those are defined.
++			 */
++			min-size = <0x8000>;
++			filename = "spl/sunxi-spl.bin";
++		};
++
++		blob@1 {
++			filename = "u-boot.itb";
++		};
++	};
++};
++
++&ccu {
++	bootph-all;
++};
++
++&cpu0 {
++	bootph-all;
++};
++
++&dcxo {
++	bootph-all;
++};
++
++&mbus {
++	bootph-all;
++};
++
++&mmc0 {
++	bootph-all;
++};
++
++&mmc0_pins {
++	bootph-all;
++};
++
++&pio {
++	bootph-all;
++};
++
++&uart3_pb_pins {
++	bootph-all;
++};
++
++&rtc {
++	bootph-all;
++};
++
++&uart3 {
++	bootph-all;
++};
+diff --git a/arch/riscv/include/asm/arch-sunxi/clock.h b/arch/riscv/include/asm/arch-sunxi/clock.h
+new file mode 100644
+index 00000000..3a96fad3
+--- /dev/null
++++ b/arch/riscv/include/asm/arch-sunxi/clock.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Clock bits the shared sunxi drivers reach for through <asm/arch/clock.h>.
++ *
++ * On ARM this resolves to clock_sun50i_h6.h, which also carries the whole
++ * legacy non-DM clock API. Here everything but the MMC mod clock comes from
++ * the CCU driver via DM, so only that is defined.
++ */
++#ifndef _SUNXI_CLOCK_H
++#define _SUNXI_CLOCK_H
++
++#include <asm/arch/cpu.h>
++
++#define CCU_PLL6_CFG			0x020
++
++#define CCM_PLL6_CTRL_P0_SHIFT		16
++#define CCM_PLL6_CTRL_P0_MASK		(0x7 << CCM_PLL6_CTRL_P0_SHIFT)
++#define CCM_PLL6_CTRL_N_SHIFT		8
++#define CCM_PLL6_CTRL_N_MASK		(0xff << CCM_PLL6_CTRL_N_SHIFT)
++#define CCM_PLL6_CTRL_DIV2_SHIFT	1
++#define CCM_PLL6_CTRL_DIV2_MASK		(0x1 << CCM_PLL6_CTRL_DIV2_SHIFT)
++
++/* MMC clock bit field */
++#define CCM_MMC_CTRL_M(x)		((x) - 1)
++#define CCM_MMC_CTRL_N(x)		((x) << 8)
++#define CCM_MMC_CTRL_OSCM24		(0x0 << 24)
++#define CCM_MMC_CTRL_PLL6		(0x1 << 24)
++#define CCM_MMC_CTRL_PLL_PERIPH2X2	(0x2 << 24)
++#define CCM_MMC_CTRL_ENABLE		(0x1 << 31)
++/* No output/sample clock delays on this generation */
++#define CCM_MMC_CTRL_OCLK_DLY(a)	((void)(a), 0)
++#define CCM_MMC_CTRL_SCLK_DLY(a)	((void)(a), 0)
++
++#ifndef __ASSEMBLY__
++unsigned int clock_get_pll6(void);
++#endif
++
++#endif /* _SUNXI_CLOCK_H */
+diff --git a/arch/riscv/include/asm/arch-sunxi/cpu.h b/arch/riscv/include/asm/arch-sunxi/cpu.h
+new file mode 100644
+index 00000000..04c831eb
+--- /dev/null
++++ b/arch/riscv/include/asm/arch-sunxi/cpu.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Memory map for the RISC-V sunxi SoCs (D1/D1s).
++ *
++ * The D1 shares its peripheral layout with the ARM R528/T113 (SUNXI_GEN_NCAT2),
++ * so these match arch/arm/include/asm/arch-sunxi/cpu_sunxi_ncat2.h. Only the
++ * bases actually referenced from shared driver or board code are listed;
++ * everything else comes from the device tree.
++ */
++#ifndef _SUNXI_CPU_H
++#define _SUNXI_CPU_H
++
++#define SUNXI_SRAM_A1_BASE		0x00020000
++
++#define SUNXI_SRAMC_BASE		0x03000000
++
++#define SUNXI_PIO_BASE			0x02000000
++#define SUNXI_CCM_BASE			0x02001000
++#define SUNXI_UART0_BASE		0x02500000
++#define SUNXI_TWI0_BASE			0x02502000
++#define SUNXI_SID_BASE			0x03006200
++#define SUNXI_RTC_BASE			0x07090000
++#define SUNXI_MMC0_BASE			0x04020000
++#define SUNXI_MMC1_BASE			0x04021000
++#define SUNXI_MMC2_BASE			0x04022000
++#define SUNXI_SPI0_BASE			0x04025000
++
++#endif /* _SUNXI_CPU_H */
+diff --git a/arch/riscv/include/asm/arch-sunxi/fel.h b/arch/riscv/include/asm/arch-sunxi/fel.h
+new file mode 100644
+index 00000000..ae1c474f
+--- /dev/null
++++ b/arch/riscv/include/asm/arch-sunxi/fel.h
+@@ -0,0 +1,164 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Assembly hooks the D1 SPL needs before anything else runs, kept out of
++ * arch/riscv/cpu/start.S so the generic startup path stays generic.
++ *
++ * Only included from start.S, and only when the matching Kconfig option is
++ * set, so everything here is a macro rather than code.
++ */
++#ifndef _ASM_ARCH_FEL_H_
++#define _ASM_ARCH_FEL_H_
++
++#if defined(CONFIG_SUNXI_SPL_EARLY_UART) && defined(CONFIG_XPL_BUILD)
++/*
++ * Bring up uart3 (PB6/PB7) before anything else, so CONFIG_DEBUG_UART works
++ * from the very first instruction. This also lets the SPL be the first thing
++ * executed over FEL after a reset: xfel writes SRAM as data and never
++ * invalidates the icache, so running a helper payload to configure the UART
++ * beforehand would leave stale instructions cached at 0x20000.
++ *
++ * 0x0200190c: CCU UART_BGR, gate + reset for uart3
++ * 0x02000030: PIO PB_CFG0, PB6/PB7 -> uart3 (function 7)
++ * 0x02500c00: uart3 registers, 8n1 at 24MHz/16/13 = 115200
++ */
++#define SUNXI_EARLY_UART_INIT		\
++	li	t0, 0x0200190c;		\
++	lw	t1, 0(t0);		\
++	li	t2, 0x00080008;		\
++	or	t1, t1, t2;		\
++	sw	t1, 0(t0);		\
++	li	t0, 0x02000030;		\
++	lw	t1, 0(t0);		\
++	li	t2, 0x00ffffff;		\
++	and	t1, t1, t2;		\
++	li	t2, 0x77000000;		\
++	or	t1, t1, t2;		\
++	sw	t1, 0(t0);		\
++	li	t0, 0x02500c00;		\
++	li	t1, 0x83;		\
++	sw	t1, 0x0c(t0);		\
++	li	t1, 13;			\
++	sw	t1, 0x00(t0);		\
++	sw	zero, 0x04(t0);		\
++	li	t1, 0x03;		\
++	sw	t1, 0x0c(t0);		\
++	li	t1, 0x07;		\
++	sw	t1, 0x08(t0)
++#else
++#define SUNXI_EARLY_UART_INIT
++#endif
++
++#if defined(CONFIG_SPL_RETURN_TO_FEL) && defined(CONFIG_XPL_BUILD)
++
++/*
++ * Storage for the BROM's state, so the SPL can hand control back to the FEL
++ * loop once DRAM is up. The ARM sunxi code has return_to_fel() for this;
++ * RISC-V never got one.
++ *
++ * This lives in .data (SRAM), not .bss: the SPL's BSS sits in DRAM and is not
++ * cleared until after board_init_f() returns.
++ */
++#define SUNXI_FEL_STASH_DEFINE			\
++	.section .data;				\
++	.align 3;				\
++	.globl fel_stash;			\
++fel_stash:					\
++	.rept 19; /* ra sp gp tp s0-s11 tvec ie status */ \
++	.dword 0;				\
++	.endr;					\
++	.section .text
++
++/*
++ * Save everything the BROM expects to survive a call. The SPL does not honour
++ * the calling convention at all -- it uses tp as the hart id and s0 as the
++ * global data pointer -- so returning to FEL needs the full callee-saved set
++ * restored, not just ra/sp.
++ *
++ * The BROM's FEL loop is also interrupt driven, and the SPL is about to point
++ * tvec at its own handler and mask every interrupt, which would leave USB dead
++ * on return. Stash the three CSRs as well.
++ */
++#define SUNXI_FEL_STASH_SAVE		\
++	la	t0, fel_stash;		\
++	sd	ra, 0(t0);		\
++	sd	sp, 8(t0);		\
++	sd	gp, 16(t0);		\
++	sd	tp, 24(t0);		\
++	sd	s0, 32(t0);		\
++	sd	s1, 40(t0);		\
++	sd	s2, 48(t0);		\
++	sd	s3, 56(t0);		\
++	sd	s4, 64(t0);		\
++	sd	s5, 72(t0);		\
++	sd	s6, 80(t0);		\
++	sd	s7, 88(t0);		\
++	sd	s8, 96(t0);		\
++	sd	s9, 104(t0);		\
++	sd	s10, 112(t0);		\
++	sd	s11, 120(t0);		\
++	csrr	t1, MODE_PREFIX(tvec);	\
++	sd	t1, 128(t0);		\
++	csrr	t1, MODE_PREFIX(ie);	\
++	sd	t1, 136(t0);		\
++	csrr	t1, MODE_PREFIX(status);\
++	sd	t1, 144(t0)
++
++/*
++ * Hand control back to the BROM's FEL loop, with DRAM already initialised.
++ * Caches are dropped first: the SPL turned them on, and the BROM's USB
++ * transfers write memory behind our back.
++ */
++#define SUNXI_FEL_RETURN_DEFINE		\
++	.globl return_to_fel;		\
++return_to_fel:				\
++	addi	sp, sp, -16;		\
++	sd	ra, 8(sp);		\
++	jal	dcache_disable;		\
++	fence.i;			\
++	ld	ra, 8(sp);		\
++	addi	sp, sp, 16;		\
++	la	t0, fel_stash;		\
++	ld	ra, 0(t0);		\
++	ld	sp, 8(t0);		\
++	ld	gp, 16(t0);		\
++	ld	tp, 24(t0);		\
++	ld	s0, 32(t0);		\
++	ld	s1, 40(t0);		\
++	ld	s2, 48(t0);		\
++	ld	s3, 56(t0);		\
++	ld	s4, 64(t0);		\
++	ld	s5, 72(t0);		\
++	ld	s6, 80(t0);		\
++	ld	s7, 88(t0);		\
++	ld	s8, 96(t0);		\
++	ld	s9, 104(t0);		\
++	ld	s10, 112(t0);		\
++	ld	s11, 120(t0);		\
++	ld	t1, 128(t0);		\
++	csrw	MODE_PREFIX(tvec), t1;	\
++	ld	t1, 136(t0);		\
++	csrw	MODE_PREFIX(ie), t1;	\
++	ld	t1, 144(t0);		\
++	csrw	MODE_PREFIX(status), t1;\
++	ret
++
++#else /* !CONFIG_SPL_RETURN_TO_FEL */
++#define SUNXI_FEL_STASH_DEFINE
++#define SUNXI_FEL_STASH_SAVE
++#define SUNXI_FEL_RETURN_DEFINE
++#endif
++
++/* The normal boot path has no saved FEL call frame to restore. */
++#if defined(CONFIG_XPL_BUILD)
++#define SUNXI_FEL_ENTER_DEFINE		\
++	.globl enter_fel;		\
++enter_fel:				\
++	jal	dcache_disable;		\
++	fence.i;			\
++	li	t0, 0x20;		\
++	jr	t0
++#else
++#define SUNXI_FEL_ENTER_DEFINE
++#endif
++
++#endif /* _ASM_ARCH_FEL_H_ */
+diff --git a/arch/riscv/include/asm/arch-sunxi/spl.h b/arch/riscv/include/asm/arch-sunxi/spl.h
+new file mode 100644
+index 00000000..0606513a
+--- /dev/null
++++ b/arch/riscv/include/asm/arch-sunxi/spl.h
+@@ -0,0 +1,38 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * RISC-V counterpart of arch/arm/include/asm/arch-sunxi/spl.h.
++ *
++ * The eGON/TOC0 header layout is a property of the BROM, not of the CPU, so
++ * these match the ARM definitions. Only the ARMv5-era SUNIV boot sources are
++ * left out; no such part exists on the RISC-V side.
++ */
++#ifndef _ASM_ARCH_SPL_H_
++#define _ASM_ARCH_SPL_H_
++
++#include <sunxi_image.h>
++
++#define SPL_ADDR		CONFIG_SUNXI_SRAM_ADDRESS
++
++/* The low 8-bits of the 'boot_media' field in the SPL header */
++#define SUNXI_BOOTED_FROM_MMC0	0
++#define SUNXI_BOOTED_FROM_NAND	1
++#define SUNXI_BOOTED_FROM_MMC2	2
++#define SUNXI_BOOTED_FROM_SPI	3
++/*
++ * Not in the ARM header: the ARM parts predate SPI NAND boot, which the D1
++ * BROM reports as its own source rather than folding into SPI. Established on
++ * an ePass Next, whose only boot medium is a SPI NAND -- the BROM loaded the
++ * SPL from it and left 4 here.
++ */
++#define SUNXI_BOOTED_FROM_SPI_NAND	4
++#define SUNXI_BOOTED_FROM_MMC0_HIGH	0x10
++#define SUNXI_BOOTED_FROM_MMC2_HIGH	0x12
++
++uint32_t sunxi_get_boot_device(void);
++uint32_t sunxi_get_spl_size(void);
++
++/* arch/riscv/cpu/start.S */
++void return_to_fel(void);
++void enter_fel(void);
++
++#endif
+diff --git a/arch/riscv/include/asm/processor.h b/arch/riscv/include/asm/processor.h
+index fe357529..60a73c9b 100644
+--- a/arch/riscv/include/asm/processor.h
++++ b/arch/riscv/include/asm/processor.h
+@@ -23,4 +23,14 @@
+  *     no one uses the macros defined in this head file.
+  **************************************************************/
+ 
++#include <linux/compiler.h>
++
++/*
++ * Busy-wait hint, as arch/{arm,mips}/include/asm/processor.h define it.
++ * Drivers shared with Linux (musb, and the polling loops in linux/compat.h)
++ * expect it to exist. There is no RISC-V equivalent of ARM's YIELD in the
++ * base ISA, so a compiler barrier is all this can be.
++ */
++#define cpu_relax()	barrier()
++
+ #endif /* __ASM_RISCV_PROCESSOR_H */
+diff --git a/board/sunxi/Kconfig.riscv b/board/sunxi/Kconfig.riscv
+new file mode 100644
+index 00000000..fa105c79
+--- /dev/null
++++ b/board/sunxi/Kconfig.riscv
+@@ -0,0 +1,210 @@
++# SPDX-License-Identifier: GPL-2.0+
++#
++# Sunxi (Allwinner) support for the RISC-V SoCs: D1 and D1s (sun20i).
++#
++# Everything the ARM sunxi boards need lives in arch/arm/mach-sunxi/Kconfig,
++# inside "if ARCH_SUNXI", so none of it is reachable from a RISC-V build.
++# Rather than move symbols the ARM boards depend on, the subset the D1 needs
++# is redeclared here. Types must match the ARM definitions exactly, or Kconfig
++# reports a type clash while parsing both trees.
++#
++# BOARD_SUNXI is the RISC-V counterpart of ARCH_SUNXI. The SPL needs full DM
++# here: unlike the ARM SPL, which pokes the DRAM controller directly, the D1
++# brings DRAM up through a UCLASS_RAM driver described by the device tree.
++
++config BOARD_SUNXI
++	bool
++	select BINMAN
++	select CLK
++	select CMD_GPIO if GPIO
++	select CMD_MMC if MMC
++	select DM
++	select DM_GPIO if GPIO
++	select DM_I2C if I2C
++	select DM_SERIAL if SERIAL
++	select DM_SPI if SPI
++	select DM_SPI_FLASH if SPI
++	select OF_BOARD_SETUP
++	select OF_CONTROL
++	select PINCTRL
++	select RAM
++	select SPECIFY_CONSOLE_INDEX
++	select SPL_CLK
++	select SPL_DM if SPL
++	select SPL_DM_SPI if SPL_DM && SPL_SPI
++	select SPL_DM_SPI_FLASH if SPL_DM && SPL_SPI
++	select SPL_OF_CONTROL if SPL_DM
++	select SPL_PINCTRL if SPL_DM
++	select SPL_PINCONF if SPL_DM
++	select SPL_RAM if SPL_DM
++	select SPL_SEPARATE_BSS if SPL
++	select SUNXI_GPIO
++	select SUPPORT_SPL
++	select ENV_RELOC_GD_ENV_ADDR
++	select USE_PREBOOT
++	imply BOARD_LATE_INIT
++	imply CMD_DM
++	imply CMD_GPT
++	imply DM_REGULATOR
++	imply DM_REGULATOR_FIXED
++	imply FAT_WRITE
++	imply FIT
++	imply MMC
++	imply OF_LIBFDT_OVERLAY
++	imply PRE_CONSOLE_BUFFER
++	imply SPL
++	imply SPL_GPIO
++	imply SPL_LIBCOMMON_SUPPORT
++	imply SPL_LIBGENERIC_SUPPORT
++	imply SPL_LOAD_FIT
++	imply SPL_MMC if MMC
++	imply SPL_POWER
++	imply SPL_SERIAL
++	imply SYS_I2C_MVTWSI
++	imply SYS_NS16550
++	imply SYSRESET
++	imply SYSRESET_SBI
++	imply SYSRESET_WATCHDOG
++	imply SYSRESET_WATCHDOG_AUTO
++	imply USB
++	imply USB_GADGET
++	imply WDT
++
++if BOARD_SUNXI
++
++config SUNXI_GEN_NCAT2
++	bool
++	select MMC_SUNXI_HAS_NEW_MODE
++	help
++	  Select this for sunxi SoCs which have D1-like peripherals, clocks
++	  and memory map.
++
++config SUNXI_SRAM_ADDRESS
++	hex
++	default 0x20000
++	help
++	  The D1 maps its boot ROM at address 0 and SRAM A1 at 0x20000, so the
++	  SPL is entered there rather than at address 0 as on the older,
++	  ARMv5-era parts.
++
++config SUNXI_MINIMUM_DRAM_MB
++	int
++	default 64
++	help
++	  Minimum DRAM size expected on the board. With co-packaged DRAM this
++	  is well below the 256 MB the older boards assumed, so U-Boot's own
++	  load address and the default payload addresses must be shifted down.
++
++config MMC_SUNXI_SLOT_EXTRA
++	int
++	default -1
++	help
++	  Extra MMC slot number, or -1 for none. Only used to pick the device
++	  the environment lives on; the controllers themselves come from DT.
++
++config SPL_RETURN_TO_FEL
++	bool "Return to the BROM's FEL loop when booted over USB"
++	depends on SPL
++	help
++	  When the SPL was pushed in over FEL there is no boot medium to load
++	  U-Boot proper from, but DRAM is up by the time the SPL is done with
++	  it. Say y to hand control back to the BROM's FEL loop at that point,
++	  so the host can push the next stage straight into DRAM over USB.
++
++	  This is what you want while bringing a board up with no boot media
++	  populated. Any other boot source is unaffected.
++
++config SUNXI_SPL_EARLY_UART
++	bool "Configure uart3 (PB6/PB7) at the top of the SPL"
++	depends on SPL && DEBUG_UART
++	help
++	  Set up uart3 in the first instructions of the SPL, before anything
++	  else runs, so CONFIG_DEBUG_UART produces output from the very start.
++
++	  This matters when loading the SPL over FEL: xfel writes SRAM as data
++	  and never invalidates the icache, so running a separate helper
++	  payload to configure the UART beforehand would leave stale
++	  instructions cached at the SPL's entry point.
++
++	  The register addresses are hardcoded for the D1/D1s. Say n if the
++	  console is on a different UART.
++
++config SUNXI_DRAM_VCC_AXP209_DCDC2
++	bool "Raise AXP209 DCDC2 to 1.8V before DRAM init"
++	help
++	  On boards where VCC-DRAM is supplied by an AXP209 DCDC2 that powers
++	  up at ~1.25V, in-package DDR2 needs it raised to 1.8V before the DRAM
++	  controller is touched, or training never completes. Enabling this
++	  pokes TWI0 directly from the SPL, well before the I2C and PMIC
++	  uclasses are available.
++
++# The ARM side offers a choice between eGON and the secure-boot TOC0 in
++# board/sunxi/Kconfig, which only arch/arm/mach-sunxi/Kconfig sources. There is
++# no TOC0 support for these parts, so just pin the type.
++config SPL_IMAGE_TYPE
++	default "sunxi_egon"
++
++config IDENT_STRING
++	default " Allwinner Technology"
++
++config SYS_BOARD
++	default "sunxi"
++
++config SYS_SOC
++	default "sunxi"
++
++config SYS_CPU
++	default "thead"
++
++config SYS_CONFIG_NAME
++	default "sun20i"
++
++config SYS_CLK_FREQ
++	default 1008000000
++
++config SYS_LOAD_ADDR
++	default 0x41000000
++
++config PRE_CON_BUF_ADDR
++	default 0x43000000
++
++config SPL_TEXT_BASE
++	default 0x20060
++
++config SPL_MAX_SIZE
++	# SRAM A1 is 160 KB at 0x20000, less the 0x60 eGON header.
++	default 0x27fa0
++
++config SPL_STACK
++	default 0x48000
++
++config SPL_BSS_START_ADDR
++	default 0x43f80000
++
++config SPL_STACK_R_ADDR
++	default 0x43e00000
++
++config SPL_OPENSBI_LOAD_ADDR
++	default 0x40000000
++
++config SPL_SPINAND_SUNXI
++	bool "SPL support for SPI NAND on RISC-V sunxi"
++	depends on SPL
++	default y
++	help
++	  Let the SPL read the next stage out of a SPI NAND. The BROM can
++	  already load the SPL itself from one, but nothing else in U-Boot
++	  can read further: spl_spi.c probes for a JEDEC SPI NOR and
++	  spl_spi_sunxi.c is both NOR-only and ARM-only. Boards whose only
++	  medium is SPI NAND -- which is what the D1s designs are -- cannot
++	  boot without this.
++
++config SYS_SPINAND_U_BOOT_OFFS
++	hex "Offset of U-Boot proper in the SPI NAND"
++	depends on SPL_SPINAND_SUNXI
++	default 0x40000
++	help
++	  Where the SPL looks for u-boot.itb. Must be erase block aligned and
++	  must agree with the partition table in the board device tree.
++
++endif
+diff --git a/board/sunxi/Makefile b/board/sunxi/Makefile
+index ee824931..6a4af93d 100644
+--- a/board/sunxi/Makefile
++++ b/board/sunxi/Makefile
+@@ -6,7 +6,9 @@
+ #
+ # (C) Copyright 2000-2003
+ # Wolfgang Denk, DENX Software Engineering, wd@denx.de.
+-obj-y	+= board.o
++obj-$(CONFIG_ARM)		+= board.o
++obj-$(CONFIG_RISCV)		+= board-riscv.o
++obj-$(CONFIG_$(PHASE_)SPINAND_SUNXI)	+= spl_spinand_sunxi.o
+ obj-$(CONFIG_SUN7I_GMAC)	+= gmac.o
+ obj-$(CONFIG_MACH_SUN4I)	+= dram_sun4i_auto.o
+ obj-$(CONFIG_MACH_SUN5I)	+= dram_sun5i_auto.o
+diff --git a/board/sunxi/board-riscv.c b/board/sunxi/board-riscv.c
+new file mode 100644
+index 00000000..f9b3d408
+--- /dev/null
++++ b/board/sunxi/board-riscv.c
+@@ -0,0 +1,802 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Board code for the RISC-V sunxi SoCs (Allwinner D1/D1s).
++ *
++ * (C) Copyright 2012-2013 Henrik Nordstrom <henrik@henriknordstrom.net>
++ * (C) Copyright 2013 Luke Kenneth Casson Leighton <lkcl@lkcl.net>
++ * (C) Copyright 2007-2011 Allwinner Technology Co., Ltd. <www.allwinnertech.com>
++ *
++ * Counterpart of board/sunxi/board.c, which is ARM-only: it reaches into
++ * asm/arch/{clock,cpu,dram,prcm,display}.h, none of which exist here, and
++ * drives the DRAM controller and pinmux directly. On the D1 all of that comes
++ * from the device tree via DM instead, so this file only carries what is left:
++ * decoding the BROM's SPL header and bringing DRAM up in the SPL.
++ */
++
++#include <cpu.h>
++#include <dm.h>
++#include <env.h>
++#include <env_internal.h>
++#include <fdt_support.h>
++#include <generic-phy.h>
++#include <image.h>
++#include <init.h>
++#include <mmc.h>
++#include <net.h>
++#include <phy-sun4i-usb.h>
++#include <ram.h>
++#include <spl.h>
++#include <usb.h>
++#include <asm/arch/clock.h>
++#include <asm/arch/cpu.h>
++#include <asm/arch/spl.h>
++#include <asm/csr.h>
++#include <asm/global_data.h>
++#include <asm/io.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <u-boot/crc.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++
++#define SUNXI_INVALID_BOOT_SOURCE	-1
++#define SUNXI_RTC_GP_DATA		0x100
++#define SUNXI_RTC_MSTM_FEL_INDEX	7
++#define SUNXI_RTC_MSTM_FEL_MAGIC	0x4d53544d
++
++/*
++ * The CCU driver has no consumer for PLL6 in the SPL, but the shared MMC
++ * driver needs its rate to compute the mod clock divider, and reaches for it
++ * through this legacy non-DM entry point.
++ */
++unsigned int clock_get_pll6(void)
++{
++	u32 rval = readl((void *)(ulong)(SUNXI_CCM_BASE + CCU_PLL6_CFG));
++	int n = ((rval & CCM_PLL6_CTRL_N_MASK) >> CCM_PLL6_CTRL_N_SHIFT) + 1;
++	int div1 = ((rval & CCM_PLL6_CTRL_P0_MASK) >>
++		    CCM_PLL6_CTRL_P0_SHIFT) + 1;
++	int div2 = ((rval & CCM_PLL6_CTRL_DIV2_MASK) >>
++		    CCM_PLL6_CTRL_DIV2_SHIFT) + 1;
++
++	/* the register describes PLL6-2X, not plain PLL6 */
++	return 24000000U * n / 2 / div1 / div2;
++}
++
++int sunxi_get_sid(unsigned int *sid)
++{
++	int i;
++
++	for (i = 0; i < 4; i++)
++		sid[i] = readl((void *)(ulong)(SUNXI_SID_BASE + 4 * i));
++
++	return 0;
++}
++
++static int sunxi_egon_valid(struct boot_file_head *egon_head)
++{
++	return !memcmp(egon_head->magic, BOOT0_MAGIC, 8); /* eGON.BT0 */
++}
++
++static int sunxi_toc0_valid(struct toc0_main_info *toc0_info)
++{
++	return !memcmp(toc0_info->name, TOC0_MAIN_INFO_NAME, 8); /* TOC0.GLH */
++}
++
++static int sunxi_get_boot_source(void)
++{
++	struct boot_file_head *egon_head = (void *)SPL_ADDR;
++	struct toc0_main_info *toc0_info = (void *)SPL_ADDR;
++
++	if (sunxi_egon_valid(egon_head))
++		return readb(&egon_head->boot_media);
++	if (sunxi_toc0_valid(toc0_info))
++		return readb(&toc0_info->platform[0]);
++
++	/* Not a valid image, so we must have been booted via FEL. */
++	return SUNXI_INVALID_BOOT_SOURCE;
++}
++
++/*
++ * The sunxi BROM tries to load the external bootloader from mmc0, NAND flash
++ * or mmc2. When booting over USB in FEL mode the 'eGON.BT0' signature is
++ * patched out by the host-side 'fel'/'xfel' tool, which is how we tell the
++ * two apart.
++ */
++uint32_t sunxi_get_boot_device(void)
++{
++	int boot_source = sunxi_get_boot_source();
++
++	switch (boot_source) {
++	case SUNXI_INVALID_BOOT_SOURCE:
++		return BOOT_DEVICE_BOARD;
++	case SUNXI_BOOTED_FROM_MMC0:
++	case SUNXI_BOOTED_FROM_MMC0_HIGH:
++		return BOOT_DEVICE_MMC1;
++	case SUNXI_BOOTED_FROM_NAND:
++		return BOOT_DEVICE_NAND;
++	case SUNXI_BOOTED_FROM_MMC2:
++	case SUNXI_BOOTED_FROM_MMC2_HIGH:
++		return BOOT_DEVICE_MMC2;
++	case SUNXI_BOOTED_FROM_SPI:
++		return BOOT_DEVICE_SPI;
++	case SUNXI_BOOTED_FROM_SPI_NAND:
++		/*
++		 * Deliberately not BOOT_DEVICE_SPI: that one belongs to the
++		 * NOR loader, which probes for a JEDEC SPI flash and finds
++		 * nothing on a NAND part.
++		 */
++		return BOOT_DEVICE_NAND;
++	}
++
++	panic("Unknown boot source %d\n", boot_source);
++	return -1;		/* Never reached */
++}
++
++#ifdef CONFIG_XPL_BUILD
++
++uint32_t sunxi_get_spl_size(void)
++{
++	struct boot_file_head *egon_head = (void *)SPL_ADDR;
++	struct toc0_main_info *toc0_info = (void *)SPL_ADDR;
++
++	if (sunxi_egon_valid(egon_head))
++		return readl(&egon_head->length);
++	if (sunxi_toc0_valid(toc0_info))
++		return readl(&toc0_info->length);
++
++	/* Not a valid image, so use the default U-Boot offset. */
++	return 0;
++}
++
++/*
++ * The eGON SPL image can be located at 8KB or at 128KB into an SD card or an
++ * eMMC device. The boot source has bit 4 set in the latter case; add 120KB to
++ * the normal offset to cover both. U-Boot proper is located at least 32KB
++ * after the SPL, but immediately follows it if the SPL is bigger than that.
++ */
++unsigned long board_spl_mmc_get_uboot_raw_sector(struct mmc *mmc,
++						 unsigned long raw_sect)
++{
++	unsigned long spl_size = sunxi_get_spl_size();
++	unsigned long sector;
++
++	sector = max(raw_sect, spl_size / 512);
++
++	switch (sunxi_get_boot_source()) {
++	case SUNXI_BOOTED_FROM_MMC0_HIGH:
++	case SUNXI_BOOTED_FROM_MMC2_HIGH:
++		sector += (128 - 8) * 2;
++		break;
++	}
++
++	return sector;
++}
++
++u32 spl_boot_device(void)
++{
++	return sunxi_get_boot_device();
++}
++
++/*
++ * C906 extension CSRs. The values come from the Allwinner BSP; the register
++ * layout is only documented in the T-Head C906 manual.
++ *
++ * MXSTATUS 0x638000: THEADISAEE | MAEE | CLINTEE | UCME | MM
++ * MCOR     0x70013:  invalidate and enable both caches plus the branch
++ *                    predictors
++ * MHCR     0x11ff:   caches on, write-back, write-allocate, RS/BP/BTB on,
++ *                    write burst on
++ * MHINT    0x16e30c: i/dcache prefetch, way prediction, AMR limit 3
++ */
++#define CSR_MXSTATUS		0x7c0
++#define CSR_MHCR		0x7c1
++#define CSR_MCOR		0x7c2
++#define CSR_MHINT		0x7c5
++
++#ifdef CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2
++/*
++ * VCC-DRAM comes from AXP209 DCDC2, which powers up at ~1.25V. That suits the
++ * T113-s3's in-package DDR3, but the D1s carries DDR2 and needs 1.8V; without
++ * this the DRAM training never completes and the board wedges hard enough to
++ * take the BROM's FEL loop with it.
++ *
++ * This has to happen before the DRAM controller is touched, so it cannot wait
++ * for the I2C/PMIC uclasses -- poke TWI0 directly. The ARM sunxi board code
++ * does the equivalent from sunxi_board_init() via axp_init(), but that path
++ * does not exist here.
++ */
++#define CCU_TWI_BGR_REG		0x0200191c
++#define CCU_TWI0_GATE		BIT(0)
++#define CCU_TWI0_RST		BIT(16)
++
++#define PIO_PB_CFG0_REG		0x02000030
++#define PB2_PB3_I2C0		((4 << 8) | (4 << 12))
++
++#define TWI0_BASE		0x02502000UL
++#define TWI_DATA		(TWI0_BASE + 0x08)
++#define TWI_CNTR		(TWI0_BASE + 0x0c)
++#define TWI_STAT		(TWI0_BASE + 0x10)
++#define TWI_CCR			(TWI0_BASE + 0x14)
++#define TWI_SRST		(TWI0_BASE + 0x18)
++
++#define CNTR_BUS_EN		BIT(6)
++#define CNTR_M_STA		BIT(5)
++#define CNTR_M_STP		BIT(4)
++#define CNTR_INT_FLAG		BIT(3)
++
++/* mv64xxx-style status codes */
++#define STAT_START_SENT		0x08
++#define STAT_ADDR_W_ACK		0x18
++#define STAT_DATA_W_ACK		0x28
++
++#define AXP209_ADDR		0x34
++#define AXP209_DCDC2_REG	0x23
++#define AXP209_DCDC2_1V8	((1800 - 700) / 25)	/* 0.7V + N*25mV */
++
++#define TWI_TIMEOUT		1000000
++
++static inline u32 sunxi_rd(ulong addr)
++{
++	return readl((void *)addr);
++}
++
++static inline void sunxi_wr(ulong addr, u32 val)
++{
++	writel(val, (void *)addr);
++}
++
++static int twi_wait(void)
++{
++	int t = TWI_TIMEOUT;
++
++	while (!(sunxi_rd(TWI_CNTR) & CNTR_INT_FLAG))
++		if (--t <= 0)
++			return -ETIMEDOUT;
++
++	return sunxi_rd(TWI_STAT);
++}
++
++/* sun6i and later clear INT_FLAG by writing a 1 to it */
++static void twi_next(u32 extra)
++{
++	sunxi_wr(TWI_CNTR, CNTR_BUS_EN | CNTR_INT_FLAG | extra);
++}
++
++static void twi_stop(void)
++{
++	int t = TWI_TIMEOUT;
++
++	twi_next(CNTR_M_STP);
++	while ((sunxi_rd(TWI_CNTR) & CNTR_M_STP) && --t > 0)
++		;
++}
++
++static int pmic_write_reg(u8 dev, u8 reg, u8 val)
++{
++	int t = 1000;
++
++	sunxi_wr(TWI_SRST, 1);
++	while ((sunxi_rd(TWI_SRST) & 1) && --t > 0)
++		;
++
++	sunxi_wr(TWI_CCR, (11 << 3) | 1);	/* 24MHz/(10*2*12) = 100kHz */
++	sunxi_wr(TWI_CNTR, CNTR_BUS_EN);
++
++	sunxi_wr(TWI_CNTR, CNTR_BUS_EN | CNTR_M_STA);
++	if (twi_wait() != STAT_START_SENT)
++		goto fail;
++
++	sunxi_wr(TWI_DATA, dev << 1);
++	twi_next(0);
++	if (twi_wait() != STAT_ADDR_W_ACK)
++		goto fail;
++
++	sunxi_wr(TWI_DATA, reg);
++	twi_next(0);
++	if (twi_wait() != STAT_DATA_W_ACK)
++		goto fail;
++
++	sunxi_wr(TWI_DATA, val);
++	twi_next(0);
++	if (twi_wait() != STAT_DATA_W_ACK)
++		goto fail;
++
++	twi_stop();
++	return 0;
++
++fail:
++	twi_stop();
++	return -EIO;
++}
++
++static void sunxi_raise_vcc_dram(void)
++{
++	u32 cfg;
++
++	sunxi_wr(CCU_TWI_BGR_REG,
++		 sunxi_rd(CCU_TWI_BGR_REG) | CCU_TWI0_RST | CCU_TWI0_GATE);
++
++	cfg = sunxi_rd(PIO_PB_CFG0_REG);
++	cfg &= ~0x0000ff00;
++	cfg |= PB2_PB3_I2C0;
++	sunxi_wr(PIO_PB_CFG0_REG, cfg);
++
++	if (pmic_write_reg(AXP209_ADDR, AXP209_DCDC2_REG, AXP209_DCDC2_1V8))
++		printf("PMIC: failed to raise VCC-DRAM to 1.8V\n");
++	else
++		printf("PMIC: VCC-DRAM (DCDC2) -> 1.8V for DDR2\n");
++}
++#else
++static void sunxi_raise_vcc_dram(void) {}
++#endif /* CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2 */
++
++int spl_board_init_f(void)
++{
++	struct ram_info info;
++	struct udevice *dev;
++	int ret;
++
++	ret = cpu_probe_all();
++	if (ret)
++		debug("CPU init failed: %d\n", ret);
++
++	/* must happen before the DRAM controller is brought up */
++	sunxi_raise_vcc_dram();
++
++	ret = uclass_get_device(UCLASS_RAM, 0, &dev);
++	if (ret) {
++		debug("DRAM init failed: %d\n", ret);
++		return ret;
++	}
++
++	if (!ram_get_info(dev, &info))
++		printf("DRAM: %lu MiB at 0x%lx\n",
++		       (ulong)(info.size >> 20), (ulong)info.base);
++
++	if (IS_ENABLED(CONFIG_SPL_RETURN_TO_FEL) &&
++	    readl((void *)(ulong)(SUNXI_RTC_BASE + SUNXI_RTC_GP_DATA +
++				       SUNXI_RTC_MSTM_FEL_INDEX * sizeof(u32))) ==
++	    SUNXI_RTC_MSTM_FEL_MAGIC) {
++		writel(0, (void *)(ulong)(SUNXI_RTC_BASE + SUNXI_RTC_GP_DATA +
++					  SUNXI_RTC_MSTM_FEL_INDEX * sizeof(u32)));
++		printf("MSTM FEL request: DRAM ready, entering FEL\n");
++		enter_fel();
++	}
++
++	/*
++	 * Booted over FEL there is no boot medium to load U-Boot proper from,
++	 * but DRAM is up by now. Hand control back to the BROM's FEL loop and
++	 * let the host push the next stage straight into DRAM over USB. Any
++	 * other boot source falls through to the normal SPL path.
++	 */
++	if (IS_ENABLED(CONFIG_SPL_RETURN_TO_FEL) &&
++	    sunxi_get_boot_device() == BOOT_DEVICE_BOARD) {
++		printf("FEL boot: DRAM ready, returning to FEL\n");
++		return_to_fel();
++	}
++
++
++
++	csr_set(CSR_MXSTATUS, 0x638000);
++	csr_write(CSR_MCOR, 0x70013);
++	csr_write(CSR_MHCR, 0x11ff);
++	csr_write(CSR_MHINT, 0x16e30c);
++
++	return 0;
++}
++
++/*
++ * DRAM size is only known once the controller has been trained, so the DT
++ * handed to U-Boot proper still carries whatever the source tree said.
++ */
++void spl_perform_board_fixups(struct spl_image_info *spl_image)
++{
++	struct ram_info info;
++	struct udevice *dev;
++	int ret;
++
++	if (!spl_image->fdt_addr)
++		return;
++
++	ret = uclass_get_device(UCLASS_RAM, 0, &dev);
++	if (ret)
++		panic("No RAM device");
++
++	ret = ram_get_info(dev, &info);
++	if (ret)
++		panic("No RAM info");
++
++	ret = fdt_fixup_memory(spl_image->fdt_addr, info.base, info.size);
++	if (ret)
++		panic("Failed to update DTB");
++}
++
++#else /* !CONFIG_XPL_BUILD */
++
++int board_init(void)
++{
++	/*
++	 * The CPU clock is set from the CPU driver's probe, which nothing else
++	 * pulls in on this platform.
++	 * https://lore.kernel.org/u-boot/31587574-4cd1-02da-9761-0134ac82b94b@sholland.org/
++	 */
++	return cpu_probe_all();
++}
++
++#if IS_ENABLED(CONFIG_USB_MUSB_GADGET) && !CONFIG_IS_ENABLED(DM_USB_GADGET)
++/*
++ * musb-new registers its gadget from the driver's probe, and driver model only
++ * probes on demand. Without DM_USB_GADGET, udc_device_get_by_index() -- which
++ * is what "dfu" and friends go through -- has nothing to probe with except
++ * board_usb_init(), so the controller stays unregistered and the command fails
++ * with "Controller uninitialized".
++ *
++ * DM_USB_GADGET is not the answer here: musb_register() only handles
++ * MUSB_PERIPHERAL when it is off, so turning it on breaks the probe instead.
++ */
++int board_usb_init(int index, enum usb_init_type init)
++{
++	struct udevice *dev;
++	int ret;
++
++	ret = uclass_get_device_by_seq(UCLASS_USB_GADGET_GENERIC, index, &dev);
++	if (ret)
++		ret = uclass_get_device(UCLASS_USB_GADGET_GENERIC, index, &dev);
++	if (ret)
++		pr_err("no USB gadget controller at index %d\n", index);
++
++	return ret;
++}
++
++int board_usb_cleanup(int index, enum usb_init_type init)
++{
++	return 0;
++}
++#endif
++
++/*
++ * Try to use the environment from the boot source first.
++ * For MMC, this means a FAT partition on the boot device (SD or eMMC).
++ * If the raw MMC environment is also enabled, this is tried next.
++ * When booting from NAND we try UBI first, then NAND directly.
++ * SPI flash falls back to FAT (on SD card).
++ */
++enum env_location env_get_location(enum env_operation op, int prio)
++{
++	if (prio > 1)
++		return ENVL_UNKNOWN;
++
++	/* NOWHERE is exclusive, no other option can be defined. */
++	if (IS_ENABLED(CONFIG_ENV_IS_NOWHERE))
++		return ENVL_NOWHERE;
++
++	switch (sunxi_get_boot_device()) {
++	case BOOT_DEVICE_MMC1:
++	case BOOT_DEVICE_MMC2:
++		if (prio == 0 && IS_ENABLED(CONFIG_ENV_IS_IN_FAT))
++			return ENVL_FAT;
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_MMC))
++			return ENVL_MMC;
++		break;
++	case BOOT_DEVICE_NAND:
++		if (prio == 0 && IS_ENABLED(CONFIG_ENV_IS_IN_UBI))
++			return ENVL_UBI;
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_NAND))
++			return ENVL_NAND;
++		/*
++		 * SPI NAND arrives here too, and it is reached through the MTD
++		 * stack rather than the raw NAND one. Without this the switch
++		 * falls through to ENVL_UNKNOWN, which board_f() cannot
++		 * recover from -- see the comment below.
++		 */
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_MTD))
++			return ENVL_MTD;
++		break;
++	case BOOT_DEVICE_SPI:
++		if (prio == 0 && IS_ENABLED(CONFIG_ENV_IS_IN_SPI_FLASH))
++			return ENVL_SPI_FLASH;
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_FAT))
++			return ENVL_FAT;
++		break;
++	case BOOT_DEVICE_BOARD:
++		break;
++	default:
++		break;
++	}
++
++	/*
++	 * If we come here for the first time, we *must* return a valid
++	 * environment location other than ENVL_UNKNOWN, or the setup sequence
++	 * in board_f() will silently hang. This is arguably a bug in
++	 * env_init(), but for now pick one environment for which we know for
++	 * sure to have a driver for.
++	 */
++	if (prio == 0) {
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_FAT))
++			return ENVL_FAT;
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_UBI))
++			return ENVL_UBI;
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_MTD))
++			return ENVL_MTD;
++	}
++
++	return ENVL_UNKNOWN;
++}
++
++#if CONFIG_MMC_SUNXI_SLOT_EXTRA != -1
++int mmc_get_env_dev(void)
++{
++	switch (sunxi_get_boot_device()) {
++	case BOOT_DEVICE_MMC1:
++		return 0;
++	case BOOT_DEVICE_MMC2:
++		return 1;
++	default:
++		return CONFIG_SYS_MMC_ENV_DEV;
++	}
++}
++#endif
++
++/*
++ * On older SoCs the SPL is actually at address zero, so using NULL as
++ * an error value does not work.
++ */
++#define INVALID_SPL_HEADER ((void *)~0UL)
++
++static struct boot_file_head *get_spl_header(uint8_t req_version)
++{
++	struct boot_file_head *spl = (void *)(ulong)SPL_ADDR;
++	uint8_t spl_header_version = spl->spl_signature[3];
++
++	/* Is there really the SPL header (still) there? */
++	if (memcmp(spl->spl_signature, SPL_SIGNATURE, 3) != 0)
++		return INVALID_SPL_HEADER;
++
++	if (spl_header_version < req_version) {
++		printf("sunxi SPL version mismatch: expected %u, got %u\n",
++		       req_version, spl_header_version);
++		return INVALID_SPL_HEADER;
++	}
++
++	return spl;
++}
++
++static const char *get_spl_dt_name(void)
++{
++	struct boot_file_head *spl = get_spl_header(SPL_DT_HEADER_VERSION);
++
++	/* Check if there is a DT name stored in the SPL header. */
++	if (spl != INVALID_SPL_HEADER && spl->dt_name_offset)
++		return (char *)spl + spl->dt_name_offset;
++
++	return NULL;
++}
++
++/*
++ * Check the SPL header for the "sunxi" variant. If found: parse values
++ * that might have been passed by the loader ("fel" utility), and update
++ * the environment accordingly.
++ */
++static void parse_spl_header(const uint32_t spl_addr)
++{
++	struct boot_file_head *spl = get_spl_header(SPL_ENV_HEADER_VERSION);
++
++	if (spl == INVALID_SPL_HEADER)
++		return;
++
++	if (!spl->fel_script_address)
++		return;
++
++	if (spl->fel_uEnv_length != 0) {
++		/*
++		 * data is expected in uEnv.txt compatible format, so "env
++		 * import -t" the string(s) at fel_script_address right away.
++		 */
++		himport_r(&env_htab, (char *)(uintptr_t)spl->fel_script_address,
++			  spl->fel_uEnv_length, '\n', H_NOCLEAR, 0, 0, NULL);
++		return;
++	}
++	/* otherwise assume .scr format (mkimage-type script) */
++	env_set_hex("fel_scriptaddr", spl->fel_script_address);
++}
++
++static bool get_unique_sid(unsigned int *sid)
++{
++	if (sunxi_get_sid(sid) != 0)
++		return false;
++
++	if (!sid[0])
++		return false;
++
++	/*
++	 * The single words 1 - 3 of the SID have quite a few bits which are
++	 * the same on many models, so take a crc32 of all 3 words to get a
++	 * more unique value.
++	 */
++	sid[3] = crc32(0, (unsigned char *)&sid[1], 12);
++
++	/* Ensure the NIC specific bytes of the mac are not all 0 */
++	if ((sid[3] & 0xffffff) == 0)
++		sid[3] |= 0x800000;
++
++	return true;
++}
++
++/*
++ * Note this function gets called multiple times.
++ * It must not make any changes to env variables which already exist.
++ */
++static void setup_environment(const void *fdt)
++{
++	char serial_string[17] = { 0 };
++	unsigned int sid[4];
++	uint8_t mac_addr[6];
++	char ethaddr[16];
++	int i;
++
++	if (!get_unique_sid(sid))
++		return;
++
++	for (i = 0; i < 4; i++) {
++		sprintf(ethaddr, "ethernet%d", i);
++		if (!fdt_get_alias(fdt, ethaddr))
++			continue;
++
++		if (i == 0)
++			strcpy(ethaddr, "ethaddr");
++		else
++			sprintf(ethaddr, "eth%daddr", i);
++
++		if (env_get(ethaddr))
++			continue;
++
++		/* Non OUI / registered MAC address */
++		mac_addr[0] = (i << 4) | 0x02;
++		mac_addr[1] = (sid[0] >>  0) & 0xff;
++		mac_addr[2] = (sid[3] >> 24) & 0xff;
++		mac_addr[3] = (sid[3] >> 16) & 0xff;
++		mac_addr[4] = (sid[3] >>  8) & 0xff;
++		mac_addr[5] = (sid[3] >>  0) & 0xff;
++
++		eth_env_set_enetaddr(ethaddr, mac_addr);
++	}
++
++	if (!env_get("serial#")) {
++		snprintf(serial_string, sizeof(serial_string),
++			 "%08x%08x", sid[0], sid[3]);
++
++		env_set("serial#", serial_string);
++	}
++}
++
++int misc_init_r(void)
++{
++	const char *spl_dt_name;
++	uint boot;
++
++	env_set("fel_booted", NULL);
++	env_set("fel_scriptaddr", NULL);
++	env_set("mmc_bootdev", NULL);
++
++	boot = sunxi_get_boot_device();
++	/* determine if we are running in FEL mode */
++	if (boot == BOOT_DEVICE_BOARD) {
++		env_set("fel_booted", "1");
++		parse_spl_header(SPL_ADDR);
++	/* or if we booted from MMC, and which one */
++	} else if (boot == BOOT_DEVICE_MMC1) {
++		env_set("mmc_bootdev", "0");
++	} else if (boot == BOOT_DEVICE_MMC2) {
++		env_set("mmc_bootdev", "1");
++	}
++
++	/* Set fdtfile to match the FIT configuration chosen in SPL. */
++	spl_dt_name = get_spl_dt_name();
++	if (spl_dt_name) {
++		char str[64];
++
++		/* matches FDTFILE in include/configs/sunxi-common.h */
++		snprintf(str, sizeof(str), "allwinner/%s.dtb", spl_dt_name);
++		env_set("fdtfile", str);
++	}
++
++	setup_environment(gd->fdt_blob);
++
++	return 0;
++}
++
++int board_late_init(void)
++{
++	if (IS_ENABLED(CONFIG_USB_ETHER))
++		usb_ether_init();
++
++	return 0;
++}
++
++int ft_board_setup(void *blob, struct bd_info *bd)
++{
++	/*
++	 * Call setup_environment() and fdt_fixup_ethernet() again in case the
++	 * boot fdt has ethernet aliases the u-boot copy does not have.
++	 */
++	setup_environment(blob);
++	fdt_fixup_ethernet(blob);
++
++	return 0;
++}
++
++#ifdef CONFIG_SPL_LOAD_FIT
++static void set_spl_dt_name(const char *name)
++{
++	struct boot_file_head *spl = get_spl_header(SPL_ENV_HEADER_VERSION);
++
++	if (spl == INVALID_SPL_HEADER)
++		return;
++
++	/* Promote the header version for U-Boot proper, if needed. */
++	if (spl->spl_signature[3] < SPL_DT_HEADER_VERSION)
++		spl->spl_signature[3] = SPL_DT_HEADER_VERSION;
++
++	strcpy((char *)&spl->string_pool, name);
++	spl->dt_name_offset = offsetof(struct boot_file_head, string_pool);
++}
++
++int board_fit_config_name_match(const char *name)
++{
++	const char *best_dt_name = get_spl_dt_name();
++	int ret;
++
++#ifdef CONFIG_DEFAULT_DEVICE_TREE
++	if (!best_dt_name)
++		best_dt_name = CONFIG_DEFAULT_DEVICE_TREE;
++#endif
++
++	if (!best_dt_name) {
++		/* No DT name was provided, so accept the first config. */
++		return 0;
++	}
++
++	ret = strcmp(name, best_dt_name);
++
++	/*
++	 * If one of the FIT configurations matches the most accurate DT name,
++	 * update the SPL header to provide that DT name to U-Boot proper.
++	 */
++	if (ret == 0)
++		set_spl_dt_name(best_dt_name);
++
++	return ret;
++}
++#endif /* CONFIG_SPL_LOAD_FIT */
++
++#ifdef CONFIG_USB_GADGET
++int g_dnl_board_usb_cable_connected(void)
++{
++	struct udevice *dev;
++	struct phy phy;
++	int ret;
++
++	ret = uclass_get_device(UCLASS_USB_GADGET_GENERIC, 0, &dev);
++	if (ret) {
++		pr_err("%s: Cannot find USB device\n", __func__);
++		return ret;
++	}
++
++	ret = generic_phy_get_by_name(dev, "usb", &phy);
++	if (ret) {
++		pr_err("failed to get %s USB PHY\n", dev->name);
++		return ret;
++	}
++
++	ret = generic_phy_init(&phy);
++	if (ret) {
++		pr_debug("failed to init %s USB PHY\n", dev->name);
++		return ret;
++	}
++
++	return sun4i_usb_phy_vbus_detect(&phy);
++}
++#endif
++
++#endif /* CONFIG_XPL_BUILD */
+diff --git a/board/sunxi/spl_spinand_sunxi.c b/board/sunxi/spl_spinand_sunxi.c
+new file mode 100644
+index 00000000..10b1cc1c
+--- /dev/null
++++ b/board/sunxi/spl_spinand_sunxi.c
+@@ -0,0 +1,387 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * SPL loader for SPI NAND on the RISC-V sunxi SoCs (Allwinner D1/D1s).
++ *
++ * The BROM can read the SPL out of a SPI NAND, but nothing in U-Boot can read
++ * anything else out of one from the SPL: spl_spi.c goes through
++ * spi_flash_probe(), which is the NOR framework and finds no JEDEC id on a
++ * NAND part, and arch/arm/mach-sunxi/spl_spi_sunxi.c handles NOR only (and is
++ * ARM-only besides). So a board whose only medium is SPI NAND -- which is what
++ * the D1s designs are -- cannot get past the SPL. This fills that in.
++ *
++ * Deliberately minimal. All it has to do is pull one image out of a fixed
++ * offset exactly once, so there is no write path, no ECC correction beyond
++ * what the chip does on its own, and no attempt at a generic geometry: the
++ * page and block size come from the parameter page every SPI NAND carries.
++ *
++ * The register sequences follow Allwinner's own boot0
++ * (brandy-2.0/spl/drivers/nand/sun20iw1p1/spinand/), which is the only
++ * documentation for this controller. Two things are dropped from it:
++ *
++ *   - Sample delay calibration. boot0 tunes the sample point against the SPI
++ *     clock, with a table per frequency range. Running the bus from the 24MHz
++ *     oscillator instead of PLL6 puts us in its "<= 24MHz" case, where the
++ *     answer is just SPI_SAMPLE_MODE and no tuning at all. Reading 741K takes
++ *     about a quarter of a second that way, which is nothing next to the DRAM
++ *     init that already happened.
++ *   - Quad and dual read, two-plane addressing, and the OperationOpt feature
++ *     flags that select between them. Plain x1 read works on every part.
++ */
++
++#include <config.h>
++#include <image.h>
++#include <spl.h>
++#include <spl_load.h>
++#include <asm/arch/spl.h>
++#include <asm/io.h>
++#include <linux/delay.h>
++
++/*
++ * The register addresses below are bare physical integers, which ARM's
++ * readl/writel take and RISC-V's do not. Same self-referential macro trick the
++ * sunxi DRAM driver uses: a function-like macro is not expanded again inside
++ * its own expansion.
++ */
++#define readl(a)	readl((const volatile void __iomem *)(ulong)(a))
++#define writel(v, a)	writel((v), (volatile void __iomem *)(ulong)(a))
++#define readb(a)	readb((const volatile void __iomem *)(ulong)(a))
++#define writeb(v, a)	writeb((v), (volatile void __iomem *)(ulong)(a))
++
++/* CCU */
++#define CCU_BASE			0x02001000UL
++#define CCU_SPI0_CLK_REG		(CCU_BASE + 0x940)
++#define CCU_SPI_BGR_REG			(CCU_BASE + 0x96c)
++#define CCU_SPI0_GATE			BIT(0)
++#define CCU_SPI0_RST			BIT(16)
++#define CCU_CLK_ENABLE			BIT(31)
++#define CCU_CLK_SRC_HOSC		(0 << 24)
++
++/* pinctrl: SPI0 is PC2..PC5, function 2 */
++#define PIO_BASE			0x02000000UL
++#define PIO_PC_CFG0_REG			(PIO_BASE + 0x60)
++
++/* SPI0 */
++#define SPI_BASE			0x04025000UL
++#define SPI_GCR				(SPI_BASE + 0x04)
++#define SPI_TCR				(SPI_BASE + 0x08)
++#define SPI_IER				(SPI_BASE + 0x10)
++#define SPI_ISR				(SPI_BASE + 0x14)
++#define SPI_FCR				(SPI_BASE + 0x18)
++#define SPI_FSR				(SPI_BASE + 0x1c)
++#define SPI_CCR				(SPI_BASE + 0x24)
++#define SPI_MBC				(SPI_BASE + 0x30)
++#define SPI_MTC				(SPI_BASE + 0x34)
++#define SPI_BCC				(SPI_BASE + 0x38)
++#define SPI_TXD				(SPI_BASE + 0x200)
++#define SPI_RXD				(SPI_BASE + 0x300)
++
++#define SPI_GCR_SOFT_RST		BIT(31)
++#define SPI_GCR_TXPAUSE_EN		BIT(7)
++#define SPI_GCR_MASTER			BIT(1)
++#define SPI_GCR_ENABLE			BIT(0)
++
++#define SPI_TCR_EXCHANGE		BIT(31)
++#define SPI_TCR_SAMPLE_MODE		BIT(13)
++#define SPI_TCR_DHB			BIT(8)
++#define SPI_TCR_SET_SS_1		BIT(7)
++#define SPI_TCR_SS_ACTIVE0		BIT(2)
++
++#define SPI_FCR_TXFIFO_RST		BIT(31)
++#define SPI_FCR_RXFIFO_RST		BIT(15)
++
++#define SPI_FIFO_DEPTH			64
++
++/* SPI NAND commands */
++#define SPINAND_CMD_RESET		0xff
++#define SPINAND_CMD_READ_ID		0x9f
++#define SPINAND_CMD_GET_FEATURE		0x0f
++#define SPINAND_CMD_SET_FEATURE		0x1f
++#define SPINAND_CMD_PAGE_READ		0x13
++#define SPINAND_CMD_READ_CACHE		0x03
++
++#define SPINAND_FEATURE_CONFIG		0xb0
++#define SPINAND_FEATURE_STATUS		0xc0
++#define SPINAND_CFG_ECC_EN		BIT(4)
++#define SPINAND_STATUS_BUSY		BIT(0)
++
++/*
++ * Geometry. Everything this loader needs is a page size, a block size and the
++ * offset of the bad block marker. Reading the ONFI-ish parameter page would
++ * mean a second command path for a value that is the same on every part these
++ * boards use, so the sizes are fixed and only checked against the id.
++ */
++#define SPINAND_PAGE_SIZE		2048
++#define SPINAND_OOB_SIZE		64
++#define SPINAND_PAGES_PER_BLOCK		64
++#define SPINAND_BLOCK_SIZE		(SPINAND_PAGE_SIZE * SPINAND_PAGES_PER_BLOCK)
++
++/*
++ * Every wait here is bounded. An unbounded one costs more than a failed read:
++ * the SPL wedges, and a wedged SPL takes the BROM's FEL loop down with it, so
++ * the board stops responding to the host entirely and only a power cycle gets
++ * it back.
++ */
++#define SPI_WAIT_LOOPS		1000000
++
++static int spinand_xfer(const u8 *txbuf, u32 tcnt, u8 *rxbuf, u32 rcnt)
++{
++	int timeout;
++	u32 i;
++
++	writel(0, SPI_IER);
++	writel(0xffffffff, SPI_ISR);
++	writel(SPI_FCR_TXFIFO_RST | SPI_FCR_RXFIFO_RST | readl(SPI_FCR),
++	       SPI_FCR);
++
++	writel(tcnt, SPI_MTC);
++	writel(tcnt + rcnt, SPI_MBC);
++	/* single-wire for the whole burst: no dummy, no quad */
++	writel(tcnt, SPI_BCC);
++
++	for (i = 0; i < tcnt; i++)
++		writeb(txbuf[i], SPI_TXD);
++
++	writel(readl(SPI_TCR) | SPI_TCR_EXCHANGE, SPI_TCR);
++
++	for (i = 0; i < rcnt; i++) {
++		timeout = SPI_WAIT_LOOPS;
++		while (!(readl(SPI_FSR) & 0x7f))
++			if (--timeout <= 0) {
++				printf("SPI NAND: rx timeout at %u/%u, FSR=%08x ISR=%08x TCR=%08x\n",
++				       i, rcnt, readl(SPI_FSR), readl(SPI_ISR),
++				       readl(SPI_TCR));
++				return -ETIMEDOUT;
++			}
++		rxbuf[i] = readb(SPI_RXD);
++	}
++
++	timeout = SPI_WAIT_LOOPS;
++	while (readl(SPI_TCR) & SPI_TCR_EXCHANGE)
++		if (--timeout <= 0) {
++			printf("SPI NAND: xfer timeout, TCR=%08x ISR=%08x\n",
++			       readl(SPI_TCR), readl(SPI_ISR));
++			return -ETIMEDOUT;
++		}
++
++	writel(0xffffffff, SPI_ISR);
++
++	return 0;
++}
++
++static u8 spinand_get_feature(u8 reg)
++{
++	u8 tx[2] = { SPINAND_CMD_GET_FEATURE, reg };
++	u8 rx = 0;
++
++	if (spinand_xfer(tx, sizeof(tx), &rx, 1))
++		return 0xff;
++
++	return rx;
++}
++
++static void spinand_set_feature(u8 reg, u8 val)
++{
++	u8 tx[3] = { SPINAND_CMD_SET_FEATURE, reg, val };
++
++	spinand_xfer(tx, sizeof(tx), NULL, 0);
++}
++
++static int spinand_wait_ready(void)
++{
++	int timeout = 100000;
++
++	while (timeout--) {
++		if (!(spinand_get_feature(SPINAND_FEATURE_STATUS) &
++		      SPINAND_STATUS_BUSY))
++			return 0;
++		udelay(1);
++	}
++
++	return -ETIMEDOUT;
++}
++
++static int spinand_hw_init(void)
++{
++	int timeout;
++	u32 val;
++
++	/* SPI0 pins: PC2..PC5 to function 2 */
++	val = readl(PIO_PC_CFG0_REG);
++	val &= ~0x00ffff00;
++	val |= 0x00222200;
++	writel(val, PIO_PC_CFG0_REG);
++
++	/* 24MHz straight off the oscillator: no PLL, and no sample tuning */
++	writel(CCU_CLK_ENABLE | CCU_CLK_SRC_HOSC, CCU_SPI0_CLK_REG);
++
++	/* ungate and release reset */
++	val = readl(CCU_SPI_BGR_REG);
++	writel(val & ~CCU_SPI0_RST, CCU_SPI_BGR_REG);
++	writel(val | CCU_SPI0_GATE | CCU_SPI0_RST, CCU_SPI_BGR_REG);
++
++	writel(SPI_GCR_SOFT_RST | SPI_GCR_TXPAUSE_EN | SPI_GCR_MASTER |
++	       SPI_GCR_ENABLE, SPI_GCR);
++	timeout = SPI_WAIT_LOOPS;
++	while (readl(SPI_GCR) & SPI_GCR_SOFT_RST)
++		if (--timeout <= 0) {
++			printf("SPI NAND: controller stuck in reset, GCR=%08x\n",
++			       readl(SPI_GCR));
++			return -ETIMEDOUT;
++		}
++
++	/*
++	 * SS idles high and is driven by the controller, discard the unused
++	 * part of a burst, and sample on the delayed edge -- the <= 24MHz
++	 * case in boot0's calibration, where nothing has to be measured.
++	 */
++	writel(SPI_TCR_SET_SS_1 | SPI_TCR_DHB | SPI_TCR_SS_ACTIVE0 |
++	       SPI_TCR_SAMPLE_MODE, SPI_TCR);
++
++	writel(SPI_FCR_TXFIFO_RST | SPI_FCR_RXFIFO_RST | (32 << 16) | 32,
++	       SPI_FCR);
++	writel(0, SPI_CCR);
++
++	return 0;
++}
++
++static int spinand_init(void)
++{
++	u8 tx[2] = { SPINAND_CMD_RESET, 0 };
++	u8 id[4] = { 0 };
++	u8 idcmd[2] = { SPINAND_CMD_READ_ID, 0 };
++
++	if (spinand_hw_init())
++		return -ETIMEDOUT;
++
++	if (spinand_xfer(tx, 1, NULL, 0))
++		return -ETIMEDOUT;
++	udelay(2000);
++	if (spinand_wait_ready())
++		return -ETIMEDOUT;
++
++	if (spinand_xfer(idcmd, sizeof(idcmd), id, 2))
++		return -ETIMEDOUT;
++	if (id[0] == 0x00 || id[0] == 0xff) {
++		printf("SPI NAND: no chip (id %02x %02x)\n", id[0], id[1]);
++		return -ENODEV;
++	}
++	printf("SPI NAND: id %02x %02x\n", id[0], id[1]);
++
++	/*
++	 * Leave the on-die ECC engine on. It is what makes a plain read
++	 * trustworthy without carrying a BCH implementation in the SPL, and
++	 * the BROM read this very chip the same way to get us here.
++	 */
++	spinand_set_feature(SPINAND_FEATURE_CONFIG,
++			    spinand_get_feature(SPINAND_FEATURE_CONFIG) |
++			    SPINAND_CFG_ECC_EN);
++
++	return 0;
++}
++
++/* Read one page into buf; column selects main area (0) or OOB. */
++static int spinand_read_page(u32 page, u32 column, u8 *buf, u32 len)
++{
++	u8 tx[4];
++
++	tx[0] = SPINAND_CMD_PAGE_READ;
++	tx[1] = (page >> 16) & 0xff;
++	tx[2] = (page >> 8) & 0xff;
++	tx[3] = page & 0xff;
++	if (spinand_xfer(tx, 4, NULL, 0))
++		return -ETIMEDOUT;
++
++	if (spinand_wait_ready())
++		return -ETIMEDOUT;
++
++	tx[0] = SPINAND_CMD_READ_CACHE;
++	tx[1] = (column >> 8) & 0xff;
++	tx[2] = column & 0xff;
++	tx[3] = 0x00;			/* one dummy byte */
++
++	return spinand_xfer(tx, 4, buf, len);
++}
++
++/*
++ * A block is bad when the first byte of the spare area of its first page is
++ * not 0xff. The marker is written by the factory and preserved by anything
++ * that erases responsibly, so this is the same test the BROM and boot0 use.
++ */
++static int spinand_block_is_bad(u32 block)
++{
++	u8 marker = 0xff;
++
++	if (spinand_read_page(block * SPINAND_PAGES_PER_BLOCK,
++			      SPINAND_PAGE_SIZE, &marker, 1))
++		return 1;
++
++	return marker != 0xff;
++}
++
++/*
++ * Read `len` bytes starting at `offs`, which must be block aligned. Bad
++ * blocks are skipped, so the data lands contiguously in memory while its
++ * physical extent on the chip grows -- exactly what a written image does.
++ */
++static int spinand_read(u32 offs, void *dst, u32 len)
++{
++	u32 block = offs / SPINAND_BLOCK_SIZE;
++	u8 *out = dst;
++	u32 done = 0;
++
++	while (done < len) {
++		u32 page, i;
++
++		if (spinand_block_is_bad(block)) {
++			block++;
++			continue;
++		}
++
++		page = block * SPINAND_PAGES_PER_BLOCK;
++		for (i = 0; i < SPINAND_PAGES_PER_BLOCK && done < len; i++) {
++			u32 chunk = min_t(u32, SPINAND_PAGE_SIZE, len - done);
++
++			if (spinand_read_page(page + i, 0, out + done, chunk))
++				return -EIO;
++			done += chunk;
++		}
++		block++;
++	}
++
++	return 0;
++}
++
++static ulong spl_spinand_read(struct spl_load_info *load, ulong sector,
++			      ulong count, void *buf)
++{
++	if (spinand_read(sector, buf, count))
++		return 0;
++
++	return count;
++}
++
++static int spl_spinand_load_image(struct spl_image_info *spl_image,
++				  struct spl_boot_device *bootdev)
++{
++	struct legacy_img_hdr *header;
++	struct spl_load_info load;
++	int ret;
++
++	ret = spinand_init();
++	if (ret)
++		return ret;
++
++	header = spl_get_load_buffer(0, sizeof(*header));
++	ret = spinand_read(CONFIG_SYS_SPINAND_U_BOOT_OFFS, header,
++			   sizeof(*header));
++	if (ret)
++		return ret;
++
++	spl_load_init(&load, spl_spinand_read, NULL, 1);
++
++	return spl_load(spl_image, bootdev, &load,
++			0, CONFIG_SYS_SPINAND_U_BOOT_OFFS);
++}
++
++SPL_LOAD_IMAGE_METHOD("sunxi SPI NAND", 0, BOOT_DEVICE_NAND,
++		      spl_spinand_load_image);
+diff --git a/common/spl/Kconfig b/common/spl/Kconfig
+index 5fa94098..43b89729 100644
+--- a/common/spl/Kconfig
++++ b/common/spl/Kconfig
+@@ -389,7 +389,7 @@ config SPL_SYS_MALLOC_SIMPLE
+ config SPL_SHARES_INIT_SP_ADDR
+ 	bool "SPL and U-Boot use the same initial stack pointer location"
+ 	depends on (ARM || ARCH_JZ47XX || MICROBLAZE || RISCV) && SPL_FRAMEWORK
+-	default n if ARCH_SUNXI || ARCH_MX6 || ARCH_MX7 || ARCH_SC5XX
++	default n if ARCH_SUNXI || BOARD_SUNXI || ARCH_MX6 || ARCH_MX7 || ARCH_SC5XX
+ 	default y
+ 	help
+ 	  In many cases, we can use the same initial stack pointer address for
+@@ -407,7 +407,7 @@ config SPL_HAVE_INIT_STACK
+ 	default y if MACH_SUN50I_H6 || MACH_SUN50I_H616 || MACH_SUN8I_R528
+ 	default y if MACH_SUN50I || MACH_SUN50I_H5
+ 	default y if MACH_SUN9I
+-	default y if ARCH_SUNXI
++	default y if ARCH_SUNXI || BOARD_SUNXI
+ 	default y if ARCH_SC5XX && (SC59X_64 || SC59X)
+ 	default y if ARCH_SC5XX && SC58X
+ 	default y if ARCH_SC5XX && SC57X
+diff --git a/include/configs/sun20i.h b/include/configs/sun20i.h
+new file mode 100644
+index 00000000..e8ef1b6c
+--- /dev/null
++++ b/include/configs/sun20i.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Placeholder wrapper to allow addressing Allwinner D1 (and later) sun20i
++ * CPU based devices separately. Please do not add anything in here.
++ */
++#ifndef __CONFIG_H
++#define __CONFIG_H
++
++#include <configs/sunxi-common.h>
++
++#endif /* __CONFIG_H */
+diff --git a/scripts/Makefile.xpl b/scripts/Makefile.xpl
+index a3fd3e13..592f59b2 100644
+--- a/scripts/Makefile.xpl
++++ b/scripts/Makefile.xpl
+@@ -275,7 +275,8 @@ endif
+ 
+ INPUTS-$(CONFIG_ARCH_SOCFPGA_SOC64) += $(obj)/u-boot-spl-dtb.hex
+ 
+-ifdef CONFIG_ARCH_SUNXI
++# ARCH_SUNXI is the ARM sunxi platform, BOARD_SUNXI its RISC-V counterpart.
++ifneq ($(filter y,$(CONFIG_ARCH_SUNXI) $(CONFIG_BOARD_SUNXI)),)
+ INPUTS-y	+= $(obj)/sunxi-spl.bin
+ 
+ ifdef CONFIG_NAND_SUNXI

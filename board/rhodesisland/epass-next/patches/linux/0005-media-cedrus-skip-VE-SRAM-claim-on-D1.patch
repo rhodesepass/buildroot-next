@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shirogane Tsumugi <inapp@iccmc.cc>
+Date: Wed, 5 Aug 2026 11:53:24 +0800
+Subject: [PATCH 5/13] media: cedrus: skip VE SRAM claim on D1
+
+Older sunxi SoCs map a slice of SRAM C to the video engine and it must be
+claimed from the SRAM controller. The D1 has no such mapping -- the VE
+reaches DRAM directly, through the IOMMU when one is present -- and there
+is no sram node to claim, so probe failed with
+
+  cedrus 1c0e000.video-codec: Failed to claim SRAM
+
+Mark the D1 variant accordingly and make the claim/release conditional.
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c    |  1 +
+ drivers/staging/media/sunxi/cedrus/cedrus.h    |  7 +++++++
+ drivers/staging/media/sunxi/cedrus/cedrus_hw.c | 17 +++++++++++------
+ 3 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index bbd186b80..3b9bf5ad1 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -616,6 +616,7 @@ static const struct cedrus_variant sun8i_r40_cedrus_variant = {
+ };
+ 
+ static const struct cedrus_variant sun20i_d1_cedrus_variant = {
++	.no_ve_sram	= true,
+ 	.capabilities	= CEDRUS_CAPABILITY_UNTILED |
+ 			  CEDRUS_CAPABILITY_MPEG2_DEC |
+ 			  CEDRUS_CAPABILITY_H264_DEC |
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index c4b1217c1..46bbb236b 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -174,6 +174,12 @@ struct cedrus_dec_ops {
+ 
+ struct cedrus_variant {
+ 	unsigned int	capabilities;
++	/*
++	 * Older SoCs map a slice of SRAM C to the VE and need it claimed from
++	 * the SRAM controller first. On the D1 the VE reaches DRAM directly
++	 * (through the IOMMU when one is present), and no such mapping exists.
++	 */
++	bool		no_ve_sram;
+ 	unsigned int	mod_rate;
+ };
+ 
+@@ -198,6 +204,7 @@ struct cedrus_dev {
+ 	struct reset_control	*rstc;
+ 
+ 	unsigned int		capabilities;
++	bool			no_ve_sram;
+ 
+ 	struct delayed_work	watchdog_work;
+ };
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index 444fb5387..0eb7b5b8a 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -254,6 +254,7 @@ int cedrus_hw_probe(struct cedrus_dev *dev)
+ 		return -EINVAL;
+ 
+ 	dev->capabilities = variant->capabilities;
++	dev->no_ve_sram = variant->no_ve_sram;
+ 
+ 	irq_dec = platform_get_irq(dev->pdev, 0);
+ 	if (irq_dec <= 0)
+@@ -273,11 +274,13 @@ int cedrus_hw_probe(struct cedrus_dev *dev)
+ 		return ret;
+ 	}
+ 
+-	ret = sunxi_sram_claim(dev->dev);
+-	if (ret) {
+-		dev_err(dev->dev, "Failed to claim SRAM\n");
++	if (!dev->no_ve_sram) {
++		ret = sunxi_sram_claim(dev->dev);
++		if (ret) {
++			dev_err(dev->dev, "Failed to claim SRAM\n");
+ 
+-		goto err_mem;
++			goto err_mem;
++		}
+ 	}
+ 
+ 	dev->ahb_clk = devm_clk_get(dev->dev, "ahb");
+@@ -339,7 +342,8 @@ int cedrus_hw_probe(struct cedrus_dev *dev)
+ err_pm:
+ 	pm_runtime_disable(dev->dev);
+ err_sram:
+-	sunxi_sram_release(dev->dev);
++	if (!dev->no_ve_sram)
++		sunxi_sram_release(dev->dev);
+ err_mem:
+ 	of_reserved_mem_device_release(dev->dev);
+ 
+@@ -352,7 +356,8 @@ void cedrus_hw_remove(struct cedrus_dev *dev)
+ 	if (!pm_runtime_status_suspended(dev->dev))
+ 		cedrus_hw_suspend(dev->dev);
+ 
+-	sunxi_sram_release(dev->dev);
++	if (!dev->no_ve_sram)
++		sunxi_sram_release(dev->dev);
+ 
+ 	of_reserved_mem_device_release(dev->dev);
+ }

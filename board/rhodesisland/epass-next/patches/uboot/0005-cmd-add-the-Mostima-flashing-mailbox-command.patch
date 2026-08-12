@@ -1,0 +1,150 @@
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 5/5] cmd: add the Mostima flashing mailbox command
+
+The host flasher brings up DRAM over FEL, leaves a header there saying which
+board this is and what to wipe, and then runs U-Boot out of that same DRAM.
+mstmchk is how bootcmd finds the header: without it a U-Boot started this way
+is indistinguishable from one that booted normally, and there is nowhere else
+to put the information -- the board has no storage that is guaranteed
+readable at that point, which is usually the reason it is being flashed.
+
+The answer comes back in mstm_ret and mstm_flags rather than in the command's
+exit status, because hush only preserves success/failure and the boot type
+needs more range than that. The previous generation learned this the hard way
+and its first version, which returned the type as the exit code, is still in
+its tree as a fossil.
+
+The address is a Kconfig option rather than a constant: it has to be
+somewhere the firmware loaded alongside it does not land and somewhere U-Boot
+does not relocate onto, which makes it a property of the board's memory map.
+
+Format, matching the F1C generation byte for byte so that one host-side
+flasher drives both:
+
+  0x00  8  magic "Mostima_"
+  0x08  1  boot type: 1 = NAND flow, 2 = SD flow
+  0x09  1  flags
+  0x0a  2  padding
+  0x0c  4  u32 LE length of the env payload, including its NUL
+  0x10  n  env text, for "env import -t"
+---
+diff --git a/cmd/Kconfig b/cmd/Kconfig
+index c71c6824..18d76273 100644
+--- a/cmd/Kconfig
++++ b/cmd/Kconfig
+@@ -1477,6 +1477,25 @@ config CMD_MISC
+ 	  a MISC uclass driver. The command provides listing all MISC devices
+ 	  as well as read and write functionalities via their drivers.
+ 
++config CMD_MSTMCHK
++	bool "mstmchk"
++	help
++	  Read the Mostima flashing mailbox left in DRAM by the host flasher
++	  and report it in the mstm_ret and mstm_flags environment variables.
++	  bootcmd dispatches on those to decide whether it was started to
++	  flash the board or to boot it.
++
++config MSTMCHK_ADDR
++	hex "Address of the Mostima mailbox"
++	depends on CMD_MSTMCHK
++	default 0x40100000
++	help
++	  Where the host flasher puts the mailbox. It has to be somewhere the
++	  firmware being loaded alongside it does not land, and somewhere U-Boot
++	  does not relocate onto, so it is board specific -- set it in the board
++	  defconfig next to the rest of the memory map rather than trusting the
++	  default.
++
+ config CMD_MMC
+ 	bool "mmc"
+ 	depends on MMC
+diff --git a/cmd/Makefile b/cmd/Makefile
+index bbbdfcc4..3fca9da1 100644
+--- a/cmd/Makefile
++++ b/cmd/Makefile
+@@ -119,6 +119,7 @@ obj-$(CONFIG_CMD_MISC) += misc.o
+ obj-$(CONFIG_CMD_MDIO) += mdio.o
+ obj-$(CONFIG_CMD_PAUSE) += pause.o
+ obj-$(CONFIG_CMD_SLEEP) += sleep.o
++obj-$(CONFIG_CMD_MSTMCHK) += mstmchk.o
+ obj-$(CONFIG_CMD_MMC) += mmc.o
+ obj-$(CONFIG_CMD_OPTEE_RPMB) += optee_rpmb.o
+ obj-$(CONFIG_CMD_OPTEE) += optee.o
+diff --git a/cmd/mstmchk.c b/cmd/mstmchk.c
+new file mode 100644
+index 00000000..a20457fd
+--- /dev/null
++++ b/cmd/mstmchk.c
+@@ -0,0 +1,72 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Read the Mostima flashing mailbox out of DRAM.
++ *
++ * The host flasher initialises DRAM over FEL, drops a header plus an env
++ * fragment at a fixed address, then loads and runs U-Boot from DRAM. This
++ * command is how bootcmd finds out it was started to flash the board rather
++ * than to boot it.
++ *
++ *   0x00  8  magic "Mostima_"
++ *   0x08  1  boot type: 1 = NAND flow, 2 = SD flow      -> ${mstm_ret}
++ *   0x09  1  flags                                      -> ${mstm_flags}
++ *   0x0a  2  padding
++ *   0x0c  4  u32 LE length of the env payload, incl NUL -> read by the env
++ *   0x10  n  env text for "env import -t"
++ *
++ * The result comes back in environment variables, not in the command's exit
++ * status: hush only records success/failure, so a status byte cannot survive
++ * the trip. Same reason the previous generation ended up here.
++ */
++
++#include <command.h>
++#include <env.h>
++#include <mapmem.h>
++#include <vsprintf.h>
++#include <linux/types.h>
++
++#define MSTMCHK_MAGIC	0x5f616d6974736f4dULL	/* "Mostima_" */
++
++static int do_mstmchk(struct cmd_tbl *cmdtp, int flag, int argc,
++		      char *const argv[])
++{
++	void *buf;
++	u64 magic;
++	u8 next, flags;
++	char val[8];
++
++	if (argc != 1)
++		return CMD_RET_USAGE;
++
++	env_set("mstm_ret", "0");
++	env_set("mstm_flags", "0");
++
++	buf = map_sysmem(CONFIG_MSTMCHK_ADDR, 10);
++	if (!buf)
++		return CMD_RET_SUCCESS;
++
++	magic = *(u64 *)buf;
++	if (magic != MSTMCHK_MAGIC) {
++		unmap_sysmem(buf);
++		return CMD_RET_SUCCESS;
++	}
++
++	next = *((u8 *)buf + 8);
++	flags = *((u8 *)buf + 9);
++	unmap_sysmem(buf);
++
++	snprintf(val, sizeof(val), "%u", next);
++	env_set("mstm_ret", val);
++
++	/* setexpr takes its operands as hex, so hand it something unambiguous */
++	snprintf(val, sizeof(val), "0x%x", flags);
++	env_set("mstm_flags", val);
++
++	return CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(
++	mstmchk, 1, 0, do_mstmchk,
++	"read the Mostima flashing mailbox into mstm_ret/mstm_flags",
++	""
++);

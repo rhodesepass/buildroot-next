@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# SD 启动: 部署拔卡守护到 tmpfs 并启动。
+# sdwatch 是静态二进制(watch/杀进程/SD ERROR 显示合一), 平时只轮询
+# 不申请显存; 从 /tmp 运行使代码页落在 tmpfs, 拔卡(rootfs 死)后
+# 不再依赖 SD 上的任何文件
+#
+# 本板只在 UBI 上启动, 下面的 cmdline 判断先一步退出; 二进制本身也还没搬
+# (F1C 那份是 board/.../tools/sdwatch.c, 裸 KMS ioctl, 要随 epass-tools 一起
+# 移植并复核 D1 的 plane 布局)。两道判断都放着, 哪一样先到位都不会误跑。
+
+case "$1" in
+    start | restart) ;;
+    stop)
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+grep -q 'root=/dev/mmcblk0p2' /proc/cmdline || exit 0
+[ -x /usr/sbin/sdwatch ] || exit 0
+
+killall sdwatch 2> /dev/null    # restart 防叠一个守护
+cp /usr/sbin/sdwatch /tmp/sdwatch
+chmod +x /tmp/sdwatch
+/tmp/sdwatch < /dev/null > /dev/null 2>&1 &

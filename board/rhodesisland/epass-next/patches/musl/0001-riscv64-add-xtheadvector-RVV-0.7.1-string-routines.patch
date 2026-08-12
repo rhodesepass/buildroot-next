@@ -1,0 +1,320 @@
+From: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+Subject: [PATCH] riscv64: add xtheadvector (RVV 0.7.1) string routines
+
+Hand-written vector string routines for the T-Head C906 using the
+xtheadvector 0.7.1 encodings (th.* mnemonics, enabled per-file with
+.option arch so the baseline -march does not need the extension).
+
+memcpy/memset/memmove move 128 bytes per iteration at VLEN=128 with
+LMUL=8, vsetvli clamps the tail.  The searching routines (strlen,
+memchr, strchrnul, strcmp, stpcpy) use fault-only-first loads, so
+running into an unmapped page trims vl instead of trapping; memcmp has
+both lengths guaranteed and uses plain loads.  Covering __strchrnul,
+__stpcpy and memchr also vectorizes musl's C strchr, strcpy and strnlen
+wrappers for free.
+
+Validated by translating the same instruction sequences to RVV 1.0
+mnemonics (the semantics of every instruction used are identical, only
+encodings differ) and running a full test matrix -- sizes 0..4000,
+overlap distances, planted differences at head/middle/tail, unsigned
+compare semantics, needle truncation, and every routine flush against a
+PROT_NONE guard page -- under qemu-riscv64 at VLEN 128/256/1024.
+
+Signed-off-by: Shirogane Tsumugi <artoriapendragon123@gmail.com>
+
+---
+diff -urN a/src/string/riscv64/memchr.S b/src/string/riscv64/memchr.S
+--- a/src/string/riscv64/memchr.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/memchr.S	2026-08-12 19:57:47.390077915 +0800
+@@ -0,0 +1,27 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) memchr.
++ * Fault-only-first loads so the search never reads past a match into an
++ * unmapped page (musl's strnlen calls memchr with the caller's raw n,
++ * which may extend far beyond the actual string).  vmseq.vx truncates
++ * the needle to SEW=8 bits, which is exactly the (unsigned char)c the C
++ * standard asks for.
++ */
++	.option arch, +xtheadvector
++
++	.global memchr
++	.type memchr, @function
++memchr:
++	beqz	a2, 2f
++1:	th.vsetvli	t0, a2, e8, m8
++	th.vleff.v	v8, 0(a0)
++	csrr	t0, vl
++	th.vmseq.vx	v0, v8, a1
++	th.vmfirst.m	t1, v0
++	bgez	t1, 3f
++	add	a0, a0, t0
++	sub	a2, a2, t0
++	bnez	a2, 1b
++2:	li	a0, 0
++	ret
++3:	add	a0, a0, t1
++	ret
++	.size memchr, . - memchr
+diff -urN a/src/string/riscv64/memcmp.S b/src/string/riscv64/memcmp.S
+--- a/src/string/riscv64/memcmp.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/memcmp.S	2026-08-12 19:57:47.390142137 +0800
+@@ -0,0 +1,31 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) memcmp.
++ * Both buffers are guaranteed n valid bytes, so plain (non-ff) loads
++ * clamped by vsetvli are fine.  The first differing index inside a chunk
++ * comes from vmsne+vmfirst; the byte compare for the return value is
++ * scalar.
++ */
++	.option arch, +xtheadvector
++
++	.global memcmp
++	.type memcmp, @function
++memcmp:
++	beqz	a2, 2f
++1:	th.vsetvli	t0, a2, e8, m8
++	th.vle.v	v8, 0(a0)
++	th.vle.v	v16, 0(a1)
++	th.vmsne.vv	v0, v8, v16
++	th.vmfirst.m	t1, v0
++	bgez	t1, 3f
++	add	a0, a0, t0
++	add	a1, a1, t0
++	sub	a2, a2, t0
++	bnez	a2, 1b
++2:	li	a0, 0
++	ret
++3:	add	a0, a0, t1
++	add	a1, a1, t1
++	lbu	t2, 0(a0)
++	lbu	t3, 0(a1)
++	sub	a0, t2, t3
++	ret
++	.size memcmp, . - memcmp
+diff -urN a/src/string/riscv64/memcpy.S b/src/string/riscv64/memcpy.S
+--- a/src/string/riscv64/memcpy.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/memcpy.S	2026-08-12 19:57:47.390199364 +0800
+@@ -0,0 +1,20 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) memcpy.
++ * Strip-mined e8/m8 copy, 128 bytes per iteration at VLEN=128.
++ * vsetvli clamps vl to the remaining count, so no scalar tail is needed
++ * and n == 0 falls straight through (vl = 0 ops touch no memory).
++ */
++	.option arch, +xtheadvector
++
++	.global memcpy
++	.type memcpy, @function
++memcpy:
++	mv	a3, a0
++1:	th.vsetvli	t0, a2, e8, m8
++	th.vle.v	v8, 0(a1)
++	th.vse.v	v8, 0(a3)
++	add	a1, a1, t0
++	add	a3, a3, t0
++	sub	a2, a2, t0
++	bnez	a2, 1b
++	ret
++	.size memcpy, . - memcpy
+diff -urN a/src/string/riscv64/memmove.S b/src/string/riscv64/memmove.S
+--- a/src/string/riscv64/memmove.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/memmove.S	2026-08-12 19:57:47.390252735 +0800
+@@ -0,0 +1,37 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) memmove.
++ * Forward copy unless the destination starts inside the source; then copy
++ * chunks back to front.  Within one chunk the whole load completes before
++ * the store, so any overlap inside a chunk is safe in either direction.
++ */
++	.option arch, +xtheadvector
++
++	.global memmove
++	.type memmove, @function
++memmove:
++	beqz	a2, 2f
++	bgeu	a1, a0, 3f		/* src >= dst: forward is safe */
++	add	t1, a1, a2
++	bgeu	a0, t1, 3f		/* disjoint: forward is safe */
++
++	/* dst overlaps the tail of src: copy backwards */
++	add	a3, a0, a2
++	add	a4, a1, a2
++1:	th.vsetvli	t0, a2, e8, m8
++	sub	a4, a4, t0
++	sub	a3, a3, t0
++	th.vle.v	v8, 0(a4)
++	th.vse.v	v8, 0(a3)
++	sub	a2, a2, t0
++	bnez	a2, 1b
++2:	ret
++
++3:	mv	a3, a0
++1:	th.vsetvli	t0, a2, e8, m8
++	th.vle.v	v8, 0(a1)
++	th.vse.v	v8, 0(a3)
++	add	a1, a1, t0
++	add	a3, a3, t0
++	sub	a2, a2, t0
++	bnez	a2, 1b
++	ret
++	.size memmove, . - memmove
+diff -urN a/src/string/riscv64/memset.S b/src/string/riscv64/memset.S
+--- a/src/string/riscv64/memset.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/memset.S	2026-08-12 19:57:47.390309783 +0800
+@@ -0,0 +1,19 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) memset.
++ * The fill value is splatted once with vl = min(n, VLMAX); later iterations
++ * only ever use a smaller vl, so the splat never needs redoing.
++ */
++	.option arch, +xtheadvector
++
++	.global memset
++	.type memset, @function
++memset:
++	mv	a3, a0
++	th.vsetvli	t0, a2, e8, m8
++	th.vmv.v.x	v8, a1
++1:	th.vse.v	v8, 0(a3)
++	add	a3, a3, t0
++	sub	a2, a2, t0
++	th.vsetvli	t0, a2, e8, m8
++	bnez	a2, 1b
++	ret
++	.size memset, . - memset
+diff -urN a/src/string/riscv64/stpcpy.S b/src/string/riscv64/stpcpy.S
+--- a/src/string/riscv64/stpcpy.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/stpcpy.S	2026-08-12 19:57:47.390362021 +0800
+@@ -0,0 +1,32 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) stpcpy.
++ * Load a chunk fault-only-first, look for the NUL; full chunks are
++ * stored as-is, the final chunk is stored with vl re-clamped to include
++ * the NUL.  musl's strcpy is a C wrapper around __stpcpy, so it gets
++ * vectorized for free.
++ */
++	.option arch, +xtheadvector
++
++	.global __stpcpy
++	.hidden __stpcpy
++	.type __stpcpy, @function
++__stpcpy:
++1:	th.vsetvli	t0, x0, e8, m8
++	th.vleff.v	v8, 0(a1)
++	csrr	t0, vl
++	th.vmseq.vi	v0, v8, 0
++	th.vmfirst.m	t1, v0
++	bgez	t1, 2f
++	th.vse.v	v8, 0(a0)
++	add	a0, a0, t0
++	add	a1, a1, t0
++	j	1b
++2:	addi	t1, t1, 1		/* include the NUL */
++	th.vsetvli	x0, t1, e8, m8
++	th.vse.v	v8, 0(a0)
++	add	a0, a0, t1
++	addi	a0, a0, -1		/* return points at the NUL */
++	ret
++	.size __stpcpy, . - __stpcpy
++
++	.weak stpcpy
++	stpcpy = __stpcpy
+diff -urN a/src/string/riscv64/strchrnul.S b/src/string/riscv64/strchrnul.S
+--- a/src/string/riscv64/strchrnul.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/strchrnul.S	2026-08-12 19:57:47.390413869 +0800
+@@ -0,0 +1,33 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) strchrnul.
++ * One pass, two masks per chunk: first match of c and first NUL; the
++ * smaller index wins.  strchr is a C wrapper around this in musl, so it
++ * gets vectorized for free.  strchrnul(s, 0) degenerates to both masks
++ * being equal and correctly returns the NUL.
++ */
++	.option arch, +xtheadvector
++
++	.global __strchrnul
++	.hidden __strchrnul
++	.type __strchrnul, @function
++__strchrnul:
++1:	th.vsetvli	t0, x0, e8, m8
++	th.vleff.v	v8, 0(a0)
++	csrr	t0, vl
++	th.vmseq.vx	v0, v8, a1
++	th.vmfirst.m	t1, v0
++	th.vmseq.vi	v0, v8, 0
++	th.vmfirst.m	t2, v0
++	bgez	t1, 2f
++	bgez	t2, 3f
++	add	a0, a0, t0
++	j	1b
++2:	bltz	t2, 4f
++	blt	t2, t1, 3f
++4:	add	a0, a0, t1
++	ret
++3:	add	a0, a0, t2
++	ret
++	.size __strchrnul, . - __strchrnul
++
++	.weak strchrnul
++	strchrnul = __strchrnul
+diff -urN a/src/string/riscv64/strcmp.S b/src/string/riscv64/strcmp.S
+--- a/src/string/riscv64/strcmp.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/strcmp.S	2026-08-12 19:57:47.390465186 +0800
+@@ -0,0 +1,35 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) strcmp.
++ * Two fault-only-first loads per chunk; the second executes under the vl
++ * already trimmed by the first, and may trim it further, so the chunk
++ * advance always reads the final vl.  A NUL that precedes the first
++ * difference means both strings ended equal.
++ */
++	.option arch, +xtheadvector
++
++	.global strcmp
++	.type strcmp, @function
++strcmp:
++1:	th.vsetvli	t0, x0, e8, m8
++	th.vleff.v	v8, 0(a0)
++	th.vleff.v	v16, 0(a1)
++	csrr	t0, vl
++	th.vmsne.vv	v0, v8, v16
++	th.vmfirst.m	t1, v0
++	th.vmseq.vi	v0, v8, 0
++	th.vmfirst.m	t2, v0
++	bgez	t1, 3f
++	bgez	t2, 2f
++	add	a0, a0, t0
++	add	a1, a1, t0
++	j	1b
++2:	li	a0, 0
++	ret
++3:	bltz	t2, 4f
++	blt	t2, t1, 2b		/* NUL before the difference: equal */
++4:	add	a0, a0, t1
++	add	a1, a1, t1
++	lbu	t2, 0(a0)
++	lbu	t3, 0(a1)
++	sub	a0, t2, t3
++	ret
++	.size strcmp, . - strcmp
+diff -urN a/src/string/riscv64/strlen.S b/src/string/riscv64/strlen.S
+--- a/src/string/riscv64/strlen.S	1970-01-01 08:00:00.000000000 +0800
++++ b/src/string/riscv64/strlen.S	2026-08-12 19:57:47.390517575 +0800
+@@ -0,0 +1,25 @@
++/* T-Head C906: RVV 0.7.1 (xtheadvector) strlen.
++ * Fault-only-first loads make crossing into an unmapped page safe: the
++ * load is trimmed at the fault instead of taking it, vl reports how many
++ * bytes really arrived, and the terminator search only covers those.
++ * A fault on the very first byte still traps, which is what a string
++ * pointer into unmapped memory deserves.
++ */
++	.option arch, +xtheadvector
++
++	.global strlen
++	.type strlen, @function
++strlen:
++	mv	a3, a0
++1:	th.vsetvli	a1, x0, e8, m8
++	th.vleff.v	v8, 0(a3)
++	csrr	a1, vl
++	th.vmseq.vi	v0, v8, 0
++	th.vmfirst.m	a2, v0
++	add	a3, a3, a1
++	bltz	a2, 1b
++	sub	a3, a3, a1		/* back to the chunk base */
++	add	a3, a3, a2		/* + index of the NUL   */
++	sub	a0, a3, a0
++	ret
++	.size strlen, . - strlen

@@ -1,0 +1,3140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shirogane Tsumugi <inapp@iccmc.cc>
+Date: Wed, 5 Aug 2026 03:59:36 +0800
+Subject: [PATCH 1/13] iommu: sunxi: add IOMMU driver for Allwinner D1/T113
+
+Ported from the linux-next work by TaterLi/Wenting. Adapted to the 7.x
+iommu_domain_ops: attach_dev() now receives the domain being replaced.
+
+The D1's DE and VE reach memory through this IOMMU, which lets them use
+non-contiguous buffers instead of pressuring CMA -- important on a board
+with only 64MB of DRAM.
+---
+ drivers/iommu/Kconfig             |   16 +
+ drivers/iommu/Makefile            |    2 +
+ drivers/iommu/sunxi-iommu-debug.c |  952 +++++++++++++++
+ drivers/iommu/sunxi-iommu.c       | 1817 +++++++++++++++++++++++++++++
+ drivers/iommu/sunxi-iommu.h       |  291 +++++
+ 5 files changed, 3078 insertions(+)
+ create mode 100644 drivers/iommu/sunxi-iommu-debug.c
+ create mode 100644 drivers/iommu/sunxi-iommu.c
+ create mode 100644 drivers/iommu/sunxi-iommu.h
+
+diff --git a/drivers/iommu/Kconfig b/drivers/iommu/Kconfig
+index f86262b11..540ce9ff1 100644
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -246,6 +246,22 @@ config SUN50I_IOMMU
+ 	help
+ 	  Support for the IOMMU introduced in the Allwinner H6 SoCs.
+ 
++config SUNXI_IOMMU
++	bool "Allwinner Sunxi IOMMU Support"
++	depends on ARCH_SUNXI || COMPILE_TEST
++	select IOMMU_API
++	select IOMMU_DMA
++	help
++	  Support for the Allwinner IOMMU used by T113/D1 class SoCs.
++	  This enables hardware multimedia accelerators (DE, VE) to access
++	  memory through a shared IOMMU.
++
++config SUNXI_IOMMU_DEBUG
++	bool "Sunxi IOMMU Profiling and Debugging"
++	depends on SUNXI_IOMMU && DEBUG_FS
++	help
++	  Enable extra debugging and profiling knobs for the Sunxi IOMMU.
++
+ config TEGRA_IOMMU_SMMU
+ 	bool "NVIDIA Tegra SMMU Support"
+ 	depends on ARCH_TEGRA || COMPILE_TEST
+diff --git a/drivers/iommu/Makefile b/drivers/iommu/Makefile
+index 0275821f4..63bc1f2e4 100644
+--- a/drivers/iommu/Makefile
++++ b/drivers/iommu/Makefile
+@@ -25,6 +25,8 @@ obj-$(CONFIG_MTK_IOMMU_V1) += mtk_iommu_v1.o
+ obj-$(CONFIG_OMAP_IOMMU) += omap-iommu.o
+ obj-$(CONFIG_OMAP_IOMMU_DEBUG) += omap-iommu-debug.o
+ obj-$(CONFIG_ROCKCHIP_IOMMU) += rockchip-iommu.o
++obj-$(CONFIG_SUNXI_IOMMU) += sunxi-iommu.o
++obj-$(CONFIG_SUNXI_IOMMU_DEBUG) += sunxi-iommu-debug.o
+ obj-$(CONFIG_SUN50I_IOMMU) += sun50i-iommu.o
+ obj-$(CONFIG_TEGRA_IOMMU_SMMU) += tegra-smmu.o
+ obj-$(CONFIG_EXYNOS_IOMMU) += exynos-iommu.o
+diff --git a/drivers/iommu/sunxi-iommu-debug.c b/drivers/iommu/sunxi-iommu-debug.c
+new file mode 100644
+index 000000000..055f2de00
+--- /dev/null
++++ b/drivers/iommu/sunxi-iommu-debug.c
+@@ -0,0 +1,952 @@
++/*
++ * Copyright (c) 2015-2016, The Linux Foundation. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 and
++ * only version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++#include <linux/debugfs.h>
++#include <linux/device.h>
++#include <linux/iommu.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/dma-contiguous.h>
++#include <linux/dma-mapping.h>
++#include <asm/cacheflush.h>
++#include <asm/barrier.h>
++#include "sunxi-iommu.h"
++#include <linux/iommu.h>
++#include <asm/cacheflush.h>
++#include <linux/module.h>
++#include <linux/compiler.h>
++
++
++#ifdef CONFIG_SUNXI_IOMMU_TESTS
++
++#ifdef CONFIG_64BIT
++
++#define kstrtoux kstrtou64
++#define kstrtox_from_user kstrtoll_from_user
++#define kstrtosize_t kstrtoul
++
++#else
++
++#define kstrtoux kstrtou32
++#define kstrtox_from_user kstrtoint_from_user
++#define kstrtosize_t kstrtouint
++
++#endif
++
++#define ION_KERNEL_USER_ERR(str)	pr_err("%s failed!", #str)
++struct ion_facade {
++	struct ion_client *client;
++	struct ion_handle *handle;
++	dma_addr_t dma_address;
++	void *virtual_address;
++	size_t address_length;
++	struct sg_table *sg_table;
++};
++
++static struct dentry *iommu_debugfs_top;
++
++static LIST_HEAD(iommu_debug_devices);
++static struct dentry *debugfs_tests_dir;
++
++struct iommu_debug_device {
++	struct device *dev;
++	struct iommu_domain *domain;
++	u64 iova;
++	u64 phys;
++	size_t len;
++	struct list_head list;
++};
++
++static const char * const _size_to_string(unsigned long size)
++{
++	switch (size) {
++	case SZ_4K:
++		return "4K";
++	case SZ_8K:
++		return "8K";
++	case SZ_16K:
++		return "16K";
++	case SZ_64K:
++		return "64K";
++	case SZ_2M:
++		return "2M";
++	case SZ_1M:
++		return "1M";
++	case SZ_1M * 4:
++		return "4M";
++	case SZ_1M * 8:
++		return "8M";
++	case SZ_1M * 16:
++		return "16M";
++	case SZ_1M * 32:
++		return "32M";
++	}
++	return "unknown size, please add to _size_to_string";
++}
++
++static int iommu_debug_profiling_fast_dma_api_show(struct seq_file *s,
++						 void *ignored)
++{
++	int i, experiment;
++	struct iommu_debug_device *ddev = s->private;
++	struct device *dev = ddev->dev;
++	u64 map_elapsed_ns[10], unmap_elapsed_ns[10];
++	dma_addr_t dma_addr;
++	void *virt;
++	const char * const extra_labels[] = {
++		"not coherent",
++		"coherent",
++	};
++	unsigned long extra_attrs[] = {
++		0,
++		DMA_ATTR_SKIP_CPU_SYNC,
++	};
++
++	virt = kmalloc(1518, GFP_KERNEL);
++	if (!virt)
++		goto out;
++
++	for (experiment = 0; experiment < 2; ++experiment) {
++		size_t map_avg = 0, unmap_avg = 0;
++
++		for (i = 0; i < 10; ++i) {
++			struct timespec tbefore, tafter, diff;
++			u64 ns;
++
++			getnstimeofday(&tbefore);
++			dma_addr = dma_map_single_attrs(
++				dev, virt, SZ_4K, DMA_TO_DEVICE,
++				extra_attrs[experiment]);
++			getnstimeofday(&tafter);
++			diff.tv_sec = tafter.tv_sec - tbefore.tv_sec;
++			diff.tv_nsec = tafter.tv_nsec - tbefore.tv_nsec;
++			ns = timespec_to_ns(&diff);
++			if (dma_mapping_error(dev, dma_addr)) {
++				seq_puts(s, "dma_map_single failed\n");
++				goto out_disable_config_clocks;
++			}
++			map_elapsed_ns[i] = ns;
++			getnstimeofday(&tbefore);
++			dma_unmap_single_attrs(
++				dev, dma_addr, SZ_4K, DMA_TO_DEVICE,
++				extra_attrs[experiment]);
++			getnstimeofday(&tafter);
++			diff.tv_sec = tafter.tv_sec - tbefore.tv_sec;
++			diff.tv_nsec = tafter.tv_nsec - tbefore.tv_nsec;
++			ns = timespec_to_ns(&diff);
++			unmap_elapsed_ns[i] = ns;
++		}
++		seq_printf(s, "%13s %24s (ns): [", extra_labels[experiment],
++			   "dma_map_single_attrs");
++		for (i = 0; i < 10; ++i) {
++			map_avg += map_elapsed_ns[i];
++			seq_printf(s, "%5llu%s", map_elapsed_ns[i],
++				   i < 9 ? ", " : "");
++		}
++		map_avg /= 10;
++		seq_printf(s, "] (avg: %zu)\n", map_avg);
++
++		seq_printf(s, "%13s %24s (ns): [", extra_labels[experiment],
++			   "dma_unmap_single_attrs");
++		for (i = 0; i < 10; ++i) {
++			unmap_avg += unmap_elapsed_ns[i];
++			seq_printf(s, "%5llu%s", unmap_elapsed_ns[i],
++				   i < 9 ? ", " : "");
++		}
++		unmap_avg /= 10;
++		seq_printf(s, "] (avg: %zu)\n", unmap_avg);
++	}
++
++out_disable_config_clocks:
++	kfree(virt);
++out:
++	return 0;
++}
++
++static int iommu_debug_profiling_fast_dma_api_open(struct inode *inode,
++						 struct file *file)
++{
++	return single_open(file, iommu_debug_profiling_fast_dma_api_show,
++			   inode->i_private);
++}
++
++static const struct file_operations iommu_debug_profiling_fast_dma_api_fops = {
++	.open	 = iommu_debug_profiling_fast_dma_api_open,
++	.read	 = seq_read,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++
++
++/* Creates a fresh fast mapping and applies @fn to it */
++static int __apply_to_new_mapping(struct seq_file *s,
++				    int (*fn)(struct device *dev,
++					      struct seq_file *s,
++					      struct iommu_domain *domain,
++					      void *priv),
++				    void *priv)
++{
++	struct iommu_debug_device *ddev = s->private;
++	struct device *dev = ddev->dev;
++	int ret = -EINVAL;
++
++	ret = fn(dev, s, global_iommu_domain, priv);
++	return ret;
++}
++
++#if 0
++static int __tlb_stress_sweep(struct device *dev, struct seq_file *s)
++{
++	int i, ret = 0;
++	unsigned long iova;
++	const unsigned long max = SZ_1G * 4UL;
++	void *virt;
++	phys_addr_t phys;
++	dma_addr_t dma_addr;
++
++	/*
++	 * we'll be doing 4K and 8K mappings.  Need to own an entire 8K
++	 * chunk that we can work with.
++	 */
++	virt = (void *)__get_free_pages(GFP_KERNEL, get_order(SZ_8K));
++	phys = virt_to_phys(virt);
++
++	/* fill the whole 4GB space */
++	for (iova = 0, i = 0; iova < max; iova += SZ_8K, ++i) {
++		dma_addr = dma_map_single(dev, virt, SZ_8K, DMA_TO_DEVICE);
++		if (dma_addr == 0) {
++			dev_err(dev, "Failed map on iter %d\n", i);
++			ret = -EINVAL;
++			goto out;
++		}
++	}
++
++	/*
++	 * free up 4K at the very beginning, then leave one 4K mapping,
++	 * then free up 8K.  This will result in the next 8K map to skip
++	 * over the 4K hole and take the 8K one.
++	 */
++	dma_unmap_single(dev, 0, SZ_4K, DMA_TO_DEVICE);
++	dma_unmap_single(dev, SZ_8K, SZ_4K, DMA_TO_DEVICE);
++	dma_unmap_single(dev, SZ_8K + SZ_4K, SZ_4K, DMA_TO_DEVICE);
++
++	/* remap 8K */
++	dma_addr = dma_map_single(dev, virt, SZ_8K, DMA_TO_DEVICE);
++
++	/*
++	 * now remap 4K.  We should get the first 4K chunk that was skipped
++	 * over during the previous 8K map.  If we missed a TLB invalidate
++	 * at that point this should explode.
++	 */
++	dma_addr = dma_map_single(dev, virt, SZ_4K, DMA_TO_DEVICE);
++
++
++	/* we're all full again. unmap everything. */
++	for (dma_addr = 0; dma_addr < max; dma_addr += SZ_8K)
++		dma_unmap_single(dev, dma_addr, SZ_8K, DMA_TO_DEVICE);
++
++out:
++	free_pages((unsigned long)virt, get_order(SZ_8K));
++	return ret;
++}
++#else
++static int __tlb_stress_sweep(struct device *dev, struct seq_file *s)
++{
++	return 0;
++}
++#endif
++
++struct fib_state {
++	unsigned long cur;
++	unsigned long prev;
++};
++
++static __maybe_unused void fib_init(struct fib_state *f)
++{
++	f->cur = f->prev = 1;
++}
++
++static __maybe_unused unsigned long get_next_fib(struct fib_state *f)
++{
++	int next = f->cur + f->prev;
++
++	f->prev = f->cur;
++	f->cur = next;
++	return next;
++}
++
++/*
++ * Not actually random.  Just testing the fibs (and max - the fibs).
++ */
++#if 0
++static int __rand_va_sweep(struct device *dev, struct seq_file *s,
++			   const size_t size)
++{
++	u64 iova;
++	const unsigned long max = SZ_1G * 4UL;
++	int i, remapped, unmapped, ret = 0;
++	void *virt;
++	dma_addr_t dma_addr, dma_addr2;
++	struct fib_state fib;
++
++	virt = (void *)__get_free_pages(GFP_KERNEL, get_order(size));
++	if (!virt) {
++		if (size > SZ_8K) {
++			dev_err(dev,
++				"Failed to allocate %s of memory, which is a lot. Skipping test for this size\n",
++				_size_to_string(size));
++			return 0;
++		}
++		return -ENOMEM;
++	}
++
++	/* fill the whole 4GB space */
++	for (iova = 0, i = 0; iova < max; iova += size, ++i) {
++		dma_addr = dma_map_single(dev, virt, size, DMA_TO_DEVICE);
++		if (dma_addr == 0) {
++			dev_err(dev, "Failed map on iter %d\n", i);
++			ret = -EINVAL;
++			goto out;
++		}
++	}
++
++	/* now unmap "random" iovas */
++	unmapped = 0;
++	fib_init(&fib);
++	for (iova = get_next_fib(&fib) * size;
++	     iova < max - size;
++	     iova = get_next_fib(&fib) * size) {
++		dma_addr = iova;
++		dma_addr2 = max - size - iova;
++		if (dma_addr == dma_addr2) {
++			WARN(1,
++			"%s test needs update! The random number sequence is folding in on itself and should be changed.\n",
++			__func__);
++			return -EINVAL;
++		}
++		dma_unmap_single(dev, dma_addr, size, DMA_TO_DEVICE);
++		dma_unmap_single(dev, dma_addr2, size, DMA_TO_DEVICE);
++		unmapped += 2;
++	}
++
++	/* and map until everything fills back up */
++	for (remapped = 0;; ++remapped) {
++		dma_addr = dma_map_single(dev, virt, size, DMA_TO_DEVICE);
++		if (dma_addr == 0)
++			break;
++	}
++
++	if (unmapped != remapped) {
++		dev_err(dev,
++			"Unexpected random remap count! Unmapped %d but remapped %d\n",
++			unmapped, remapped);
++		ret = -EINVAL;
++	}
++
++	for (dma_addr = 0; dma_addr < max; dma_addr += size)
++		dma_unmap_single(dev, dma_addr, size, DMA_TO_DEVICE);
++
++out:
++	free_pages((unsigned long)virt, get_order(size));
++	return ret;
++}
++#else
++static int __rand_va_sweep(struct device *dev, struct seq_file *s,
++			   const size_t size)
++{
++	return 0;
++}
++#endif
++
++struct dma_addr_list {
++	dma_addr_t addr;
++	void *next;
++};
++
++static int __full_va_sweep(struct device *dev, struct seq_file *s,
++			   const size_t size, struct iommu_domain *domain)
++{
++	unsigned long iova;
++	void *virt;
++	phys_addr_t phys;
++	const unsigned long max = SZ_128M;
++	struct dma_addr_list *phead, *p, *ptmp;
++
++	phead = kmalloc(sizeof(struct dma_addr_list), GFP_KERNEL);
++	memset(phead, 0, sizeof(struct dma_addr_list));
++	virt = (void *)__get_free_pages(GFP_KERNEL, get_order(size));
++	if (!virt) {
++		if (size > SZ_8K) {
++			dev_err(dev,
++				"Failed to allocate %s of memory, which is a lot. Skipping test for this size\n",
++				_size_to_string(size));
++			return 0;
++		}
++		return -ENOMEM;
++	}
++	phys = virt_to_phys(virt);
++
++	for (p = phead, iova = 0; iova < max; iova += size, p = p->next) {
++		p->addr = dma_map_single(dev, virt, size, DMA_TO_DEVICE);
++		p->next = kmalloc(sizeof(struct dma_addr_list), GFP_KERNEL);
++		memset(p->next, 0, sizeof(struct dma_addr_list));
++		if (p->addr == 0 || p->addr == DMA_MAPPING_ERROR) {
++			dev_err(dev, "Failed to map dma, out of iova space\n");
++			return -ENOMEM;
++		}
++	}
++
++	for (p = phead; p->addr != 0;) {
++		dma_unmap_single(dev, p->addr, size, DMA_TO_DEVICE);
++		ptmp = p;
++		p = p->next;
++		kfree(ptmp);
++	}
++	kfree(p);
++	free_pages((unsigned long)virt, get_order(size));
++	return 0;
++}
++
++#define ds_printf(d, s, fmt, ...) ({				\
++			dev_err(d, fmt, ##__VA_ARGS__);		\
++			seq_printf(s, fmt, ##__VA_ARGS__);	\
++		})
++
++static int __functional_dma_api_va_test(struct device *dev, struct seq_file *s,
++				     struct iommu_domain *domain, void *priv)
++{
++	int i, j;
++	int ret = 0;
++	size_t *sz, *sizes = priv;
++
++	for (j = 0; j < 1; ++j) {
++		for (sz = sizes; *sz; ++sz) {
++			for (i = 0; i < 2; ++i) {
++				ds_printf(dev, s, "Full VA sweep @%s %d",
++					       _size_to_string(*sz), i);
++				if (__full_va_sweep(dev, s, *sz, domain)) {
++					ds_printf(dev, s, "  -> FAILED\n");
++					ret = -EINVAL;
++					goto out;
++				} else
++					ds_printf(dev, s, "  -> SUCCEEDED\n");
++			}
++		}
++	}
++
++	ds_printf(dev, s, "bonus map:");
++	if (__full_va_sweep(dev, s, SZ_4K, domain)) {
++		ds_printf(dev, s, "  -> FAILED\n");
++		ret = -EINVAL;
++		goto out;
++	} else
++		ds_printf(dev, s, "  -> SUCCEEDED\n");
++
++	for (sz = sizes; *sz; ++sz) {
++		for (i = 0; i < 2; ++i) {
++			ds_printf(dev, s, "Rand VA sweep @%s %d",
++				   _size_to_string(*sz), i);
++			if (__rand_va_sweep(dev, s, *sz)) {
++				ds_printf(dev, s, "  -> FAILED\n");
++				ret = -EINVAL;
++				goto out;
++			} else
++				ds_printf(dev, s, "  -> SUCCEEDED\n");
++		}
++	}
++
++	ds_printf(dev, s, "TLB stress sweep");
++	if (__tlb_stress_sweep(dev, s)) {
++		ds_printf(dev, s, "  -> FAILED\n");
++		ret = -EINVAL;
++		goto out;
++	} else
++		ds_printf(dev, s, "  -> SUCCEEDED\n");
++
++	ds_printf(dev, s, "second bonus map:");
++	if (__full_va_sweep(dev, s, SZ_4K, domain)) {
++		ds_printf(dev, s, "  -> FAILED\n");
++		ret = -EINVAL;
++		goto out;
++	} else
++		ds_printf(dev, s, "  -> SUCCEEDED\n");
++out:
++	return ret;
++}
++
++/*iova alloc strategy stress test*/
++static int iommu_iova_alloc_strategy_stress_show(struct seq_file *s,
++						    void *ignored)
++{
++	size_t sizes[] = {SZ_4K, SZ_8K, SZ_16K, SZ_64K, 0};
++	int ret = 0;
++
++	ret = __apply_to_new_mapping(s, __functional_dma_api_va_test, sizes);
++	return ret;
++}
++
++static int iommu_iova_alloc_strategy_stress_open(struct inode *inode,
++						    struct file *file)
++{
++	return single_open(file, iommu_iova_alloc_strategy_stress_show,
++			   inode->i_private);
++}
++
++static const struct file_operations iommu_iova_alloc_strategy_stress_fops = {
++	.open	 = iommu_iova_alloc_strategy_stress_open,
++	.read	 = seq_read,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++
++
++static int __functional_dma_api_alloc_test(struct device *dev,
++					   struct seq_file *s,
++					   struct iommu_domain *domain,
++					   void *ignored)
++{
++	size_t size = SZ_1K * 742;
++	int ret = 0;
++	u8 *data;
++	dma_addr_t iova;
++
++	/* Make sure we can allocate and use a buffer */
++	ds_printf(dev, s, "Allocating coherent buffer");
++	data = dma_alloc_coherent(dev, size, &iova, GFP_KERNEL);
++	if (!data) {
++		ds_printf(dev, s, "  -> FAILED\n");
++		ret = -EINVAL;
++	} else {
++		int i;
++
++		ds_printf(dev, s, "  -> SUCCEEDED\n");
++		ds_printf(dev, s, "Using coherent buffer");
++		for (i = 0; i < 742; ++i) {
++			int ind = SZ_1K * i;
++			u8 *p = data + ind;
++			u8 val = i % 255;
++
++			memset(data, 0xa5, size);
++			*p = val;
++			(*p)++;
++			if ((*p) != val + 1) {
++				ds_printf(dev, s,
++					  "  -> FAILED on iter %d since %d != %d\n",
++					  i, *p, val + 1);
++				ret = -EINVAL;
++				break;
++			}
++		}
++		if (!ret)
++			ds_printf(dev, s, "  -> SUCCEEDED\n");
++		dma_free_coherent(dev, size, data, iova);
++	}
++
++	return ret;
++}
++
++/*iommu kernel virtual addr read/write*/
++static int iommu_kvirtual_addr_rdwr_show(struct seq_file *s,
++						   void *ignored)
++{
++	struct iommu_debug_device *ddev = s->private;
++	struct device *dev = ddev->dev;
++	int ret = -EINVAL;
++
++	ret = __functional_dma_api_alloc_test(dev, s,
++				global_iommu_domain, NULL);
++	return ret;
++}
++
++static int iommu_kvirtual_addr_rdwr_open(struct inode *inode,
++						   struct file *file)
++{
++	return single_open(file, iommu_kvirtual_addr_rdwr_show,
++			   inode->i_private);
++}
++
++static const struct file_operations iommu_kvirtul_addr_rdwr_fops = {
++	.open	 = iommu_kvirtual_addr_rdwr_open,
++	.read	 = seq_read,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++
++static int __functional_dma_api_ion_test(struct device *dev,
++					   struct seq_file *s,
++					   struct iommu_domain *domain,
++					   void *ignored)
++{
++	return 0;
++}
++
++/*iommu ion interface test*/
++static int iommu_ion_interface_test_show(struct seq_file *s,
++						   void *ignored)
++{
++	struct iommu_debug_device *ddev = s->private;
++	struct device *dev = ddev->dev;
++	int ret = -EINVAL;
++
++	ret = __functional_dma_api_ion_test(dev, s,
++				global_iommu_domain, NULL);
++	return ret;
++}
++
++static int iommu_ion_interface_test_open(struct inode *inode,
++						   struct file *file)
++{
++	return single_open(file, iommu_ion_interface_test_show,
++			   inode->i_private);
++}
++
++static const struct file_operations iommu_ion_interface_test_fops = {
++	.open	 = iommu_ion_interface_test_open,
++	.read	 = seq_read,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++
++static int __functional_dma_api_iova_test(struct device *dev,
++					   struct seq_file *s,
++					   struct iommu_domain *domain,
++					   void *ignored)
++{
++	size_t size = SZ_4K * 1024;
++	int ret = 0;
++	u32 *data;
++	dma_addr_t iova;
++
++	sunxi_set_debug_mode();
++
++	/* Make sure we can allocate and use a buffer */
++	ds_printf(dev, s, "Allocating coherent iova buffer");
++	data = dma_alloc_coherent(dev, size, &iova, GFP_KERNEL);
++	if (!data) {
++		ds_printf(dev, s, "  -> FAILED\n");
++		ret = -EINVAL;
++	} else {
++		int i;
++
++		ds_printf(dev, s, "  -> SUCCEEDED\n");
++		ds_printf(dev, s, "Using coherent buffer");
++		for (i = 0; i < 1024; ++i) {
++			int ind = (SZ_4K * i) / sizeof(u32);
++			u32 *p = data + ind;
++			u32 *p1 = (u32 *)iova + ind;
++			u32 read_data;
++
++			memset(data, 0xa5, size);
++			*p = 0x5a5a5a5a;
++			/**
++			 * make sure that *p is written before
++			 * the write operation of the debug mode of iommu
++			 */
++			wmb();
++			sunxi_iova_test_write((dma_addr_t)p1, 0xdead);
++			/**
++			 * do the write operation of debug mode of iommu
++			 * in order
++			 */
++			rmb();
++			if ((*p) != 0xdead) {
++				ds_printf(dev, s,
++				 "-> FAILED on iova0 iter %x  %x\n", i, *p);
++				ret = -EINVAL;
++				goto out;
++			}
++
++			*p = 0xffffaaaa;
++			/**
++			 * make sure that *p is written before
++			 * the read operation of the debug mode of iommu
++			 */
++			wmb();
++			read_data = sunxi_iova_test_read((dma_addr_t)p1);
++			if (read_data != 0xffffaaaa) {
++				ds_printf(dev, s,
++					"-> FAILED on iova1 iter %x  %x\n",
++					i, read_data);
++				ret = -EINVAL;
++				goto out;
++			}
++
++		}
++		if (!ret)
++			ds_printf(dev, s, "  -> SUCCEEDED\n");
++	}
++out:
++	dma_free_coherent(dev, size, data, iova);
++	sunxi_set_prefetch_mode();
++	return ret;
++}
++
++/*iommu test use debug interface*/
++static int iommu_vir_devio_addr_rdwr_show(struct seq_file *s,
++						    void *ignored)
++{
++	int ret = 0;
++
++	ret = __apply_to_new_mapping(s, __functional_dma_api_iova_test, NULL);
++	if (ret) {
++		pr_err("the first iova test failed\n");
++		return ret;
++	}
++	ret = 0;
++	ret = __apply_to_new_mapping(s, __functional_dma_api_iova_test, NULL);
++	if (ret) {
++		pr_err("the second iova test failed\n");
++		return ret;
++	}
++	ret = 0;
++	ret = __apply_to_new_mapping(s, __functional_dma_api_iova_test, NULL);
++	if (ret) {
++		pr_err("the third iova test failed\n");
++		return ret;
++	}
++	return 0;
++}
++
++static int iommu_vir_devio_addr_rdwr_open(struct inode *inode,
++						    struct file *file)
++{
++	return single_open(file, iommu_vir_devio_addr_rdwr_show,
++			   inode->i_private);
++}
++
++static const struct file_operations iommu_vir_devio_addr_rdwr_fops = {
++	.open	 = iommu_vir_devio_addr_rdwr_open,
++	.read	 = seq_read,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++
++
++static int __functional_dma_api_basic_test(struct device *dev,
++					   struct seq_file *s,
++					   struct iommu_domain *domain,
++					   void *ignored)
++{
++	size_t size = 1518;
++	int i, j, ret = 0;
++	u8 *data;
++	dma_addr_t iova;
++	phys_addr_t pa, pa2;
++
++	ds_printf(dev, s, "Basic DMA API test");
++	/* Make sure we can allocate and use a buffer */
++	for (i = 0; i < 1000; ++i) {
++		data = kmalloc(size, GFP_KERNEL);
++		if (!data) {
++			ds_printf(dev, s, "  -> FAILED\n");
++			ret = -EINVAL;
++			goto out;
++		}
++		memset(data, 0xa5, size);
++		iova = dma_map_single(dev, data, size, DMA_TO_DEVICE);
++		pa = iommu_iova_to_phys(domain, iova);
++		pa2 = virt_to_phys(data);
++		if (pa != pa2) {
++			dev_err(dev,
++				"iova_to_phys doesn't match virt_to_phys: %pa != %pa\n",
++				&pa, &pa2);
++			ret = -EINVAL;
++			kfree(data);
++			goto out;
++		}
++		dma_unmap_single(dev, iova, size, DMA_TO_DEVICE);
++		for (j = 0; j < size; ++j) {
++			if (data[j] != 0xa5) {
++				dev_err(dev, "data[%d] != 0xa5\n", data[j]);
++				ret = -EINVAL;
++				kfree(data);
++				goto out;
++			}
++		}
++		kfree(data);
++	}
++
++out:
++	if (ret)
++		ds_printf(dev, s, "  -> FAILED\n");
++	else
++		ds_printf(dev, s, "  -> SUCCEEDED\n");
++
++	return ret;
++}
++
++/*iommu basic test*/
++static int iommu_debug_basic_test_show(struct seq_file *s,
++						   void *ignored)
++{
++	struct iommu_debug_device *ddev = s->private;
++	struct device *dev = ddev->dev;
++	int ret = -EINVAL;
++
++	ret = __functional_dma_api_basic_test(dev, s,
++				global_iommu_domain, NULL);
++	return ret;
++}
++
++static int iommu_debug_basic_test_open(struct inode *inode,
++						   struct file *file)
++{
++	return single_open(file, iommu_debug_basic_test_show,
++			   inode->i_private);
++}
++
++static const struct file_operations iommu_debug_basic_test_fops = {
++	.open	 = iommu_debug_basic_test_open,
++	.read	 = seq_read,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++
++
++/*
++ * The following will only work for drivers that implement the generic
++ * device tree bindings described in
++ * Documentation/devicetree/bindings/iommu/iommu.txt
++ */
++static int snarf_iommu_devices(struct device *dev, const char *name)
++{
++	struct iommu_debug_device *ddev;
++	struct dentry *dir;
++
++	if (IS_ERR_OR_NULL(dev))
++		return -EINVAL;
++
++	ddev = kzalloc(sizeof(*ddev), GFP_KERNEL);
++	if (!ddev)
++		return -ENODEV;
++	ddev->dev = dev;
++	ddev->domain = global_iommu_domain;
++	dir = debugfs_create_dir(name, debugfs_tests_dir);
++	if (!dir) {
++		pr_err("Couldn't create iommu/devices/%s debugfs dir\n",
++		       name);
++		goto err;
++	}
++
++	if (!debugfs_create_file("profiling_fast_dma_api", 0400, dir, ddev,
++				 &iommu_debug_profiling_fast_dma_api_fops)) {
++		pr_err("Couldn't create iommu/devices/%s/profiling_fast_dma_api debugfs file\n",
++		       name);
++		goto err_rmdir;
++	}
++
++	if (!debugfs_create_file("iommu_basic_test", 0400, dir, ddev,
++				 &iommu_debug_basic_test_fops)) {
++		pr_err("Couldn't create iommu/devices/%s/iommu_basic_test debugfs file\n",
++		       name);
++		goto err_rmdir;
++	}
++
++	if (!debugfs_create_file("ion_interface_test", 0400, dir, ddev,
++				 &iommu_ion_interface_test_fops)) {
++		pr_err("Couldn't create iommu/devices/%s/ion_interface_test debugfs file\n",
++		       name);
++		goto err_rmdir;
++	}
++
++	if (!debugfs_create_file("iova_alloc_strategy_stress_test",
++		0200, dir, ddev,
++		&iommu_iova_alloc_strategy_stress_fops)) {
++		pr_err("Couldn't create iommu/devices/%s/iova_alloc_strategy_stress_test debugfs file\n",
++		       name);
++		goto err_rmdir;
++	}
++
++	if (!debugfs_create_file("kvirtual_addr_rdwr_test", 0200, dir, ddev,
++				 &iommu_kvirtul_addr_rdwr_fops)) {
++		pr_err("Couldn't create iommu/devices/%s/kvirtual_addr_rdwr_test debugfs file\n",
++		       name);
++		goto err_rmdir;
++	}
++
++	if (!debugfs_create_file("vir_devio_addr_rdwr_test", 0200, dir, ddev,
++				 &iommu_vir_devio_addr_rdwr_fops)) {
++		pr_err("Couldn't create iommu/devices/%s/vir_devio_addr_rdwr_test debugfs file\n",
++		       name);
++		goto err_rmdir;
++	}
++
++	list_add(&ddev->list, &iommu_debug_devices);
++	return 0;
++
++err_rmdir:
++	debugfs_remove_recursive(dir);
++err:
++	kfree(ddev);
++	return 0;
++}
++
++static int pass_iommu_devices(struct device *dev, void *ignored)
++{
++	if (!of_find_property(dev->of_node, "iommus", NULL))
++		return 0;
++
++	return snarf_iommu_devices(dev, dev_name(dev));
++}
++
++static int iommu_debug_populate_devices(void)
++{
++	return bus_for_each_dev(&platform_bus_type, NULL, NULL,
++			pass_iommu_devices);
++}
++
++static int iommu_debug_init_tests(void)
++{
++	iommu_debugfs_top = debugfs_create_dir("iommu", NULL);
++	if (!iommu_debugfs_top) {
++		pr_err("Couldn't create iommu debugfs directory\n");
++		return -ENODEV;
++	}
++	debugfs_tests_dir = debugfs_create_dir("tests",
++					       iommu_debugfs_top);
++	if (!debugfs_tests_dir) {
++		pr_err("Couldn't create iommu/tests debugfs directory\n");
++		return -ENODEV;
++	}
++
++	return iommu_debug_populate_devices();
++}
++
++static void iommu_debug_destroy_tests(void)
++{
++	debugfs_remove_recursive(debugfs_tests_dir);
++}
++#else
++static inline int iommu_debug_init_tests(void) { return 0; }
++static inline void iommu_debug_destroy_tests(void) { }
++#endif
++
++static int __init iommu_debug_init(void)
++{
++	if (iommu_debug_init_tests())
++		return -ENODEV;
++
++	return 0;
++}
++
++static void __exit iommu_debug_exit(void)
++{
++	iommu_debug_destroy_tests();
++}
++
++module_init(iommu_debug_init);
++module_exit(iommu_debug_exit);
++
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/iommu/sunxi-iommu.c b/drivers/iommu/sunxi-iommu.c
+new file mode 100644
+index 000000000..dd0da4fad
+--- /dev/null
++++ b/drivers/iommu/sunxi-iommu.c
+@@ -0,0 +1,1817 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Allwinner IOMMU driver (quirks-based, multi-SoC)
++ *
++ * Derived from the Allwinner BSP IOMMU driver.
++ * Original author: zhuxianbin <zhuxianbin@allwinnertech.com>
++ * Copyright (C) 2016-2018, Allwinner Technology CO., LTD.
++ *
++ * Refactored to use per-SoC quirks instead of compile-time #ifdef.
++ */
++
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/interrupt.h>
++#include <linux/of_irq.h>
++#include <linux/of_iommu.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <linux/delay.h>
++#include <linux/iommu.h>
++#include <linux/dma-mapping.h>
++#include <linux/clk.h>
++#include <linux/sizes.h>
++#include <linux/device.h>
++#include <asm/cacheflush.h>
++#include <linux/pm_runtime.h>
++
++#include "sunxi-iommu.h"
++
++/* ================================================================== */
++/* Per-SoC quirks definitions                                          */
++/* ================================================================== */
++
++/*
++ * V1 — 6 micro-TLBs, addr+mask TLB/PTW invalidation.
++ * BSP platforms: sun50iw3 (A63 / H6-class), sun50iw6
++ */
++static const char *const sunxi_masters_v1[] = {
++	"DE", "DI", "VE", "CSI", "G2D", "RESERVED",
++};
++
++static const struct sunxi_iommu_quirks sun50i_a63_iommu_quirks = {
++	.num_micro_tlbs		= 6,
++	.tlb_prefetch_val	= 0x7f,
++	.master_names		= sunxi_masters_v1,
++};
++
++/*
++ * V2 — 7 micro-TLBs, addr+mask TLB/PTW invalidation.
++ * BSP platforms: sun8iw15 (A50 / V831-class)
++ */
++static const char *const sunxi_masters_v2[] = {
++	"DE", "E_EDMA", "E_FE", "VE", "CSI", "G2D", "E_BE",
++};
++
++static const struct sunxi_iommu_quirks sun8i_a50_iommu_quirks = {
++	.num_micro_tlbs		= 7,
++	.tlb_prefetch_val	= 0x5f,
++	.master_names		= sunxi_masters_v2,
++};
++
++/*
++ * V3 — 7 micro-TLBs, range-based TLB invalidation, single-addr PTW.
++ * BSP platforms: sun50iw9 (H616), sun8iw19, sun50iw10
++ *
++ * sun50iw10 has two IC revisions; the newer one has a prefetch-valid
++ * fix that can be indicated via the DT boolean property
++ * "allwinner,sun50iw10-iommu-fixed".  When that property is present
++ * the driver enables the fix and uses prefetch = 0x5f instead of 0x00.
++ */
++static const char *const sunxi_masters_v3[] = {
++	"DE", "DI", "VE_R", "VE", "CSI0", "CSI1", "G2D",
++};
++
++static const struct sunxi_iommu_quirks sun50i_h616_iommu_quirks = {
++	.num_micro_tlbs		= 7,
++	.tlb_ivld_range		= true,
++	.tlb_prefetch_val	= 0x00,
++	.master_names		= sunxi_masters_v3,
++};
++
++/*
++ * V4 — 7 micro-TLBs, range-based TLB + PTW, prefetch-valid fix.
++ * BSP platforms: sun8iw20 (T113), sun20iw1 (D1), sun50iw12, sun55iw3
++ */
++/*
++ * Master order must match the hardware micro-TLB ID assignment (the
++ * second cell of the "iommus" DT property), not an arbitrary list.
++ * For sun8iw20 (T113) / sun20iw1 (D1) the BSP order is:
++ *   0:VE 1:CSI 2:DE 3:G2D 4:DI 5:DEBUG_MODE
++ * Cross-check: t113 DT uses <&iommu 0> for VE and <&iommu 2> for DE.
++ */
++static const char *const sunxi_masters_v4[] = {
++	"VE", "CSI", "DE", "G2D", "DI", "DEBUG_MODE", "RESERVED",
++};
++
++static const struct sunxi_iommu_quirks sun20i_d1_iommu_quirks = {
++	.num_micro_tlbs		= 7,
++	.tlb_ivld_range		= true,
++	.ptw_ivld_range		= true,
++	.has_prefetch_fix	= true,
++	.tlb_prefetch_val	= 0x16,
++	.master_names		= sunxi_masters_v4,
++};
++
++/* ================================================================== */
++/* Static globals (kept for BSP compatibility)                         */
++/* ================================================================== */
++static struct kmem_cache *iopte_cache;
++static struct sunxi_iommu_dev *global_iommu_dev;
++static struct sunxi_iommu_domain *global_sunxi_iommu_domain;
++struct iommu_domain *global_iommu_domain;
++struct sunxi_iommu_owner *global_iommu_owner;
++static bool tlb_init_flag;
++static struct device *dma_dev;
++EXPORT_SYMBOL_GPL(global_iommu_domain);
++
++/* ================================================================== */
++/* Low-level register helpers                                          */
++/* ================================================================== */
++static inline u32 sunxi_iommu_read(struct sunxi_iommu_dev *iommu, u32 offset)
++{
++	return readl(iommu->base + offset);
++}
++
++static inline void sunxi_iommu_write(struct sunxi_iommu_dev *iommu,
++				      u32 offset, u32 value)
++{
++	writel(value, iommu->base + offset);
++}
++
++/* ================================================================== */
++/* Page-table address helpers                                          */
++/* ================================================================== */
++static inline u32 *iopde_offset(u32 *iopd, unsigned int iova)
++{
++	return iopd + IOPDE_INDEX(iova);
++}
++
++static inline u32 *iopte_offset(u32 *ent, unsigned int iova)
++{
++	unsigned long iopte_base = IOPTE_BASE(*ent);
++
++	if (iopte_base < SUNXI_PHYS_OFFSET)
++		iopte_base += SUNXI_4G_PHYS_OFFSET;
++
++	return (u32 *)__va(iopte_base) + IOPTE_INDEX(iova);
++}
++
++static inline u32 *iopte_page(u32 *ent)
++{
++	unsigned long iopte_base = IOPTE_BASE(*ent);
++
++	if (iopte_base < SUNXI_PHYS_OFFSET)
++		iopte_base += SUNXI_4G_PHYS_OFFSET;
++
++	return (u32 *)__va(iopte_base);
++}
++
++static inline dma_addr_t iommu_phy_to_cpu_phy(dma_addr_t iommu_phy)
++{
++	return iommu_phy < SUNXI_PHYS_OFFSET ?
++		iommu_phy + SUNXI_4G_PHYS_OFFSET : iommu_phy;
++}
++
++/* ================================================================== */
++/* TLB flush (full)                                                    */
++/* ================================================================== */
++static int sunxi_tlb_flush(struct sunxi_iommu_dev *iommu)
++{
++	int ret;
++
++	sunxi_iommu_write(iommu, IOMMU_TLB_FLUSH_ENABLE_REG,
++			  MICRO_TLB_FLUSH_MASK(iommu->quirks->num_micro_tlbs) |
++			  PTW_CACHE_FLUSH_BIT |
++			  MACRO_TLB_FLUSH_BIT);
++	ret = sunxi_wait_when(
++		sunxi_iommu_read(iommu, IOMMU_TLB_FLUSH_ENABLE_REG), 2);
++	if (ret)
++		dev_err(iommu->dev, "Enable flush all request timed out\n");
++
++	return ret;
++}
++
++/* ================================================================== */
++/* TLB invalidation primitives                                         */
++/* ================================================================== */
++
++/* Range-based TLB invalidation (V3 / V4) */
++static int sunxi_tlb_invalid_range(struct sunxi_iommu_dev *iommu,
++				   dma_addr_t start, dma_addr_t end)
++{
++	int ret;
++	unsigned long mflag;
++
++	spin_lock_irqsave(&iommu->iommu_lock, mflag);
++	sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_START_ADDR_REG, start);
++	sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_END_ADDR_REG, end);
++	sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ENABLE_REG, 0x1);
++	ret = sunxi_wait_when(
++		sunxi_iommu_read(iommu, IOMMU_TLB_IVLD_ENABLE_REG) & 0x1, 2);
++	if (ret)
++		dev_err(iommu->dev, "TLB range-invalid timed out\n");
++	spin_unlock_irqrestore(&iommu->iommu_lock, mflag);
++
++	return ret;
++}
++
++/* Address + mask TLB invalidation (V1 / V2) */
++static int sunxi_tlb_invalid_addr(struct sunxi_iommu_dev *iommu,
++				  dma_addr_t addr, u32 mask)
++{
++	int ret;
++	unsigned long mflag;
++
++	spin_lock_irqsave(&iommu->iommu_lock, mflag);
++	sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ADDR_REG, addr);
++	sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ADDR_MASK_REG, mask);
++	sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ENABLE_REG, 0x1);
++	ret = sunxi_wait_when(
++		sunxi_iommu_read(iommu, IOMMU_TLB_IVLD_ENABLE_REG) & 0x1, 2);
++	if (ret)
++		dev_err(iommu->dev, "TLB addr-invalid timed out\n");
++	spin_unlock_irqrestore(&iommu->iommu_lock, mflag);
++
++	return ret;
++}
++
++/* ================================================================== */
++/* PTW cache invalidation primitives                                   */
++/* ================================================================== */
++
++/* Range-based PTW cache invalidation (V4) */
++static int sunxi_ptw_cache_invalid_range(struct sunxi_iommu_dev *iommu,
++					 dma_addr_t start, dma_addr_t end)
++{
++	int ret;
++	unsigned long mflag;
++
++	spin_lock_irqsave(&iommu->iommu_lock, mflag);
++	sunxi_iommu_write(iommu, IOMMU_PC_IVLD_START_ADDR_REG, start);
++	sunxi_iommu_write(iommu, IOMMU_PC_IVLD_END_ADDR_REG, end);
++	sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ENABLE_REG, 0x1);
++	ret = sunxi_wait_when(
++		sunxi_iommu_read(iommu, IOMMU_PC_IVLD_ENABLE_REG) & 0x1, 2);
++	if (ret)
++		dev_err(iommu->dev, "PTW range-invalid timed out\n");
++	spin_unlock_irqrestore(&iommu->iommu_lock, mflag);
++
++	return ret;
++}
++
++/* Single-address PTW cache invalidation (V1 / V2 / V3) */
++static int sunxi_ptw_cache_invalid_addr(struct sunxi_iommu_dev *iommu,
++					dma_addr_t addr)
++{
++	int ret;
++	unsigned long mflag;
++
++	spin_lock_irqsave(&iommu->iommu_lock, mflag);
++	sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ADDR_REG, addr);
++	sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ENABLE_REG, 0x1);
++	ret = sunxi_wait_when(
++		sunxi_iommu_read(iommu, IOMMU_PC_IVLD_ENABLE_REG) & 0x1, 2);
++	if (ret)
++		dev_err(iommu->dev, "PTW addr-invalid timed out\n");
++	spin_unlock_irqrestore(&iommu->iommu_lock, mflag);
++
++	return ret;
++}
++
++/* ================================================================== */
++/* Unified zap-TLB (called after map / before unmap completes)         */
++/* ================================================================== */
++static void sunxi_zap_tlb(struct sunxi_iommu_dev *iommu,
++			  unsigned long iova, size_t size)
++{
++	const struct sunxi_iommu_quirks *q = iommu->quirks;
++	bool effective_fix = q->has_prefetch_fix || iommu->prefetch_fixed;
++
++	/* --- TLB invalidation --- */
++	if (q->tlb_ivld_range) {
++		sunxi_tlb_invalid_range(iommu, iova,
++					iova + 2 * SPAGE_SIZE);
++		sunxi_tlb_invalid_range(iommu,
++					iova + size - SPAGE_SIZE,
++					iova + size + 8 * SPAGE_SIZE);
++	} else {
++		sunxi_tlb_invalid_addr(iommu, iova, (u32)IOMMU_PT_MASK);
++		sunxi_tlb_invalid_addr(iommu, iova + SPAGE_SIZE,
++				       (u32)IOMMU_PT_MASK);
++		sunxi_tlb_invalid_addr(iommu, iova + size,
++				       (u32)IOMMU_PT_MASK);
++		sunxi_tlb_invalid_addr(iommu, iova + size + SPAGE_SIZE,
++				       (u32)IOMMU_PT_MASK);
++	}
++
++	/* --- PTW cache invalidation --- */
++	if (q->ptw_ivld_range) {
++		/* V4: range-based PTW */
++		sunxi_ptw_cache_invalid_range(iommu, iova,
++					      iova + SPD_SIZE);
++		sunxi_ptw_cache_invalid_range(iommu,
++					      iova + size - SPD_SIZE,
++					      iova + size);
++	} else if (!q->tlb_ivld_range) {
++		/* V1 / V2: always 4 PTW invalidations */
++		sunxi_ptw_cache_invalid_addr(iommu, iova);
++		sunxi_ptw_cache_invalid_addr(iommu, iova + SPD_SIZE);
++		sunxi_ptw_cache_invalid_addr(iommu, iova + size);
++		sunxi_ptw_cache_invalid_addr(iommu, iova + size + SPD_SIZE);
++	} else {
++		/* V3: 2 basic PTW invalidations + workaround for old HW */
++		sunxi_ptw_cache_invalid_addr(iommu, iova);
++		sunxi_ptw_cache_invalid_addr(iommu, iova + size);
++
++		if (!effective_fix) {
++			sunxi_ptw_cache_invalid_addr(iommu,
++						     iova + SPD_SIZE);
++			sunxi_ptw_cache_invalid_addr(iommu,
++						     iova + size + SPD_SIZE);
++			sunxi_ptw_cache_invalid_addr(iommu,
++						     iova + size + 2 * SPD_SIZE);
++		}
++	}
++}
++
++/* ================================================================== */
++/* TLB init (called on first attach and on resume)                     */
++/* ================================================================== */
++static int sunxi_tlb_init(struct sunxi_iommu_owner *owner,
++			  struct iommu_domain *input_domain)
++{
++	struct sunxi_iommu_dev *iommu = owner->data;
++	const struct sunxi_iommu_quirks *q = iommu->quirks;
++	bool effective_fix = q->has_prefetch_fix || iommu->prefetch_fixed;
++	u32 prefetch_val;
++	int ret = 0;
++	int iommu_enable = 0;
++	phys_addr_t dte_addr;
++	unsigned long mflag;
++	struct sunxi_iommu_domain *sunxi_domain =
++		container_of(input_domain, struct sunxi_iommu_domain, domain);
++
++	/* If DT override is active, use 0x5f instead of the quirk default */
++	prefetch_val = iommu->prefetch_fixed ? 0x5f : q->tlb_prefetch_val;
++
++	spin_lock_irqsave(&iommu->iommu_lock, mflag);
++
++	dte_addr = __pa(sunxi_domain->pgtable);
++	sunxi_iommu_write(iommu, IOMMU_TTB_REG, dte_addr);
++
++	/* TLB prefetch configuration */
++	sunxi_iommu_write(iommu, IOMMU_TLB_PREFETCH_REG, prefetch_val);
++
++	/* Interrupt enable (micro-TLBs 0..5 + L1/L2) */
++	sunxi_iommu_write(iommu, IOMMU_INT_ENABLE_REG, 0x3003f);
++	sunxi_iommu_write(iommu, IOMMU_BYPASS_REG, iommu->bypass);
++
++	/* TLB / PTW invalidation mode selection */
++	if (q->ptw_ivld_range) {
++		/* V4: both range-based */
++		sunxi_iommu_write(iommu, IOMMU_PC_IVLD_MODE_SEL_REG, 0x1);
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_MODE_SEL_REG, 0x1);
++	} else if (q->tlb_ivld_range) {
++		/* V3: range-based TLB, single-addr PTW */
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_MODE_SEL_REG, 0x1);
++	} else {
++		/* V1 / V2: addr+mask for both */
++		sunxi_iommu_write(iommu, IOMMU_PC_IVLD_MODE_SEL_REG, 0x0);
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_MODE_SEL_REG, 0x0);
++	}
++
++	/* Enable prefetch-valid fix if applicable */
++	if (effective_fix) {
++		u32 pf = sunxi_iommu_read(iommu, IOMMU_TLB_PREFETCH_REG);
++
++		sunxi_iommu_write(iommu, IOMMU_TLB_PREFETCH_REG,
++				  pf | 0x30000);
++	}
++
++	ret = sunxi_tlb_flush(iommu);
++	if (ret) {
++		dev_err(iommu->dev, "Enable flush all request timed out\n");
++		goto out;
++	}
++
++	sunxi_iommu_write(iommu, IOMMU_AUTO_GATING_REG, 0x1);
++	sunxi_iommu_write(iommu, IOMMU_ENABLE_REG, IOMMU_ENABLE);
++
++	iommu_enable = sunxi_iommu_read(iommu, IOMMU_ENABLE_REG);
++	if (iommu_enable != 0x1) {
++		iommu_enable = sunxi_iommu_read(iommu, IOMMU_ENABLE_REG);
++		if (iommu_enable != 0x1) {
++			dev_err(iommu->dev,
++				"iommu enable failed! No iommu in bitfile!\n");
++			ret = -ENODEV;
++			goto out;
++		}
++	}
++	tlb_init_flag = true;
++
++out:
++	spin_unlock_irqrestore(&iommu->iommu_lock, mflag);
++	return ret;
++}
++
++/* ================================================================== */
++/* Page-table entry helpers                                            */
++/* ================================================================== */
++static int sunxi_alloc_iopte(u32 *sent, int prot)
++{
++	u32 *pent;
++
++	pent = kmem_cache_zalloc(iopte_cache, GFP_ATOMIC);
++	WARN_ON((unsigned long)pent & (PT_SIZE - 1));
++	if (!pent)
++		return 0;
++
++	dma_sync_single_for_cpu(dma_dev, virt_to_phys(sent),
++				sizeof(*sent), DMA_TO_DEVICE);
++	*sent = __pa(pent) | DENT_VALID;
++	dma_sync_single_for_device(dma_dev, virt_to_phys(sent),
++				   sizeof(*sent), DMA_TO_DEVICE);
++
++	return 1;
++}
++
++static void sunxi_free_iopte(u32 *pent)
++{
++	kmem_cache_free(iopte_cache, pent);
++}
++
++static inline u32 sunxi_mk_pte(u32 page, int prot)
++{
++	u32 flags = 0;
++
++	flags |= (prot & IOMMU_READ) ? SUNXI_PTE_PAGE_READABLE : 0;
++	flags |= (prot & IOMMU_WRITE) ? SUNXI_PTE_PAGE_WRITABLE : 0;
++	page &= IOMMU_PT_MASK;
++
++	return page | flags | SUNXI_PTE_PAGE_VALID;
++}
++
++/* ================================================================== */
++/* Exported device helpers                                             */
++/* ================================================================== */
++void sunxi_reset_device_iommu(unsigned int master_id)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++	unsigned int regval;
++
++	regval = sunxi_iommu_read(iommu, IOMMU_RESET_REG);
++	sunxi_iommu_write(iommu, IOMMU_RESET_REG,
++			  regval & ~BIT(master_id));
++	regval = sunxi_iommu_read(iommu, IOMMU_RESET_REG);
++	if (!(regval & BIT(master_id)))
++		sunxi_iommu_write(iommu, IOMMU_RESET_REG,
++				  regval | BIT(master_id));
++}
++EXPORT_SYMBOL(sunxi_reset_device_iommu);
++
++void sunxi_enable_device_iommu(unsigned int master_id, bool flag)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++	unsigned long mflag;
++
++	spin_lock_irqsave(&iommu->iommu_lock, mflag);
++	if (flag)
++		iommu->bypass &= ~BIT(master_id);
++	else
++		iommu->bypass |= BIT(master_id);
++	sunxi_iommu_write(iommu, IOMMU_BYPASS_REG, iommu->bypass);
++	spin_unlock_irqrestore(&iommu->iommu_lock, mflag);
++}
++EXPORT_SYMBOL(sunxi_enable_device_iommu);
++
++/* ================================================================== */
++/* IOMMU map / unmap                                                   */
++/* ================================================================== */
++static int sunxi_iommu_map(struct iommu_domain *domain, unsigned long iova,
++			   phys_addr_t paddr, size_t pgsize, size_t pgcount,
++			   int prot, gfp_t gfp, size_t *mapped)
++{
++	struct sunxi_iommu_domain *sunxi_domain =
++		container_of(domain, struct sunxi_iommu_domain, domain);
++	size_t iova_start, iova_end, paddr_start, s_iova_start;
++	size_t size = pgsize * pgcount;
++	u32 *dent, *pent;
++	int i, j;
++	int flush_count = 0;
++
++	(void)gfp;
++	WARN_ON(!sunxi_domain->pgtable);
++	iova_start = iova & IOMMU_PT_MASK;
++	paddr_start = paddr & IOMMU_PT_MASK;
++	iova_end = SPAGE_ALIGN(iova + size) - SPAGE_SIZE;
++	s_iova_start = iova_start;
++
++	mutex_lock(&sunxi_domain->dt_lock);
++
++	if (IOPDE_INDEX(iova_start) == IOPDE_INDEX(iova_end)) {
++		dent = iopde_offset(sunxi_domain->pgtable, iova_start);
++		if (!IS_VALID(*dent))
++			sunxi_alloc_iopte(dent, prot);
++		for (flush_count = 0; iova_start <= iova_end;
++		     iova_start += SPAGE_SIZE, paddr_start += SPAGE_SIZE) {
++			pent = iopte_offset(dent, iova_start);
++			WARN_ON(*pent);
++			*pent = sunxi_mk_pte(paddr_start, prot);
++			++flush_count;
++		}
++		dma_sync_single_for_device(dma_dev,
++			virt_to_phys(iopte_offset(dent, s_iova_start)),
++			flush_count << 2, DMA_TO_DEVICE);
++		goto out;
++	}
++
++	/* First partial PDE */
++	dent = iopde_offset(sunxi_domain->pgtable, iova_start);
++	if (!IS_VALID(*dent))
++		sunxi_alloc_iopte(dent, prot);
++	for (flush_count = 0;
++	     iova_start < SPDE_ALIGN(s_iova_start + 1);
++	     iova_start += SPAGE_SIZE, paddr_start += SPAGE_SIZE) {
++		pent = iopte_offset(dent, iova_start);
++		WARN_ON(*pent);
++		*pent = sunxi_mk_pte(paddr_start, prot);
++		++flush_count;
++	}
++	dma_sync_single_for_device(dma_dev,
++		virt_to_phys(iopte_offset(dent, s_iova_start)),
++		flush_count << 2, DMA_TO_DEVICE);
++
++	/* Full PDEs in the middle */
++	if (IOPDE_INDEX(iova_start) < IOPDE_INDEX(iova_end)) {
++		for (i = IOPDE_INDEX(iova_start); i < IOPDE_INDEX(iova_end);
++		     i++, iova_start += SPD_SIZE, paddr_start += SPD_SIZE) {
++			dent = iopde_offset(sunxi_domain->pgtable, iova_start);
++			if (!IS_VALID(*dent))
++				sunxi_alloc_iopte(dent, prot);
++			pent = iopte_offset(dent, iova_start);
++			dma_sync_single_for_cpu(dma_dev,
++				virt_to_phys(pent), PT_SIZE, DMA_TO_DEVICE);
++			for (j = 0; j < NUM_ENTRIES_PTE; j++)
++				*(pent + j) = sunxi_mk_pte(
++					paddr_start + (j * SPAGE_SIZE), prot);
++			dma_sync_single_for_device(dma_dev,
++				virt_to_phys(pent), PT_SIZE, DMA_TO_DEVICE);
++		}
++	}
++
++	/* Last partial PDE */
++	s_iova_start = iova_start;
++	dent = iopde_offset(sunxi_domain->pgtable, iova_start);
++	if (!IS_VALID(*dent))
++		sunxi_alloc_iopte(dent, prot);
++	for (flush_count = 0; iova_start <= iova_end;
++	     iova_start += SPAGE_SIZE, paddr_start += SPAGE_SIZE) {
++		pent = iopte_offset(dent, iova_start);
++		WARN_ON(*pent);
++		*pent = sunxi_mk_pte(paddr_start, prot);
++		++flush_count;
++	}
++	dma_sync_single_for_device(dma_dev,
++		virt_to_phys(iopte_offset(dent, s_iova_start)),
++		flush_count << 2, DMA_TO_DEVICE);
++
++out:
++	if (!(prot & BIT(16)))
++		sunxi_zap_tlb(global_iommu_dev, iova, size);
++	mutex_unlock(&sunxi_domain->dt_lock);
++
++	if (mapped)
++		*mapped = size;
++
++	return 0;
++}
++
++static size_t sunxi_iommu_unmap(struct iommu_domain *domain, unsigned long iova,
++				size_t pgsize, size_t pgcount,
++				struct iommu_iotlb_gather *gather)
++{
++	struct sunxi_iommu_domain *sunxi_domain =
++		container_of(domain, struct sunxi_iommu_domain, domain);
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++	const struct sunxi_iommu_quirks *q = iommu->quirks;
++	bool effective_fix = q->has_prefetch_fix || iommu->prefetch_fixed;
++	size_t iova_start, iova_end, s_iova_start;
++	size_t size = pgsize * pgcount;
++	u32 *dent, *pent;
++	int i;
++	int flush_count = 0;
++
++	WARN_ON(!sunxi_domain->pgtable);
++	iova_start = iova & IOMMU_PT_MASK;
++	iova_end = SPAGE_ALIGN(iova + size) - SPAGE_SIZE;
++	s_iova_start = iova_start;
++
++	gather->start = iova_start;
++	gather->end = iova_end;
++
++	mutex_lock(&sunxi_domain->dt_lock);
++
++	/* V3/V4: bulk TLB invalidation first */
++	if (q->tlb_ivld_range)
++		sunxi_tlb_invalid_range(iommu, iova_start, iova_end);
++
++	/* V4: also bulk PTW cache invalidation */
++	if (q->ptw_ivld_range)
++		sunxi_ptw_cache_invalid_range(iommu, iova_start, iova_end);
++
++	/* Case 1: iova_start and iova_end within same PDE */
++	if (IOPDE_INDEX(iova_start) == IOPDE_INDEX(iova_end)) {
++		dent = iopde_offset(sunxi_domain->pgtable, iova_start);
++		if (IS_VALID(*dent)) {
++			u32 *pent_page = iopte_page(dent);
++
++			for (flush_count = 0; iova_start <= iova_end;
++			     iova_start += SPAGE_SIZE) {
++				pent = iopte_offset(dent, iova_start);
++				*pent = 0;
++				if (!q->tlb_ivld_range)
++					sunxi_tlb_invalid_addr(iommu,
++						iova_start,
++						(u32)IOMMU_PT_MASK);
++				++flush_count;
++			}
++			dma_sync_single_for_device(dma_dev,
++				virt_to_phys(iopte_offset(dent, s_iova_start)),
++				flush_count << 2, DMA_TO_DEVICE);
++
++			if (!q->ptw_ivld_range)
++				sunxi_ptw_cache_invalid_addr(iommu,
++							     s_iova_start);
++
++			/* Free the PTE page */
++			dma_sync_single_for_cpu(dma_dev,
++				virt_to_phys(dent), sizeof(*dent),
++				DMA_TO_DEVICE);
++			*dent = 0;
++			dma_sync_single_for_device(dma_dev,
++				virt_to_phys(dent), sizeof(*dent),
++				DMA_TO_DEVICE);
++			sunxi_free_iopte(pent_page);
++		}
++		goto done;
++	}
++
++	/* Case 2.1: first partial PDE */
++	dent = iopde_offset(sunxi_domain->pgtable, iova_start);
++	if (IS_VALID(*dent)) {
++		for (flush_count = 0;
++		     iova_start < SPDE_ALIGN(s_iova_start + 1);
++		     iova_start += SPAGE_SIZE) {
++			pent = iopte_offset(dent, iova_start);
++			*pent = 0;
++			if (!q->tlb_ivld_range)
++				sunxi_tlb_invalid_addr(iommu, iova_start,
++						       (u32)IOMMU_PT_MASK);
++			++flush_count;
++		}
++		dma_sync_single_for_device(dma_dev,
++			virt_to_phys(iopte_offset(dent, s_iova_start)),
++			flush_count << 2, DMA_TO_DEVICE);
++
++		if (!q->ptw_ivld_range)
++			sunxi_ptw_cache_invalid_addr(iommu, s_iova_start);
++	}
++
++	/* Case 2.2: full PDEs in the middle */
++	if (IOPDE_INDEX(iova_start) < IOPDE_INDEX(iova_end)) {
++		for (i = IOPDE_INDEX(iova_start); i < IOPDE_INDEX(iova_end);
++		     i++, iova_start += SPD_SIZE) {
++			dent = iopde_offset(sunxi_domain->pgtable, iova_start);
++			if (!IS_VALID(*dent))
++				continue;
++
++			{
++				u32 *pent_page = iopte_page(dent);
++
++				pent = iopte_offset(dent, iova_start);
++				dma_sync_single_for_cpu(dma_dev,
++					virt_to_phys(pent), PT_SIZE,
++					DMA_TO_DEVICE);
++				memset(pent, 0, PT_SIZE);
++				dma_sync_single_for_device(dma_dev,
++					virt_to_phys(pent), PT_SIZE,
++					DMA_TO_DEVICE);
++
++				if (!q->tlb_ivld_range)
++					sunxi_tlb_invalid_addr(iommu,
++						iova_start,
++						(u32)IOMMU_PD_MASK);
++
++				dma_sync_single_for_cpu(dma_dev,
++					virt_to_phys(dent), sizeof(*dent),
++					DMA_TO_DEVICE);
++				*dent = 0;
++				dma_sync_single_for_device(dma_dev,
++					virt_to_phys(dent), sizeof(*dent),
++					DMA_TO_DEVICE);
++
++				if (!q->ptw_ivld_range)
++					sunxi_ptw_cache_invalid_addr(iommu,
++								     iova_start);
++				sunxi_free_iopte(pent_page);
++			}
++		}
++	}
++
++	/* Case 2.3: last partial PDE */
++	s_iova_start = iova_start;
++	dent = iopde_offset(sunxi_domain->pgtable, iova_start);
++	if (IS_VALID(*dent)) {
++		for (flush_count = 0; iova_start <= iova_end;
++		     iova_start += SPAGE_SIZE) {
++			pent = iopte_offset(dent, iova_start);
++			*pent = 0;
++			if (!q->tlb_ivld_range)
++				sunxi_tlb_invalid_addr(iommu, iova_start,
++						       (u32)IOMMU_PT_MASK);
++			++flush_count;
++		}
++		dma_sync_single_for_device(dma_dev,
++			virt_to_phys(iopte_offset(dent, s_iova_start)),
++			flush_count << 2, DMA_TO_DEVICE);
++
++		if (!q->ptw_ivld_range)
++			sunxi_ptw_cache_invalid_addr(iommu, s_iova_start);
++	}
++
++done:
++	/*
++	 * V3 without prefetch-valid fix: need extra zap_tlb because the
++	 * hardware may have prefetched stale entries during bulk-invalidate.
++	 * V1/V2 already invalidate per-page inline.
++	 * V4 does range PTW invalidation upfront so this is not needed.
++	 */
++	if (q->tlb_ivld_range && !q->ptw_ivld_range && !effective_fix)
++		sunxi_zap_tlb(iommu, iova, size);
++
++	mutex_unlock(&sunxi_domain->dt_lock);
++
++	return size;
++}
++
++/* ================================================================== */
++/* IOTLB sync                                                          */
++/* ================================================================== */
++static void sunxi_iommu_iotlb_sync(struct iommu_domain *domain,
++				    struct iommu_iotlb_gather *gather)
++{
++	struct sunxi_iommu_domain *sunxi_domain =
++		container_of(domain, struct sunxi_iommu_domain, domain);
++	unsigned long iova_start = gather->start & IOMMU_PT_MASK;
++	unsigned long iova_end = SPAGE_ALIGN(gather->end);
++	size_t size = iova_end - iova_start;
++
++	mutex_lock(&sunxi_domain->dt_lock);
++	sunxi_zap_tlb(global_iommu_dev, iova_start, size);
++	mutex_unlock(&sunxi_domain->dt_lock);
++}
++
++/* ================================================================== */
++/* IOVA-to-phys                                                        */
++/* ================================================================== */
++static phys_addr_t
++sunxi_iommu_iova_to_phys(struct iommu_domain *domain, dma_addr_t iova)
++{
++	struct sunxi_iommu_domain *sunxi_domain =
++		container_of(domain, struct sunxi_iommu_domain, domain);
++	u32 *dent, *pent;
++	phys_addr_t ret = 0;
++
++	WARN_ON(!sunxi_domain->pgtable);
++	mutex_lock(&sunxi_domain->dt_lock);
++	dent = iopde_offset(sunxi_domain->pgtable, iova);
++	if (IS_VALID(*dent)) {
++		pent = iopte_offset(dent, iova);
++		if (*pent) {
++			ret = IOPTE_TO_PFN(pent) + IOVA_PAGE_OFT(iova);
++			if (ret < SUNXI_PHYS_OFFSET)
++				ret += SUNXI_4G_PHYS_OFFSET;
++		}
++	}
++	mutex_unlock(&sunxi_domain->dt_lock);
++
++	return ret;
++}
++
++/* ================================================================== */
++/* Domain alloc / free                                                 */
++/* ================================================================== */
++static struct iommu_domain *sunxi_iommu_domain_alloc_paging(struct device *dev)
++{
++	struct sunxi_iommu_domain *sunxi_domain;
++
++	/* Only a single domain is used */
++	if (global_sunxi_iommu_domain)
++		return &global_sunxi_iommu_domain->domain;
++
++	sunxi_domain = kzalloc(sizeof(*sunxi_domain), GFP_KERNEL);
++	if (!sunxi_domain)
++		return NULL;
++
++	sunxi_domain->pgtable = (unsigned int *)__get_free_pages(
++				GFP_KERNEL, get_order(PD_SIZE));
++	if (!sunxi_domain->pgtable)
++		goto err_page;
++
++	sunxi_domain->sg_buffer = (unsigned int *)__get_free_pages(
++				GFP_KERNEL, get_order(MAX_SG_TABLE_SIZE));
++	if (!sunxi_domain->sg_buffer)
++		goto err_sg_buffer;
++
++	memset(sunxi_domain->pgtable, 0, PD_SIZE);
++	sunxi_domain->domain.pgsize_bitmap = SZ_4K | SZ_16K | SZ_64K |
++			SZ_256K | SZ_1M | SZ_4M | SZ_16M;
++	sunxi_domain->domain.geometry.aperture_start = 0;
++	sunxi_domain->domain.geometry.aperture_end = (1ULL << 32) - 1;
++	sunxi_domain->domain.geometry.force_aperture = true;
++	mutex_init(&sunxi_domain->dt_lock);
++	global_sunxi_iommu_domain = sunxi_domain;
++	global_iommu_domain = &sunxi_domain->domain;
++
++	return &sunxi_domain->domain;
++
++err_sg_buffer:
++	free_pages((unsigned long)sunxi_domain->pgtable, get_order(PD_SIZE));
++	sunxi_domain->pgtable = NULL;
++err_page:
++	kfree(sunxi_domain);
++	return NULL;
++}
++
++static void sunxi_iommu_domain_free(struct iommu_domain *domain)
++{
++	struct sunxi_iommu_domain *sunxi_domain =
++		container_of(domain, struct sunxi_iommu_domain, domain);
++	int i;
++	size_t dom_iova;
++	u32 *dent, *pent;
++
++	mutex_lock(&sunxi_domain->dt_lock);
++	for (i = 0; i < NUM_ENTRIES_PDE; ++i) {
++		dent = sunxi_domain->pgtable + i;
++		dom_iova = (size_t)i << IOMMU_PD_SHIFT;
++		if (IS_VALID(*dent)) {
++			u32 *pent_page = iopte_page(dent);
++
++			pent = iopte_offset(dent, dom_iova);
++			dma_sync_single_for_cpu(dma_dev, virt_to_phys(pent),
++						PT_SIZE, DMA_TO_DEVICE);
++			memset(pent, 0, PT_SIZE);
++			dma_sync_single_for_device(dma_dev, virt_to_phys(pent),
++						   PT_SIZE, DMA_TO_DEVICE);
++			dma_sync_single_for_cpu(dma_dev, virt_to_phys(dent),
++						sizeof(*dent), DMA_TO_DEVICE);
++			*dent = 0;
++			dma_sync_single_for_device(dma_dev, virt_to_phys(dent),
++						   sizeof(*dent), DMA_TO_DEVICE);
++			sunxi_free_iopte(pent_page);
++		}
++	}
++	sunxi_tlb_flush(global_iommu_dev);
++	mutex_unlock(&sunxi_domain->dt_lock);
++
++	free_pages((unsigned long)sunxi_domain->pgtable, get_order(PD_SIZE));
++	sunxi_domain->pgtable = NULL;
++	free_pages((unsigned long)sunxi_domain->sg_buffer,
++		   get_order(MAX_SG_TABLE_SIZE));
++	sunxi_domain->sg_buffer = NULL;
++	kfree(sunxi_domain);
++}
++
++/* ================================================================== */
++/* Attach / probe / release                                            */
++/* ================================================================== */
++/*
++ * Since 7.x the core passes the domain being replaced; this driver keeps no
++ * per-domain device list, so there is nothing to detach from.
++ */
++static int sunxi_iommu_attach_dev(struct iommu_domain *domain,
++				  struct device *dev,
++				  struct iommu_domain *old)
++{
++	struct sunxi_iommu_owner *owner = dev_iommu_priv_get(dev);
++	int ret = 0;
++
++	if (!owner)
++		return -ENODEV;
++
++	if (!tlb_init_flag) {
++		global_iommu_owner = owner;
++		ret = sunxi_tlb_init(owner, domain);
++		if (ret)
++			return ret;
++		tlb_init_flag = true;
++	}
++
++	sunxi_enable_device_iommu(owner->tlbid, owner->flag);
++
++	return ret;
++}
++
++static struct iommu_device *sunxi_iommu_probe_device(struct device *dev)
++{
++	struct sunxi_iommu_owner *owner = dev_iommu_priv_get(dev);
++
++	if (!owner || !owner->data)
++		return ERR_PTR(-ENODEV);
++
++	return &owner->data->iommu;
++}
++
++static void sunxi_iommu_release_device(struct device *dev)
++{
++	struct sunxi_iommu_owner *owner = dev_iommu_priv_get(dev);
++
++	if (!owner || !owner->data)
++		return;
++
++	sunxi_enable_device_iommu(owner->tlbid, false);
++	kfree(owner);
++	dev_iommu_priv_set(dev, NULL);
++}
++
++static int sunxi_iommu_of_xlate(struct device *dev,
++				const struct of_phandle_args *args)
++{
++	struct platform_device *sysmmu = of_find_device_by_node(args->np);
++	struct sunxi_iommu_owner *owner;
++	struct sunxi_iommu_dev *data;
++
++	if (!sysmmu)
++		return -ENODEV;
++
++	data = platform_get_drvdata(sysmmu);
++	if (!data)
++		return -ENODEV;
++
++	owner = kzalloc(sizeof(*owner), GFP_KERNEL);
++	if (!owner)
++		return -ENOMEM;
++
++	owner->tlbid = args->args_count > 0 ? args->args[0] : 0;
++	owner->flag = args->args_count > 1 ? args->args[1] : 0;
++	owner->data = data;
++	owner->dev = dev;
++
++	dev_iommu_priv_set(dev, owner);
++
++	return iommu_fwspec_add_ids(dev, &owner->tlbid, 1);
++}
++
++/* ================================================================== */
++/* Debug mode (V2+ only)                                               */
++/* ================================================================== */
++void sunxi_set_debug_mode(void)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++
++	if (iommu && iommu->quirks->num_micro_tlbs == 7)
++		sunxi_iommu_write(iommu, IOMMU_VA_CONFIG_REG, 0x80000000);
++}
++
++void sunxi_set_prefetch_mode(void)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++
++	if (iommu && iommu->quirks->num_micro_tlbs == 7)
++		sunxi_iommu_write(iommu, IOMMU_VA_CONFIG_REG, 0x00000000);
++}
++
++/* ================================================================== */
++/* IOVA debug read / write                                             */
++/* ================================================================== */
++int sunxi_iova_test_write(dma_addr_t iova, u32 val)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++	int retval;
++
++	sunxi_iommu_write(iommu, IOMMU_VA_REG, iova);
++	sunxi_iommu_write(iommu, IOMMU_VA_DATA_REG, val);
++	sunxi_iommu_write(iommu, IOMMU_VA_CONFIG_REG, 0x80000100);
++	sunxi_iommu_write(iommu, IOMMU_VA_CONFIG_REG, 0x80000101);
++	retval = sunxi_wait_when(
++		sunxi_iommu_read(iommu, IOMMU_VA_CONFIG_REG) & 0x1, 1);
++	if (retval)
++		dev_err(iommu->dev, "write VA address request timed out\n");
++
++	return retval;
++}
++
++unsigned long sunxi_iova_test_read(dma_addr_t iova)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++	unsigned long retval;
++
++	sunxi_iommu_write(iommu, IOMMU_VA_REG, iova);
++	sunxi_iommu_write(iommu, IOMMU_VA_CONFIG_REG, 0x80000000);
++	sunxi_iommu_write(iommu, IOMMU_VA_CONFIG_REG, 0x80000001);
++	retval = sunxi_wait_when(
++		sunxi_iommu_read(iommu, IOMMU_VA_CONFIG_REG) & 0x1, 1);
++	if (retval) {
++		dev_err(iommu->dev, "read VA address request timed out\n");
++		return 0;
++	}
++
++	return sunxi_iommu_read(iommu, IOMMU_VA_DATA_REG);
++}
++
++/* ================================================================== */
++/* IRQ handler                                                         */
++/* ================================================================== */
++static int sunxi_iova_invalid_helper(unsigned long iova)
++{
++	struct sunxi_iommu_domain *sunxi_domain = global_sunxi_iommu_domain;
++	u32 *pte_addr, *dte_addr;
++
++	dte_addr = iopde_offset(sunxi_domain->pgtable, iova);
++	if ((*dte_addr & 0x3) != 0x1) {
++		pr_err("0x%lx is not mapped!\n", iova);
++		return 1;
++	}
++	pte_addr = iopte_offset(dte_addr, iova);
++	if ((*pte_addr & 0x2) == 0) {
++		pr_err("0x%lx is not mapped!\n", iova);
++		return 1;
++	}
++	pr_err("0x%lx is mapped!\n", iova);
++	return 0;
++}
++
++/*
++ * Recover TLB/PTW state after an IOMMU fault.
++ * Called from IRQ context with iommu_lock held.
++ */
++static void sunxi_iommu_irq_recover(struct sunxi_iommu_dev *iommu,
++				     u32 fault_addr)
++{
++	const struct sunxi_iommu_quirks *q = iommu->quirks;
++
++	if (q->tlb_ivld_range) {
++		/* Range-based TLB invalidation */
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_START_ADDR_REG,
++				  fault_addr);
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_END_ADDR_REG,
++				  fault_addr + 4 * SPAGE_SIZE);
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ENABLE_REG, 0x1);
++		while (sunxi_iommu_read(iommu,
++					IOMMU_TLB_IVLD_ENABLE_REG) & 0x1)
++			;
++
++		if (q->ptw_ivld_range) {
++			/* V4: range-based PTW */
++			sunxi_iommu_write(iommu,
++					  IOMMU_PC_IVLD_START_ADDR_REG,
++					  fault_addr);
++			sunxi_iommu_write(iommu,
++					  IOMMU_PC_IVLD_END_ADDR_REG,
++					  fault_addr + 2 * SPD_SIZE);
++			sunxi_iommu_write(iommu,
++					  IOMMU_PC_IVLD_ENABLE_REG, 0x1);
++			while (sunxi_iommu_read(iommu,
++						IOMMU_PC_IVLD_ENABLE_REG) & 0x1)
++				;
++		} else {
++			/* V3: single-addr PTW */
++			sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ADDR_REG,
++					  fault_addr);
++			sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ENABLE_REG,
++					  0x1);
++			while (sunxi_iommu_read(iommu,
++						IOMMU_PC_IVLD_ENABLE_REG) & 0x1)
++				;
++			sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ADDR_REG,
++					  fault_addr + 0x200000);
++			sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ENABLE_REG,
++					  0x1);
++			while (sunxi_iommu_read(iommu,
++						IOMMU_PC_IVLD_ENABLE_REG) & 0x1)
++				;
++		}
++	} else {
++		/* V1/V2: addr+mask TLB */
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ADDR_REG,
++				  fault_addr);
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ADDR_MASK_REG,
++				  (u32)IOMMU_PT_MASK);
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ENABLE_REG, 0x1);
++		while (sunxi_iommu_read(iommu,
++					IOMMU_TLB_IVLD_ENABLE_REG) & 0x1)
++			;
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ADDR_REG,
++				  fault_addr + 0x2000);
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ADDR_MASK_REG,
++				  (u32)IOMMU_PT_MASK);
++		sunxi_iommu_write(iommu, IOMMU_TLB_IVLD_ENABLE_REG, 0x1);
++		while (sunxi_iommu_read(iommu,
++					IOMMU_TLB_IVLD_ENABLE_REG) & 0x1)
++			;
++		sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ADDR_REG,
++				  fault_addr);
++		sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ENABLE_REG, 0x1);
++		while (sunxi_iommu_read(iommu,
++					IOMMU_PC_IVLD_ENABLE_REG) & 0x1)
++			;
++		sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ADDR_REG,
++				  fault_addr + 0x200000);
++		sunxi_iommu_write(iommu, IOMMU_PC_IVLD_ENABLE_REG, 0x1);
++		while (sunxi_iommu_read(iommu,
++					IOMMU_PC_IVLD_ENABLE_REG) & 0x1)
++			;
++	}
++}
++
++static irqreturn_t sunxi_iommu_irq(int irq, void *dev_id)
++{
++	struct sunxi_iommu_dev *iommu = dev_id;
++	const struct sunxi_iommu_quirks *q = iommu->quirks;
++	u32 inter_status_reg;
++	u32 addr_reg = 0;
++	u32 int_masterid_bitmap;
++	u32 data_reg = 0;
++	u32 l1_pgint_reg;
++	u32 l2_pgint_reg;
++	u32 master_id = 0;
++	unsigned long mflag;
++	int i;
++	bool handled = false;
++
++	spin_lock_irqsave(&iommu->iommu_lock, mflag);
++
++	inter_status_reg = sunxi_iommu_read(iommu, IOMMU_INT_STA_REG) & 0x3ffff;
++	l1_pgint_reg = sunxi_iommu_read(iommu, IOMMU_L1PG_INT_REG);
++	l2_pgint_reg = sunxi_iommu_read(iommu, IOMMU_L2PG_INT_REG);
++	int_masterid_bitmap = inter_status_reg | l1_pgint_reg | l2_pgint_reg;
++
++	/* Check micro-TLB 0..5 */
++	for (i = 0; i < 6; i++) {
++		if (inter_status_reg & MICRO_TLB_INVALID_INTER_MASK(i)) {
++			pr_err("%s Invalid Authority\n",
++			       q->master_names[i]);
++			addr_reg = sunxi_iommu_read(iommu,
++						    IOMMU_INT_ERR_ADDR_REG(i));
++			data_reg = sunxi_iommu_read(iommu,
++						    IOMMU_INT_ERR_DATA_REG(i));
++			handled = true;
++			break;
++		}
++	}
++
++	/* Check micro-TLB 6 (7-TLB variants only) */
++	if (!handled && q->num_micro_tlbs == 7 &&
++	    (inter_status_reg & MICRO_TLB_INVALID_INTER_MASK(6))) {
++		pr_err("%s Invalid Authority\n", q->master_names[6]);
++		addr_reg = sunxi_iommu_read(iommu, IOMMU_INT_ERR_ADDR_UTLB6);
++		data_reg = sunxi_iommu_read(iommu, IOMMU_INT_ERR_DATA_UTLB6);
++		handled = true;
++	}
++
++	/* L1 page-table error */
++	if (!handled &&
++	    (inter_status_reg & L1_PAGETABLE_INVALID_INTER_MASK)) {
++		if (q->num_micro_tlbs < 7 || !(int_masterid_bitmap & BIT(31)))
++			pr_err("L1 PageTable Invalid\n");
++		addr_reg = sunxi_iommu_read(iommu, IOMMU_INT_ERR_ADDR_L1);
++		data_reg = sunxi_iommu_read(iommu, IOMMU_INT_ERR_DATA_L1);
++		handled = true;
++	}
++
++	/* L2 page-table error */
++	if (!handled &&
++	    (inter_status_reg & L2_PAGETABLE_INVALID_INTER_MASK)) {
++		if (q->num_micro_tlbs < 7 || !(int_masterid_bitmap & BIT(31)))
++			pr_err("L2 PageTable Invalid\n");
++		addr_reg = sunxi_iommu_read(iommu, IOMMU_INT_ERR_ADDR_L2);
++		data_reg = sunxi_iommu_read(iommu, IOMMU_INT_ERR_DATA_L2);
++		handled = true;
++	}
++
++	if (!handled)
++		pr_err("sunxi iommu int error!!!\n");
++
++	if (handled && !(int_masterid_bitmap & BIT(31))) {
++		if (sunxi_iova_invalid_helper(addr_reg)) {
++			int_masterid_bitmap &= 0xffff;
++			master_id = __ffs(int_masterid_bitmap);
++		}
++		if (master_id < q->num_micro_tlbs)
++			pr_err("%s invalid address: 0x%x, data:0x%x, id:0x%x\n",
++			       q->master_names[master_id],
++			       addr_reg, data_reg, int_masterid_bitmap);
++		else
++			pr_err("unknown master %u invalid address: 0x%x, data:0x%x, id:0x%x\n",
++			       master_id, addr_reg, data_reg,
++			       int_masterid_bitmap);
++	}
++
++	/* Recover TLB / PTW state */
++	sunxi_iommu_irq_recover(iommu, addr_reg);
++
++	sunxi_iommu_write(iommu, IOMMU_INT_CLR_REG, inter_status_reg);
++	inter_status_reg |= (l1_pgint_reg | l2_pgint_reg);
++	inter_status_reg &= 0xffff;
++	sunxi_iommu_write(iommu, IOMMU_RESET_REG, ~inter_status_reg);
++	sunxi_iommu_write(iommu, IOMMU_RESET_REG, 0xffffffff);
++
++	spin_unlock_irqrestore(&iommu->iommu_lock, mflag);
++
++	return IRQ_HANDLED;
++}
++
++/* ================================================================== */
++/* Sysfs: PMU enable                                                   */
++/* ================================================================== */
++static ssize_t sunxi_iommu_enable_show(struct device *dev,
++					struct device_attribute *attr,
++					char *buf)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++	u32 data;
++
++	spin_lock(&iommu->iommu_lock);
++	data = sunxi_iommu_read(iommu, IOMMU_PMU_ENABLE_REG);
++	spin_unlock(&iommu->iommu_lock);
++
++	return scnprintf(buf, PAGE_SIZE, "enable = %d\n", data & 0x1 ? 1 : 0);
++}
++
++static ssize_t sunxi_iommu_enable_store(struct device *dev,
++					 struct device_attribute *attr,
++					 const char *buf, size_t count)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++	unsigned long val;
++	u32 data;
++	int retval;
++
++	if (kstrtoul(buf, 0, &val))
++		return -EINVAL;
++
++	spin_lock(&iommu->iommu_lock);
++	if (val) {
++		data = sunxi_iommu_read(iommu, IOMMU_PMU_ENABLE_REG);
++		sunxi_iommu_write(iommu, IOMMU_PMU_ENABLE_REG, data | 0x1);
++		data = sunxi_iommu_read(iommu, IOMMU_PMU_CLR_REG);
++		sunxi_iommu_write(iommu, IOMMU_PMU_CLR_REG, data | 0x1);
++		retval = sunxi_wait_when(
++			sunxi_iommu_read(iommu, IOMMU_PMU_CLR_REG) & 0x1, 1);
++		if (retval)
++			dev_err(iommu->dev, "Clear PMU Count timed out\n");
++	} else {
++		data = sunxi_iommu_read(iommu, IOMMU_PMU_CLR_REG);
++		sunxi_iommu_write(iommu, IOMMU_PMU_CLR_REG, data | 0x1);
++		retval = sunxi_wait_when(
++			sunxi_iommu_read(iommu, IOMMU_PMU_CLR_REG) & 0x1, 1);
++		if (retval)
++			dev_err(iommu->dev, "Clear PMU Count timed out\n");
++		data = sunxi_iommu_read(iommu, IOMMU_PMU_ENABLE_REG);
++		sunxi_iommu_write(iommu, IOMMU_PMU_ENABLE_REG, data & ~0x1);
++	}
++	spin_unlock(&iommu->iommu_lock);
++
++	return count;
++}
++
++/* ================================================================== */
++/* Sysfs: PMU profiling (unified loop over micro-TLBs)                 */
++/* ================================================================== */
++static ssize_t sunxi_iommu_profilling_show(struct device *dev,
++					    struct device_attribute *attr,
++					    char *buf)
++{
++	struct sunxi_iommu_dev *iommu = global_iommu_dev;
++	const struct sunxi_iommu_quirks *q = iommu->quirks;
++	ssize_t len = 0;
++	u64 access_cnt, hit_cnt, latency;
++	int i;
++
++	spin_lock(&iommu->iommu_lock);
++
++	/* Per micro-TLB access / hit counts */
++	for (i = 0; i < q->num_micro_tlbs; i++) {
++		access_cnt =
++			((u64)(sunxi_iommu_read(iommu,
++				IOMMU_PMU_ACCESS_HIGH_REG(i)) & 0x7ff) << 32) |
++			sunxi_iommu_read(iommu, IOMMU_PMU_ACCESS_LOW_REG(i));
++		hit_cnt =
++			((u64)(sunxi_iommu_read(iommu,
++				IOMMU_PMU_HIT_HIGH_REG(i)) & 0x7ff) << 32) |
++			sunxi_iommu_read(iommu, IOMMU_PMU_HIT_LOW_REG(i));
++
++		len += scnprintf(buf + len, PAGE_SIZE - len,
++				 "%s_access_count = 0x%llx\n"
++				 "%s_hit_count = 0x%llx\n",
++				 q->master_names[i], access_cnt,
++				 q->master_names[i], hit_cnt);
++	}
++
++	/* Macro-TLB */
++	access_cnt =
++		((u64)(sunxi_iommu_read(iommu,
++			IOMMU_PMU_ACCESS_HIGH_MACROTLB) & 0x7ff) << 32) |
++		sunxi_iommu_read(iommu, IOMMU_PMU_ACCESS_LOW_MACROTLB);
++	hit_cnt =
++		((u64)(sunxi_iommu_read(iommu,
++			IOMMU_PMU_HIT_HIGH_MACROTLB) & 0x7ff) << 32) |
++		sunxi_iommu_read(iommu, IOMMU_PMU_HIT_LOW_MACROTLB);
++	len += scnprintf(buf + len, PAGE_SIZE - len,
++			 "macrotlb_access_count = 0x%llx\n"
++			 "macrotlb_hit_count = 0x%llx\n",
++			 access_cnt, hit_cnt);
++
++	/* PTW cache */
++	access_cnt =
++		((u64)(sunxi_iommu_read(iommu,
++			IOMMU_PMU_ACCESS_HIGH_PTWCACHE) & 0x7ff) << 32) |
++		sunxi_iommu_read(iommu, IOMMU_PMU_ACCESS_LOW_PTWCACHE);
++	hit_cnt =
++		((u64)(sunxi_iommu_read(iommu,
++			IOMMU_PMU_HIT_HIGH_PTWCACHE) & 0x7ff) << 32) |
++		sunxi_iommu_read(iommu, IOMMU_PMU_HIT_LOW_PTWCACHE);
++	len += scnprintf(buf + len, PAGE_SIZE - len,
++			 "ptwcache_access_count = 0x%llx\n"
++			 "ptwcache_hit_count = 0x%llx\n",
++			 access_cnt, hit_cnt);
++
++	/* Per micro-TLB total latency */
++	for (i = 0; i < q->num_micro_tlbs; i++) {
++		latency =
++			((u64)(sunxi_iommu_read(iommu,
++				IOMMU_PMU_TL_HIGH_REG(i)) & 0x3ffff) << 32) |
++			sunxi_iommu_read(iommu, IOMMU_PMU_TL_LOW_REG(i));
++		len += scnprintf(buf + len, PAGE_SIZE - len,
++				 "%s_total_latency = 0x%llx\n",
++				 q->master_names[i], latency);
++	}
++
++	/* Per micro-TLB max latency (7-TLB variants only) */
++	if (q->num_micro_tlbs == 7) {
++		for (i = 0; i < q->num_micro_tlbs; i++) {
++			u32 ml = sunxi_iommu_read(iommu,
++						  IOMMU_PMU_ML_REG(i));
++
++			len += scnprintf(buf + len, PAGE_SIZE - len,
++					 "%s_max_latency = 0x%x\n",
++					 q->master_names[i], ml);
++		}
++	}
++
++	spin_unlock(&iommu->iommu_lock);
++
++	return len;
++}
++
++/* ================================================================== */
++/* Sysfs: page-table dump                                              */
++/* ================================================================== */
++static inline bool __region_ended(u32 pent)
++{
++	return !(pent & SUNXI_PTE_PAGE_VALID);
++}
++
++static inline bool __access_mask_changed(u32 pent, u32 old_mask)
++{
++	return old_mask != (pent & (SUNXI_PTE_PAGE_READABLE |
++				    SUNXI_PTE_PAGE_WRITABLE));
++}
++
++#define DUMP_REGION_MAP		0
++#define DUMP_REGION_RESERVE	1
++
++struct dump_region {
++	u32 access_mask;
++	size_t size;
++	u32 type;
++	dma_addr_t phys, iova;
++};
++
++static inline u32 __print_region(char *buf, size_t buf_len, ssize_t len,
++				 struct dump_region *r)
++{
++	if (r->type == DUMP_REGION_RESERVE)
++		len += scnprintf(buf + len, buf_len - len,
++			"iova:%pad                            size:0x%zx\n",
++			&r->iova, r->size);
++	else
++		len += scnprintf(buf + len, buf_len - len,
++			"iova:%pad phys:%pad %s%s size:0x%zx\n",
++			&r->iova, &r->phys,
++			r->access_mask & SUNXI_PTE_PAGE_READABLE ? "R" : " ",
++			r->access_mask & SUNXI_PTE_PAGE_WRITABLE ? "W" : " ",
++			r->size);
++	return len;
++}
++
++ssize_t sunxi_iommu_dump_pgtable(char *buf, size_t buf_len)
++{
++	struct sunxi_iommu_domain *sunxi_domain = container_of(
++		global_iommu_domain, struct sunxi_iommu_domain, domain);
++	ssize_t len = 0;
++	int i, j;
++	u32 *dent, *pent;
++	struct dump_region active_region;
++	struct iommu_resv_region *resv;
++
++	len += scnprintf(buf + len, buf_len - len, "reserved\n");
++	list_for_each_entry(resv, &global_iommu_dev->rsv_list, list) {
++		active_region.access_mask = 0;
++		active_region.iova = resv->start;
++		active_region.type = DUMP_REGION_RESERVE;
++		active_region.size = resv->length;
++		len = __print_region(buf, buf_len, len, &active_region);
++	}
++	len += scnprintf(buf + len, buf_len - len, "mapped\n");
++
++	dent = sunxi_domain->pgtable;
++	active_region.type = DUMP_REGION_MAP;
++	active_region.size = 0;
++	active_region.access_mask = 0;
++	for (i = 0; i < NUM_ENTRIES_PDE; i++) {
++		if (!IS_VALID(dent[i]))
++			continue;
++		pent = iopte_offset(dent + i, 0);
++		for (j = 0; j < NUM_ENTRIES_PTE; j++) {
++			if (active_region.size) {
++				if (__region_ended(pent[j]) ||
++				    (active_region.access_mask &&
++				     __access_mask_changed(pent[j],
++					active_region.access_mask))) {
++					len = __print_region(buf, buf_len, len,
++							     &active_region);
++					active_region.size = 0;
++					active_region.access_mask = 0;
++				}
++			}
++			if (pent[j] & SUNXI_PTE_PAGE_VALID) {
++				if (active_region.size == 0) {
++					active_region.iova =
++						((dma_addr_t)i << IOMMU_PD_SHIFT) +
++						((dma_addr_t)j << IOMMU_PT_SHIFT);
++					active_region.phys =
++						iommu_phy_to_cpu_phy(
++							IOPTE_TO_PFN(&pent[j]));
++					active_region.access_mask =
++						pent[j] & (SUNXI_PTE_PAGE_READABLE |
++							   SUNXI_PTE_PAGE_WRITABLE);
++				}
++				active_region.size += 1 << IOMMU_PT_SHIFT;
++			}
++		}
++	}
++	if (active_region.size)
++		len = __print_region(buf, buf_len, len, &active_region);
++
++	return len;
++}
++EXPORT_SYMBOL_GPL(sunxi_iommu_dump_pgtable);
++
++static ssize_t sunxi_iommu_map_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	return sunxi_iommu_dump_pgtable(buf, PAGE_SIZE);
++}
++
++static struct device_attribute sunxi_iommu_enable_attr =
++	__ATTR(enable, 0644, sunxi_iommu_enable_show, sunxi_iommu_enable_store);
++static struct device_attribute sunxi_iommu_profilling_attr =
++	__ATTR(profilling, 0444, sunxi_iommu_profilling_show, NULL);
++static struct device_attribute sunxi_iommu_map_attr =
++	__ATTR(page_debug, 0444, sunxi_iommu_map_show, NULL);
++
++static void sunxi_iommu_sysfs_create(struct platform_device *pdev)
++{
++	device_create_file(&pdev->dev, &sunxi_iommu_enable_attr);
++	device_create_file(&pdev->dev, &sunxi_iommu_profilling_attr);
++	device_create_file(&pdev->dev, &sunxi_iommu_map_attr);
++}
++
++static void sunxi_iommu_sysfs_remove(struct platform_device *pdev)
++{
++	device_remove_file(&pdev->dev, &sunxi_iommu_enable_attr);
++	device_remove_file(&pdev->dev, &sunxi_iommu_profilling_attr);
++	device_remove_file(&pdev->dev, &sunxi_iommu_map_attr);
++}
++
++/* ================================================================== */
++/* Reserved-memory regions                                             */
++/* ================================================================== */
++static int sunxi_iommu_check_cmd(struct device *dev, void *data)
++{
++	struct iommu_resv_region *region;
++	int prot = IOMMU_WRITE | IOMMU_READ;
++	struct list_head *rsv_list = data;
++	struct {
++		const char *name;
++		u32 region_type;
++	} supported_region[] = {
++		{ "sunxi-iova-reserve", IOMMU_RESV_RESERVED },
++		{ "sunxi-iova-premap",  IOMMU_RESV_DIRECT },
++	};
++	int i, j;
++#define REGION_CNT_MAX 8
++	struct {
++		u64 array[REGION_CNT_MAX * 2];
++		int count;
++	} *tmp_data;
++
++	tmp_data = kzalloc(sizeof(*tmp_data), GFP_KERNEL);
++	if (!tmp_data)
++		return -ENOMEM;
++
++	for (i = 0; i < ARRAY_SIZE(supported_region); i++) {
++		if (!of_find_property(dev->of_node, supported_region[i].name,
++				      NULL))
++			continue;
++
++		tmp_data->count = of_property_read_variable_u64_array(
++			dev->of_node, supported_region[i].name, tmp_data->array,
++			0, REGION_CNT_MAX);
++		if (tmp_data->count <= 0 || (tmp_data->count & 1) != 0) {
++			if (tmp_data->count > 0)
++				dev_err(dev, "array %s size %d should be even\n",
++					supported_region[i].name,
++					tmp_data->count);
++			continue;
++		}
++		tmp_data->count /= 2;
++
++		for (j = 0; j < tmp_data->count; j++) {
++			region = iommu_alloc_resv_region(
++				tmp_data->array[j * 2],
++				tmp_data->array[j * 2 + 1], prot,
++				supported_region[i].region_type, GFP_KERNEL);
++			if (!region) {
++				dev_err(dev, "no memory for iova rsv region\n");
++				continue;
++			}
++			list_add_tail(&region->list, rsv_list);
++		}
++	}
++	kfree(tmp_data);
++#undef REGION_CNT_MAX
++
++	return 0;
++}
++
++static int __init_reserve_mem(struct sunxi_iommu_dev *dev)
++{
++	return bus_for_each_dev(&platform_bus_type, NULL, &dev->rsv_list,
++				sunxi_iommu_check_cmd);
++}
++
++static void sunxi_iommu_get_resv_regions(struct device *dev,
++					  struct list_head *head)
++{
++	struct iommu_resv_region *entry;
++	struct iommu_resv_region *region;
++
++	if (!head || !global_iommu_dev)
++		return;
++
++	if (list_empty(&global_iommu_dev->rsv_list))
++		__init_reserve_mem(global_iommu_dev);
++
++	if (list_empty(&global_iommu_dev->rsv_list))
++		return;
++
++	list_for_each_entry(entry, &global_iommu_dev->rsv_list, list) {
++		region = iommu_alloc_resv_region(entry->start, entry->length,
++						 entry->prot, entry->type,
++						 GFP_KERNEL);
++		if (region)
++			list_add_tail(&region->list, head);
++	}
++}
++
++/* ================================================================== */
++/* IOMMU ops                                                           */
++/* ================================================================== */
++static const struct iommu_ops sunxi_iommu_ops = {
++	.domain_alloc_paging = sunxi_iommu_domain_alloc_paging,
++	.probe_device	= sunxi_iommu_probe_device,
++	.release_device = sunxi_iommu_release_device,
++	.get_resv_regions = sunxi_iommu_get_resv_regions,
++	.of_xlate	= sunxi_iommu_of_xlate,
++	.default_domain_ops = &(const struct iommu_domain_ops) {
++		.attach_dev	= sunxi_iommu_attach_dev,
++		.map_pages	= sunxi_iommu_map,
++		.unmap_pages	= sunxi_iommu_unmap,
++		.iotlb_sync	= sunxi_iommu_iotlb_sync,
++		.iova_to_phys	= sunxi_iommu_iova_to_phys,
++		.free		= sunxi_iommu_domain_free,
++	},
++	.device_group	= generic_single_device_group,
++	.owner		= THIS_MODULE,
++};
++
++/* ================================================================== */
++/* Platform driver probe / remove / suspend / resume                   */
++/* ================================================================== */
++static int sunxi_iommu_probe(struct platform_device *pdev)
++{
++	int ret, irq;
++	struct device *dev = &pdev->dev;
++	struct sunxi_iommu_dev *sunxi_iommu;
++	struct resource *res;
++	const struct sunxi_iommu_quirks *quirks;
++
++	quirks = of_device_get_match_data(dev);
++	if (!quirks) {
++		dev_err(dev, "No matching quirks found\n");
++		return -ENODEV;
++	}
++
++	iopte_cache = kmem_cache_create("sunxi-iopte-cache", PT_SIZE,
++					PT_SIZE, SLAB_HWCACHE_ALIGN, NULL);
++	if (!iopte_cache) {
++		dev_err(dev, "Failed to create sunxi-iopte-cache.\n");
++		return -ENOMEM;
++	}
++
++	sunxi_iommu = devm_kzalloc(dev, sizeof(*sunxi_iommu), GFP_KERNEL);
++	if (!sunxi_iommu)
++		return -ENOMEM;
++
++	sunxi_iommu->quirks = quirks;
++
++	/* Check for the sun50iw10 "fixed" IC revision DT property */
++	sunxi_iommu->prefetch_fixed =
++		of_property_read_bool(dev->of_node,
++				      "allwinner,sun50iw10-iommu-fixed");
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_dbg(dev, "Unable to find resource region\n");
++		ret = -ENOENT;
++		goto err_res;
++	}
++
++	sunxi_iommu->base = devm_ioremap_resource(dev, res);
++	if (IS_ERR(sunxi_iommu->base)) {
++		ret = PTR_ERR(sunxi_iommu->base);
++		goto err_res;
++	}
++
++	sunxi_iommu->bypass = GENMASK(quirks->num_micro_tlbs - 1, 0);
++
++	irq = platform_get_irq(pdev, 0);
++	if (irq <= 0) {
++		dev_dbg(dev, "Unable to find IRQ resource\n");
++		ret = -ENOENT;
++		goto err_irq;
++	}
++
++	dev_info(dev, "sunxi iommu: irq = %d, %u micro-TLBs\n",
++		 irq, quirks->num_micro_tlbs);
++
++	ret = devm_request_irq(dev, irq, sunxi_iommu_irq, 0,
++			       dev_name(dev), sunxi_iommu);
++	if (ret < 0) {
++		dev_dbg(dev, "Unable to register interrupt handler\n");
++		goto err_irq;
++	}
++
++	sunxi_iommu->irq = irq;
++
++	sunxi_iommu->clk = of_clk_get_by_name(dev->of_node, "iommu");
++	if (IS_ERR(sunxi_iommu->clk)) {
++		sunxi_iommu->clk = NULL;
++		dev_dbg(dev, "Unable to find clock\n");
++		ret = -ENOENT;
++		goto err_clk;
++	}
++	clk_prepare_enable(sunxi_iommu->clk);
++
++	platform_set_drvdata(pdev, sunxi_iommu);
++	sunxi_iommu->dev = dev;
++	spin_lock_init(&sunxi_iommu->iommu_lock);
++	INIT_LIST_HEAD(&sunxi_iommu->rsv_list);
++	global_iommu_dev = sunxi_iommu;
++
++	if (dev->parent)
++		pm_runtime_enable(dev);
++
++	sunxi_iommu_sysfs_create(pdev);
++
++	ret = iommu_device_sysfs_add(&sunxi_iommu->iommu, dev, NULL,
++				     dev_name(dev));
++	if (ret) {
++		dev_err(dev, "Failed to register iommu in sysfs\n");
++		return ret;
++	}
++
++	ret = iommu_device_register(&sunxi_iommu->iommu, &sunxi_iommu_ops,
++				    dev);
++	if (ret) {
++		dev_err(dev, "Failed to register iommu\n");
++		goto err_remove_sysfs;
++	}
++
++	if (!dma_dev)
++		dma_dev = dev;
++
++	return 0;
++
++err_remove_sysfs:
++	iommu_device_sysfs_remove(&sunxi_iommu->iommu);
++err_clk:
++	free_irq(irq, sunxi_iommu);
++err_irq:
++	devm_iounmap(dev, sunxi_iommu->base);
++err_res:
++	kmem_cache_destroy(iopte_cache);
++	dev_err(dev, "Failed to initialize\n");
++
++	return ret;
++}
++
++static void sunxi_iommu_remove(struct platform_device *pdev)
++{
++	struct sunxi_iommu_dev *sunxi_iommu = platform_get_drvdata(pdev);
++	struct iommu_resv_region *entry, *next;
++
++	kmem_cache_destroy(iopte_cache);
++	if (!list_empty(&sunxi_iommu->rsv_list)) {
++		list_for_each_entry_safe(entry, next,
++					 &sunxi_iommu->rsv_list, list)
++			kfree(entry);
++	}
++	free_irq(sunxi_iommu->irq, sunxi_iommu);
++	devm_iounmap(sunxi_iommu->dev, sunxi_iommu->base);
++	sunxi_iommu_sysfs_remove(pdev);
++	iommu_device_sysfs_remove(&sunxi_iommu->iommu);
++	iommu_device_unregister(&sunxi_iommu->iommu);
++	global_iommu_dev = NULL;
++}
++
++static int sunxi_iommu_suspend(struct device *dev)
++{
++	clk_disable_unprepare(global_iommu_dev->clk);
++	return 0;
++}
++
++static int sunxi_iommu_resume(struct device *dev)
++{
++	int err;
++
++	clk_prepare_enable(global_iommu_dev->clk);
++
++	if (unlikely(!global_sunxi_iommu_domain))
++		return 0;
++
++	err = sunxi_tlb_init(global_iommu_owner,
++			     &global_sunxi_iommu_domain->domain);
++	return err;
++}
++
++static const struct dev_pm_ops sunxi_iommu_pm_ops = {
++	.suspend	= sunxi_iommu_suspend,
++	.resume		= sunxi_iommu_resume,
++};
++
++/* ================================================================== */
++/* OF match table                                                      */
++/* ================================================================== */
++static const struct of_device_id sunxi_iommu_dt[] = {
++	/* V1: 6 micro-TLBs, addr+mask invalidation (sun50iw3, sun50iw6) */
++	{ .compatible = "allwinner,sun50i-a63-iommu",
++	  .data = &sun50i_a63_iommu_quirks },
++
++	/* V2: 7 micro-TLBs, addr+mask invalidation (sun8iw15) */
++	{ .compatible = "allwinner,sun8i-a50-iommu",
++	  .data = &sun8i_a50_iommu_quirks },
++
++	/* V3: 7 micro-TLBs, range TLB + single PTW (sun50iw9, sun8iw19, sun50iw10) */
++	{ .compatible = "allwinner,sun50i-h616-iommu",
++	  .data = &sun50i_h616_iommu_quirks },
++
++	/* V4: 7 micro-TLBs, range TLB + range PTW (sun8iw20, sun20iw1, sun50iw12, sun55iw3) */
++	{ .compatible = "allwinner,sun20i-d1-iommu",
++	  .data = &sun20i_d1_iommu_quirks },
++
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(of, sunxi_iommu_dt);
++
++static struct platform_driver sunxi_iommu_driver = {
++	.probe		= sunxi_iommu_probe,
++	.remove		= sunxi_iommu_remove,
++	.driver		= {
++		.owner		= THIS_MODULE,
++		.name		= "sunxi-iommu",
++		.pm		= &sunxi_iommu_pm_ops,
++		.of_match_table	= sunxi_iommu_dt,
++	},
++};
++
++static int __init sunxi_iommu_init(void)
++{
++	return platform_driver_register(&sunxi_iommu_driver);
++}
++
++static void __exit sunxi_iommu_exit(void)
++{
++	platform_driver_unregister(&sunxi_iommu_driver);
++}
++
++subsys_initcall(sunxi_iommu_init);
++module_exit(sunxi_iommu_exit);
++
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/iommu/sunxi-iommu.h b/drivers/iommu/sunxi-iommu.h
+new file mode 100644
+index 000000000..219cfbcc5
+--- /dev/null
++++ b/drivers/iommu/sunxi-iommu.h
+@@ -0,0 +1,291 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Allwinner IOMMU driver - internal structures and register definitions
++ *
++ * Copyright (C) 2016-2018 Allwinner Technology CO., LTD.
++ * Copyright (C) 2024-2025 various contributors
++ */
++
++#ifndef _SUNXI_IOMMU_H_
++#define _SUNXI_IOMMU_H_
++
++#include <linux/bitops.h>
++#include <linux/io.h>
++#include <linux/types.h>
++
++/* ------------------------------------------------------------------ */
++/* Register offsets                                                     */
++/* ------------------------------------------------------------------ */
++#define IOMMU_VERSION_REG		0x0000
++#define IOMMU_RESET_REG			0x0010
++#define IOMMU_ENABLE_REG		0x0020
++#define IOMMU_BYPASS_REG		0x0030
++#define IOMMU_AUTO_GATING_REG		0x0040
++#define IOMMU_WBUF_CTRL_REG		0x0044
++#define IOMMU_OOO_CTRL_REG		0x0048
++#define IOMMU_4KB_BDY_PRT_CTRL_REG	0x004C
++#define IOMMU_TTB_REG			0x0050
++#define IOMMU_TLB_ENABLE_REG		0x0060
++#define IOMMU_TLB_PREFETCH_REG		0x0070
++#define IOMMU_TLB_FLUSH_ENABLE_REG	0x0080
++#define IOMMU_TLB_IVLD_MODE_SEL_REG	0x0084
++#define IOMMU_TLB_IVLD_START_ADDR_REG	0x0088
++#define IOMMU_TLB_IVLD_END_ADDR_REG	0x008C
++#define IOMMU_TLB_IVLD_ADDR_REG	0x0090
++#define IOMMU_TLB_IVLD_ADDR_MASK_REG	0x0094
++#define IOMMU_TLB_IVLD_ENABLE_REG	0x0098
++#define IOMMU_PC_IVLD_MODE_SEL_REG	0x009C
++#define IOMMU_PC_IVLD_ADDR_REG		0x00A0
++#define IOMMU_PC_IVLD_START_ADDR_REG	0x00A4
++#define IOMMU_PC_IVLD_ENABLE_REG	0x00A8
++#define IOMMU_PC_IVLD_END_ADDR_REG	0x00AC
++
++#define IOMMU_DM_AUT_CTRL_REG(n)	(0x00B0 + (n) * 4)	/* n = 0..7 */
++#define IOMMU_DM_AUT_OVWT_REG		0x00D0
++
++/* Interrupt registers */
++#define IOMMU_INT_ENABLE_REG		0x0100
++#define IOMMU_INT_CLR_REG		0x0104
++#define IOMMU_INT_STA_REG		0x0108
++
++/*
++ * Error address / data registers for micro-TLB 0..5 share a common
++ * stride and are identical across all known SoC variants.
++ */
++#define IOMMU_INT_ERR_ADDR_REG(n)	(0x0110 + (n) * 4)	/* n = 0..5 */
++#define IOMMU_INT_ERR_DATA_REG(n)	(0x0150 + (n) * 4)	/* n = 0..5 */
++
++/*
++ * Variants with 7 micro-TLBs insert an extra register pair for micro-TLB 6
++ * at 0x128 / 0x168.  The L1 / L2 page-table error registers always live at
++ * 0x130-0x134 / 0x170-0x174 regardless of the micro-TLB count; the BSP
++ * header used different REG6/REG7/REG8 numbering depending on the SoC which
++ * was confusing — the macros below use semantic names instead.
++ */
++#define IOMMU_INT_ERR_ADDR_UTLB6	0x0128	/* 7-TLB only */
++#define IOMMU_INT_ERR_ADDR_L1		0x0130
++#define IOMMU_INT_ERR_ADDR_L2		0x0134
++
++#define IOMMU_INT_ERR_DATA_UTLB6	0x0168	/* 7-TLB only */
++#define IOMMU_INT_ERR_DATA_L1		0x0170
++#define IOMMU_INT_ERR_DATA_L2		0x0174
++
++#define IOMMU_L1PG_INT_REG		0x0180
++#define IOMMU_L2PG_INT_REG		0x0184
++
++/* Virtual-address debug registers */
++#define IOMMU_VA_REG			0x0190
++#define IOMMU_VA_DATA_REG		0x0194
++#define IOMMU_VA_CONFIG_REG		0x0198
++
++/* ---- PMU registers ------------------------------------------------ */
++#define IOMMU_PMU_ENABLE_REG		0x0200
++#define IOMMU_PMU_CLR_REG		0x0210
++
++/* Per-micro-TLB access / hit counters (n = 0..5 always, 6 on 7-TLB) */
++#define IOMMU_PMU_ACCESS_LOW_REG(n)	(0x0230 + (n) * 0x10)
++#define IOMMU_PMU_ACCESS_HIGH_REG(n)	(0x0234 + (n) * 0x10)
++#define IOMMU_PMU_HIT_LOW_REG(n)	(0x0238 + (n) * 0x10)
++#define IOMMU_PMU_HIT_HIGH_REG(n)	(0x023C + (n) * 0x10)
++
++/* Macro-TLB PMU (same address on 6-TLB and 7-TLB variants) */
++#define IOMMU_PMU_ACCESS_LOW_MACROTLB	0x02D0
++#define IOMMU_PMU_ACCESS_HIGH_MACROTLB	0x02D4
++#define IOMMU_PMU_HIT_LOW_MACROTLB	0x02D8
++#define IOMMU_PMU_HIT_HIGH_MACROTLB	0x02DC
++
++/* PTW-cache PMU (same address on 6-TLB and 7-TLB variants) */
++#define IOMMU_PMU_ACCESS_LOW_PTWCACHE	0x02E0
++#define IOMMU_PMU_ACCESS_HIGH_PTWCACHE	0x02E4
++#define IOMMU_PMU_HIT_LOW_PTWCACHE	0x02E8
++#define IOMMU_PMU_HIT_HIGH_PTWCACHE	0x02EC
++
++/* Per-micro-TLB total / max latency (n = 0..5 always, 6 on 7-TLB) */
++#define IOMMU_PMU_TL_LOW_REG(n)	(0x0300 + (n) * 0x10)
++#define IOMMU_PMU_TL_HIGH_REG(n)	(0x0304 + (n) * 0x10)
++#define IOMMU_PMU_ML_REG(n)		(0x0308 + (n) * 0x10)	/* 7-TLB only */
++
++/* ------------------------------------------------------------------ */
++/* Bit-field helpers                                                    */
++/* ------------------------------------------------------------------ */
++#define IOMMU_RESET_SHIFT	31
++#define IOMMU_RESET_MASK	BIT(IOMMU_RESET_SHIFT)
++#define IOMMU_RESET_SET		(0U << 31)
++#define IOMMU_RESET_RELEASE	(1U << 31)
++#define IOMMU_ENABLE		0x1
++
++/* Micro-TLB interrupt masks */
++#define MICRO_TLB_INVALID_INTER_MASK(n)	BIT(n)		/* n = 0..6 */
++#define L1_PAGETABLE_INVALID_INTER_MASK	BIT(16)
++#define L2_PAGETABLE_INVALID_INTER_MASK	BIT(17)
++
++/* TLB flush masks */
++#define MICRO_TLB_FLUSH_MASK(n)		(((1U << (n)) - 1))
++#define PTW_CACHE_FLUSH_BIT	BIT(16)
++#define MACRO_TLB_FLUSH_BIT	BIT(17)
++
++
++/* ------------------------------------------------------------------ */
++/* Page-table geometry                                                  */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Two-level page table: 4096 first-level (PDE) entries, each pointing
++ * to 256 second-level (PTE) entries.  Only 4 KB pages are supported.
++ *
++ * Virtual Address:
++ *  31              20 | 19        12 | 11     0
++ *  +------------------+-------------+---------+
++ *  |    PDE Index     |  PTE Index  | offset  |
++ *  +------------------+-------------+---------+
++ */
++#define NUM_ENTRIES_PDE		4096
++#define NUM_ENTRIES_PTE		256
++#define PD_SIZE			(NUM_ENTRIES_PDE * sizeof(u32))
++#define PT_SIZE			(NUM_ENTRIES_PTE * sizeof(u32))
++
++#define IOMMU_PD_SHIFT		20
++#define IOMMU_PD_MASK		(~((1UL << IOMMU_PD_SHIFT) - 1))
++#define IOMMU_PT_SHIFT		12
++#define IOMMU_PT_MASK		(~((1UL << IOMMU_PT_SHIFT) - 1))
++#define PAGE_OFFSET_MASK	((1UL << IOMMU_PT_SHIFT) - 1)
++#define IOPTE_BASE_MASK		(~(PT_SIZE - 1))
++
++/* Page Directory Entry control bits */
++#define DENT_VALID		0x01
++#define DENT_PTE_SHIFT		10
++#define DENT_WRITABLE		BIT(3)
++#define DENT_READABLE		BIT(2)
++
++/* Page Table Entry control bits */
++#define SUNXI_PTE_PAGE_WRITABLE	BIT(3)
++#define SUNXI_PTE_PAGE_READABLE	BIT(2)
++#define SUNXI_PTE_PAGE_VALID	BIT(1)
++
++#define IS_VALID(x)		(((x) & 0x03) == DENT_VALID)
++
++#define IOPDE_INDEX(va)		(((va) >> IOMMU_PD_SHIFT) & (NUM_ENTRIES_PDE - 1))
++#define IOPTE_INDEX(va)		(((va) >> IOMMU_PT_SHIFT) & (NUM_ENTRIES_PTE - 1))
++#define IOPTE_BASE(ent)		((ent) & IOPTE_BASE_MASK)
++#define IOPTE_TO_PFN(ent)	((*ent) & IOMMU_PT_MASK)
++#define IOVA_PAGE_OFT(va)	((va) & PAGE_OFFSET_MASK)
++
++#define SPAGE_SIZE		(1 << IOMMU_PT_SHIFT)
++#define SPD_SIZE		(1 << IOMMU_PD_SHIFT)
++#define SPAGE_ALIGN(addr)	ALIGN(addr, SPAGE_SIZE)
++#define SPDE_ALIGN(addr)	ALIGN(addr, SPD_SIZE)
++#define MAX_SG_SIZE		(128 << 20)
++#define MAX_SG_TABLE_SIZE	((MAX_SG_SIZE / SPAGE_SIZE) * sizeof(u32))
++
++/* IO virtual address helpers */
++#define IOVA_START_PFN		1
++#define IOVA_PFN(addr)		((addr) >> PAGE_SHIFT)
++#define DMA_32BIT_PFN		IOVA_PFN(DMA_BIT_MASK(32))
++#define IOVA_4M_ALIGN(iova)	((iova) & (~0x3fffff))
++
++/* Physical address fixup (common to all known Allwinner SoCs) */
++#define SUNXI_PHYS_OFFSET	0x40000000UL
++#define SUNXI_4G_PHYS_OFFSET	0x100000000UL
++
++/* ------------------------------------------------------------------ */
++/* Busy-wait helper                                                     */
++/* ------------------------------------------------------------------ */
++#define sunxi_wait_when(COND, MS) ({				\
++	unsigned long timeout__ = jiffies + msecs_to_jiffies(MS) + 1; \
++	int ret__ = 0;						\
++	while ((COND)) {					\
++		if (time_after(jiffies, timeout__)) {		\
++			ret__ = (!COND) ? 0 : -ETIMEDOUT;	\
++			break;					\
++		}						\
++		udelay(1);					\
++	}							\
++	ret__;							\
++})
++
++/* ------------------------------------------------------------------ */
++/* Per-SoC quirks                                                       */
++/* ------------------------------------------------------------------ */
++#define SUNXI_IOMMU_MAX_MASTERS	7
++
++struct sunxi_iommu_quirks {
++	/* Number of micro-TLBs present in hardware (6 or 7) */
++	u8 num_micro_tlbs;
++
++	/* TLB invalidation uses start/end range (else: addr + mask) */
++	bool tlb_ivld_range;
++
++	/* PTW cache invalidation uses start/end range (else: single addr) */
++	bool ptw_ivld_range;
++
++	/* Hardware has the prefetch-valid fix (bits 16-17 of TLB_PREFETCH) */
++	bool has_prefetch_fix;
++
++	/* Initial value for TLB_PREFETCH_REG */
++	u32 tlb_prefetch_val;
++
++	/* Master device names (one per micro-TLB, for error reporting) */
++	const char *const *master_names;
++};
++
++/* ------------------------------------------------------------------ */
++/* Driver structures                                                    */
++/* ------------------------------------------------------------------ */
++struct sunxi_iommu_dev {
++	struct iommu_device iommu;
++	struct device *dev;
++	void __iomem *base;
++	struct clk *clk;
++	int irq;
++	u32 bypass;
++	spinlock_t iommu_lock;
++	struct list_head rsv_list;
++
++	const struct sunxi_iommu_quirks *quirks;
++
++	/*
++	 * Runtime override: set when DT contains the boolean property
++	 * "allwinner,sun50iw10-iommu-fixed", which indicates the newer
++	 * sun50iw10 IC revision with the prefetch-valid fix.
++	 */
++	bool prefetch_fixed;
++};
++
++struct sunxi_iommu_domain {
++	unsigned int *pgtable;		/* first-level page directory (16 KB) */
++	u32 *sg_buffer;
++	struct mutex dt_lock;		/* protects page-table modifications */
++	struct dma_iommu_mapping *mapping;
++	struct iommu_domain domain;
++	struct list_head mdevs;		/* list of master devices */
++	spinlock_t lock;
++};
++
++struct sunxi_mdev {
++	struct list_head node;
++	struct device *dev;
++	unsigned int tlbid;
++	bool flag;
++};
++
++struct sunxi_iommu_owner {
++	unsigned int tlbid;
++	bool flag;
++	struct sunxi_iommu_dev *data;
++	struct device *dev;
++	struct dma_iommu_mapping *mapping;
++};
++
++/* ------------------------------------------------------------------ */
++/* Exported helpers (used by other BSP drivers)                         */
++/* ------------------------------------------------------------------ */
++void sunxi_reset_device_iommu(unsigned int master_id);
++void sunxi_enable_device_iommu(unsigned int master_id, bool enable);
++int sunxi_iova_test_write(dma_addr_t iova, u32 val);
++unsigned long sunxi_iova_test_read(dma_addr_t iova);
++void sunxi_set_debug_mode(void);
++void sunxi_set_prefetch_mode(void);
++ssize_t sunxi_iommu_dump_pgtable(char *buf, size_t buf_len);
++extern struct iommu_domain *global_iommu_domain;
++
++#endif /* _SUNXI_IOMMU_H_ */

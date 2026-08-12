@@ -1,0 +1,1107 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 10/13] drm/sun4i: support indexed (C8) layers on the D1/T113
+ DE2
+
+The D1/T113 generation of DE2 can treat a UI layer's framebuffer as
+indices into a 256-entry ARGB8888 palette, which quarters the scanout
+bandwidth and the buffer size against ARGB8888 and gives every index its
+own alpha. Neither the DE2.0 spec nor the D1-H manual documents the
+registers -- the spec predates the feature and the manual only lists
+"palette" among the input formats -- so the following was established by
+poking the hardware and watching the panel:
+
+  - layer attribute FBFMT 27 (0x1b) selects 8-bit indices;
+  - the palette RAM is 256 words at channel base + 0x400, ARGB8888;
+  - it is write-only, always reading back as zero;
+  - attribute bit 3 opens the CPU's write port to it. It is a
+    channel-level switch living in overlay 0's word, and it gates writes
+    only: leaving it set disturbs neither indexed nor ordinary scanout;
+  - writes are also dropped unless that overlay is enabled -- and the
+    enable that counts is the one the last dbuff cycle *latched*, not
+    what a commit just put in the shadow registers. A readback cannot
+    tell the two apart (it returns the shadow value), and with the RAM
+    write-only a swallowed upload is undetectable after the fact. This
+    is presumably why the vendor driver only ever touches the RAM from
+    its vsync-synchronised update path.
+
+Since the palette belongs to the channel and not to any one plane -- the
+four UI overlays index the same table -- it is a device attribute rather
+than a plane property, which also means four planes sharing one table is
+simply what the hardware is, not a conflict to arbitrate. Userspace
+writes 1024 bytes of little-endian ARGB8888 to
+
+  /sys/devices/platform/soc/5100000.mixer/palette
+
+The latched-enable gating dictates the vendor BSP's structure: a single
+writer. Writes to the sysfs file only update a shadow copy (which also
+answers reads) and mark it dirty; every hardware access happens in
+sun8i_mixer_commit(), where the atomic framework's stall on the previous
+commit's flip_done guarantees that "overlay 0 was enabled going into
+this commit" is exactly "the write port is open now". The commit that
+turns the overlay on therefore cannot land the upload itself -- writing
+palette-then-enable in one go, which is the natural userspace order,
+used to lose the palette right here -- so the upload stays pending and a
+worker replays it by running an empty atomic commit once the enable has
+latched. The worker never touches the hardware directly either: firing
+dbuff from outside the commit path can latch a concurrent commit's
+half-programmed frame.
+
+C8 is offered only where sun8i_layer_cfg.has_palette says the hardware
+has it: the vendor driver enables this for sun20i/sun8iw20 alone, so the
+older DE2 SoCs must not advertise it even though they share de_type.
+Scaling an indexed layer is refused -- an interpolated index is an
+unrelated colour rather than an intermediate one.
+---
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index b33fc0f10..f93be6208 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -9,6 +9,9 @@
+ 
+ #include <linux/component.h>
+ #include <linux/dma-mapping.h>
++#include <linux/io.h>
++#include <linux/sysfs.h>
++#include <linux/unaligned.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+@@ -23,6 +26,7 @@
+ #include <drm/drm_gem_dma_helper.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
+ 
+ #include "sun4i_drv.h"
+ #include "sun8i_mixer.h"
+@@ -236,6 +240,14 @@ static const struct de2_fmt_info de2_formats[] = {
+ 		.drm_fmt = DRM_FORMAT_P210,
+ 		.de2_fmt = SUN8I_MIXER_FBFMT_P210_YUV,
+ 	},
++	{
++		/*
++		 * Reachable only where sun8i_layer_cfg.has_palette let the
++		 * plane advertise C8 in the first place.
++		 */
++		.drm_fmt = DRM_FORMAT_C8,
++		.de2_fmt = SUN8I_MIXER_FBFMT_PALETTE8,
++	},
+ };
+ 
+ int sun8i_mixer_drm_format_to_hw(u32 format, u32 *hw_format)
+@@ -251,6 +263,330 @@ int sun8i_mixer_drm_format_to_hw(u32 format, u32 *hw_format)
+ 	return -EINVAL;
+ }
+ 
++static bool sun8i_mixer_has_palette(struct sun8i_mixer *mixer)
++{
++	/*
++	 * Only the first UI channel is wired up: nothing with a palette has
++	 * more than one, and the VI channels' own palettes are untried.
++	 */
++	return mixer->cfg->lay_cfg.has_palette && mixer->cfg->ui_num == 1;
++}
++
++/*
++ * How long a staged palette may sit before palette_work forces a commit for
++ * it. An app that pairs a palette write with its own commit gets that long
++ * to make the swap ride its frame; a bare sysfs writer is delayed by this
++ * much, which does not matter.
++ */
++#define SUN8I_MIXER_PALETTE_WORK_DELAY	msecs_to_jiffies(20)
++
++/*
++ * Journal a register write for the vblank interrupt to perform. See the
++ * comment at struct sun8i_mixer::stage -- the D1 has no working register
++ * double buffering, so a write from process context lands mid-scanout and
++ * tears the frame. A later write to the same offset just replaces the
++ * journaled value.
++ *
++ * Writes go into the build journal first, which only the (per-CRTC
++ * serialised) commit path touches, so no lock is needed here. The commit
++ * hands the finished set over as one atomic merge in stage_arm() -- the
++ * interrupt must never see a commit's writes piecemeal: it can fire
++ * between two plane updates, and flushing that half-built state programs
++ * inconsistent geometry the DE can hang on.
++ */
++void sun8i_mixer_stage_write(struct sun8i_mixer *mixer, u32 offset, u32 value)
++{
++	unsigned int i;
++
++	for (i = 0; i < mixer->build_n; i++)
++		if (mixer->build[i].offset == offset)
++			break;
++
++	if (i == mixer->build_n) {
++		if (WARN_ON_ONCE(i >= SUN8I_MIXER_STAGE_MAX)) {
++			/* Overflow: a torn frame beats a lost write. */
++			regmap_write(mixer->engine.regs, offset, value);
++			return;
++		}
++		mixer->build[i].offset = offset;
++		mixer->build_n++;
++	}
++	mixer->build[i].value = value;
++}
++
++/* Look up a journaled write, newest first, for checks against pending state. */
++bool sun8i_mixer_stage_peek(struct sun8i_mixer *mixer, u32 offset, u32 *value)
++{
++	unsigned long flags;
++	unsigned int i;
++	bool hit = false;
++
++	for (i = 0; i < mixer->build_n; i++)
++		if (mixer->build[i].offset == offset) {
++			*value = mixer->build[i].value;
++			return true;
++		}
++
++	spin_lock_irqsave(&mixer->palette_hw_lock, flags);
++	for (i = 0; i < mixer->stage_n; i++)
++		if (mixer->stage[i].offset == offset) {
++			*value = mixer->stage[i].value;
++			hit = true;
++			break;
++		}
++	spin_unlock_irqrestore(&mixer->palette_hw_lock, flags);
++
++	return hit;
++}
++
++/* Caller holds palette_hw_lock. */
++static void sun8i_mixer_stage_merge(struct sun8i_mixer *mixer)
++{
++	unsigned int i, j;
++
++	for (i = 0; i < mixer->build_n; i++) {
++		for (j = 0; j < mixer->stage_n; j++)
++			if (mixer->stage[j].offset == mixer->build[i].offset)
++				break;
++		if (j == mixer->stage_n) {
++			if (WARN_ON_ONCE(j >= SUN8I_MIXER_STAGE_MAX))
++				continue;
++			mixer->stage[j].offset = mixer->build[i].offset;
++			mixer->stage_n++;
++		}
++		mixer->stage[j].value = mixer->build[i].value;
++	}
++	mixer->build_n = 0;
++}
++
++/* Caller holds palette_hw_lock (or the display is not scanning out). */
++static void sun8i_mixer_stage_flush(struct sun8i_mixer *mixer)
++{
++	unsigned int i;
++
++	for (i = 0; i < mixer->stage_n; i++)
++		writel(mixer->stage[i].value,
++		       mixer->palette_regs + mixer->stage[i].offset);
++	mixer->stage_n = 0;
++}
++
++/*
++ * Publish the commit's build journal to the interrupt side in one go and
++ * arm the flush. Falls back to writing directly when the CRTC cannot
++ * deliver an interrupt -- then nothing is being scanned out and there is
++ * no frame to tear.
++ */
++static void sun8i_mixer_stage_arm(struct sun8i_mixer *mixer,
++				  struct drm_crtc *crtc)
++{
++	unsigned long flags;
++	bool armed = false;
++
++	if (!mixer->build_n)
++		return;
++
++	if (drm_crtc_vblank_get(crtc) == 0) {
++		spin_lock_irqsave(&mixer->palette_hw_lock, flags);
++		sun8i_mixer_stage_merge(mixer);
++		if (mixer->stage_pending)
++			armed = true;	/* previous arm's reference stands */
++		else
++			mixer->stage_pending = true;
++		mixer->stage_crtc = crtc;
++		spin_unlock_irqrestore(&mixer->palette_hw_lock, flags);
++
++		/* The quirk puts exactly one reference per flush. */
++		if (armed)
++			drm_crtc_vblank_put(crtc);
++	} else {
++		spin_lock_irqsave(&mixer->palette_hw_lock, flags);
++		sun8i_mixer_stage_merge(mixer);
++		sun8i_mixer_stage_flush(mixer);
++		spin_unlock_irqrestore(&mixer->palette_hw_lock, flags);
++	}
++}
++
++/*
++ * Perform an armed palette upload from the TCON vblank interrupt.
++ *
++ * The palette RAM is the one thing a commit touches that is not latched by
++ * dbuff: writes take effect the moment they land. Writing it from process
++ * context therefore races the scanout -- the write can overlap the active
++ * area and corrupt that frame's palette fetches for *every* overlay
++ * sharing the channel (one grey frame), and even a clean write recolours
++ * the frame that is already on screen rather than the one the commit is
++ * building. At the vblank interrupt the frame has been fully pushed out to
++ * the panel, so this is the only spot where the RAM can be rewritten
++ * without a visible artefact -- the same "safe zone" the BSP uses in
++ * sync_event_proc().
++ *
++ * The mixer regmap locks with a mutex, so the upload uses the raw mapping.
++ * The access bit is read-modify-written one step at a time to keep the
++ * window where a concurrent regmap write to ATTR could be clobbered as
++ * small as possible (the ATTR readback returns the shadow register).
++ */
++static void sun8i_mixer_vblank_quirk(struct sunxi_engine *engine)
++{
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++	struct drm_crtc *crtc = NULL, *stage_crtc = NULL;
++	void __iomem *attr_reg, *pal_reg;
++	unsigned int i;
++	u32 ch_base;
++
++	spin_lock(&mixer->palette_hw_lock);
++
++	/*
++	 * The journal goes first: it carries the overlay attributes this
++	 * commit decided on, and the palette write port is gated by overlay
++	 * 0's live EN bit.
++	 */
++	if (mixer->stage_pending) {
++		sun8i_mixer_stage_flush(mixer);
++		mixer->stage_pending = false;
++		stage_crtc = mixer->stage_crtc;
++	}
++
++	if (mixer->palette_pending) {
++		/* The UI channels follow the VI ones. */
++		ch_base = DE2_CH_BASE + mixer->cfg->vi_num * DE2_CH_SIZE;
++		attr_reg = mixer->palette_regs +
++			   SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, 0);
++		pal_reg = mixer->palette_regs +
++			  SUN8I_MIXER_CHAN_UI_PALETTE(ch_base);
++
++		/* The write window needs a fresh rising edge every time. */
++		writel(readl(attr_reg) &
++		       ~SUN8I_MIXER_CHAN_UI_LAYER_ATTR_PALETTE_ACCESS,
++		       attr_reg);
++		writel(readl(attr_reg) |
++		       SUN8I_MIXER_CHAN_UI_LAYER_ATTR_PALETTE_ACCESS,
++		       attr_reg);
++
++		for (i = 0; i < SUN8I_MIXER_PALETTE_ENTRIES; i++)
++			writel(mixer->palette_hw[i], pal_reg + 4 * i);
++
++		writel(readl(attr_reg) &
++		       ~SUN8I_MIXER_CHAN_UI_LAYER_ATTR_PALETTE_ACCESS,
++		       attr_reg);
++
++		mixer->palette_pending = false;
++		crtc = mixer->palette_crtc;
++	}
++
++	spin_unlock(&mixer->palette_hw_lock);
++
++	/* Drop the references the arming commits took to keep the IRQ on. */
++	if (stage_crtc)
++		drm_crtc_vblank_put(stage_crtc);
++	if (crtc)
++		drm_crtc_vblank_put(crtc);
++}
++
++/*
++ * Arm a palette upload for the vblank interrupt to perform, so that it
++ * lands in the same safe zone where this commit's dbuff-latched state takes
++ * effect instead of racing the scanout (see sun8i_mixer_vblank_quirk).
++ *
++ * The RAM only accepts writes while overlay 0's *live* EN bit is set --
++ * with the layer off they are silently dropped, and the RAM cannot be
++ * read back to check. The commit that brings the layer up journals the
++ * EN write, and the interrupt flushes the journal before the upload, so
++ * by the time the upload runs the port is open; palette_work replaying
++ * through a second commit remains as a belt-and-braces fallback.
++ */
++static void sun8i_mixer_palette_arm(struct sun8i_mixer *mixer,
++				    struct drm_crtc *crtc)
++{
++	unsigned long flags;
++	u32 ch_base, attr;
++	bool enabled, armed = false;
++
++	lockdep_assert_held(&mixer->palette_lock);
++
++	/* The UI channels follow the VI ones. */
++	ch_base = DE2_CH_BASE + mixer->cfg->vi_num * DE2_CH_SIZE;
++
++	/*
++	 * A journaled ATTR is what the interrupt will have written by the
++	 * time the upload runs, so it beats the live register.
++	 */
++	if (!sun8i_mixer_stage_peek(mixer,
++				    SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, 0),
++				    &attr))
++		regmap_read(mixer->engine.regs,
++			    SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, 0), &attr);
++	enabled = attr & SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN;
++
++	if (mixer->palette_dirty && enabled &&
++	    drm_crtc_vblank_get(crtc) == 0) {
++		spin_lock_irqsave(&mixer->palette_hw_lock, flags);
++		memcpy(mixer->palette_hw, mixer->palette,
++		       sizeof(mixer->palette_hw));
++		if (mixer->palette_pending)
++			armed = true;	/* previous arm's reference stands */
++		else
++			mixer->palette_pending = true;
++		spin_unlock_irqrestore(&mixer->palette_hw_lock, flags);
++
++		/* The quirk puts exactly one reference per upload. */
++		if (armed)
++			drm_crtc_vblank_put(crtc);
++
++		if (mixer->palette_live)
++			mixer->palette_dirty = false;
++		else
++			schedule_delayed_work(&mixer->palette_work,
++					      SUN8I_MIXER_PALETTE_WORK_DELAY);
++	}
++
++	mixer->palette_live = enabled;
++}
++
++/*
++ * Provide a commit for a staged palette when nobody else does: an empty
++ * atomic commit serialises against every other committer and arms the
++ * upload the ordinary way. Runs delayed so that an app which follows its
++ * palette write with a real commit wins the race and finds nothing left to
++ * do here -- its own commit is the one the swap should ride.
++ */
++static void sun8i_mixer_palette_work(struct work_struct *work)
++{
++	struct sun8i_mixer *mixer =
++		container_of(work, struct sun8i_mixer, palette_work.work);
++	struct drm_modeset_acquire_ctx ctx;
++	struct drm_atomic_state *state;
++	struct drm_crtc *crtc;
++	int ret;
++
++	mutex_lock(&mixer->palette_lock);
++	crtc = mixer->palette_dirty && mixer->palette_live ?
++	       mixer->palette_crtc : NULL;
++	mutex_unlock(&mixer->palette_lock);
++
++	if (!crtc)
++		return;
++
++	state = drm_atomic_state_alloc(crtc->dev);
++	if (!state)
++		return;
++
++	drm_modeset_acquire_init(&ctx, 0);
++	state->acquire_ctx = &ctx;
++retry:
++	ret = PTR_ERR_OR_ZERO(drm_atomic_get_crtc_state(state, crtc));
++	if (!ret)
++		ret = drm_atomic_commit(state);
++	if (ret == -EDEADLK) {
++		drm_atomic_state_clear(state);
++		drm_modeset_backoff(&ctx);
++		goto retry;
++	}
++
++	drm_atomic_state_put(state);
++	drm_modeset_drop_locks(&ctx);
++	drm_modeset_acquire_fini(&ctx);
++}
++
+ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 			       struct drm_crtc *crtc,
+ 			       struct drm_atomic_state *state)
+@@ -368,6 +704,17 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		route |= i << SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(zpos);
+ 		pipe_en |= SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
+ 
++		if (ui_ovl > 1) {
++			/* No double buffering here: journal for the vblank. */
++			sun8i_mixer_stage_write(mixer,
++				SUN8I_MIXER_BLEND_ATTR_COORD(bld_base, zpos),
++				SUN8I_MIXER_COORD(c->x1, c->y1));
++			sun8i_mixer_stage_write(mixer,
++				SUN8I_MIXER_BLEND_ATTR_INSIZE(bld_base, zpos),
++				SUN8I_MIXER_SIZE(w, h));
++			continue;
++		}
++
+ 		regmap_write(bld_regs,
+ 			     SUN8I_MIXER_BLEND_ATTR_COORD(bld_base, zpos),
+ 			     SUN8I_MIXER_COORD(c->x1, c->y1));
+@@ -376,9 +723,35 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 			     SUN8I_MIXER_SIZE(w, h));
+ 	}
+ 
+-	regmap_write(bld_regs, SUN8I_MIXER_BLEND_ROUTE(bld_base), route);
+-	regmap_write(bld_regs, SUN8I_MIXER_BLEND_PIPE_CTL(bld_base),
+-		     pipe_en | SUN8I_MIXER_BLEND_PIPE_CTL_FC_EN(0));
++	if (ui_ovl > 1) {
++		sun8i_mixer_stage_write(mixer,
++					SUN8I_MIXER_BLEND_ROUTE(bld_base),
++					route);
++		sun8i_mixer_stage_write(mixer,
++					SUN8I_MIXER_BLEND_PIPE_CTL(bld_base),
++					pipe_en |
++					SUN8I_MIXER_BLEND_PIPE_CTL_FC_EN(0));
++	} else {
++		regmap_write(bld_regs, SUN8I_MIXER_BLEND_ROUTE(bld_base),
++			     route);
++		regmap_write(bld_regs, SUN8I_MIXER_BLEND_PIPE_CTL(bld_base),
++			     pipe_en | SUN8I_MIXER_BLEND_PIPE_CTL_FC_EN(0));
++	}
++
++	/*
++	 * The layer attributes are in place by now, so a staged palette can
++	 * be armed for the vblank interrupt alongside this commit's dbuff.
++	 */
++	if (sun8i_mixer_has_palette(mixer)) {
++		mutex_lock(&mixer->palette_lock);
++		mixer->palette_crtc = crtc;
++		sun8i_mixer_palette_arm(mixer, crtc);
++		mutex_unlock(&mixer->palette_lock);
++	}
++
++	/* Everything this commit journaled lands at the next vblank. */
++	if (ui_ovl > 1)
++		sun8i_mixer_stage_arm(mixer, crtc);
+ 
+ 	if (mixer->cfg->de_type != SUN8I_MIXER_DE33)
+ 		regmap_write(engine->regs, SUN8I_MIXER_GLOBAL_DBUFF,
+@@ -432,6 +805,7 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ 			return ERR_CAST(layer);
+ 		}
+ 
++		layer->mixer = mixer;
+ 		planes[i] = &layer->plane;
+ 	}
+ 
+@@ -461,6 +835,7 @@ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+ 			return ERR_CAST(layer);
+ 		}
+ 
++		layer->mixer = mixer;
+ 		planes[index] = &layer->plane;
+ 	}
+ 
+@@ -505,6 +880,7 @@ static void sun8i_mixer_mode_set(struct sunxi_engine *engine,
+ static const struct sunxi_engine_ops sun8i_engine_ops = {
+ 	.commit		= sun8i_mixer_commit,
+ 	.layers_init	= sun8i_layers_init,
++	.vblank_quirk	= sun8i_mixer_vblank_quirk,
+ 	.mode_set	= sun8i_mixer_mode_set,
+ };
+ 
+@@ -596,6 +972,70 @@ static void sun8i_mixer_init(struct sun8i_mixer *mixer)
+ 			   SUN8I_MIXER_BLEND_PIPE_CTL_EN_MSK, 0);
+ }
+ 
++/*
++ * A UI channel owns 256 ARGB8888 entries that all of its overlays index
++ * into, so the palette belongs to the channel and not to any one plane --
++ * which is why this is a device attribute rather than a plane property, and
++ * why four planes sharing one table is the honest picture rather than a
++ * conflict to arbitrate.
++ *
++ * Reads come from the shadow copy: the RAM itself always reads back zero.
++ */
++static ssize_t sun8i_mixer_palette_read(struct file *file,
++					struct kobject *kobj,
++					const struct bin_attribute *attr,
++					char *buf, loff_t off, size_t count)
++{
++	struct sun8i_mixer *mixer = dev_get_drvdata(kobj_to_dev(kobj));
++
++	mutex_lock(&mixer->palette_lock);
++	memcpy(buf, (u8 *)mixer->palette + off, count);
++	mutex_unlock(&mixer->palette_lock);
++
++	return count;
++}
++
++static ssize_t sun8i_mixer_palette_write(struct file *file,
++					 struct kobject *kobj,
++					 const struct bin_attribute *attr,
++					 char *buf, loff_t off, size_t count)
++{
++	struct sun8i_mixer *mixer = dev_get_drvdata(kobj_to_dev(kobj));
++	bool live;
++	size_t i;
++
++	if ((off | count) & 3)
++		return -EINVAL;
++
++	mutex_lock(&mixer->palette_lock);
++
++	for (i = 0; i < count; i += 4)
++		mixer->palette[(off + i) / 4] = get_unaligned_le32(buf + i);
++	mixer->palette_dirty = true;
++	live = mixer->palette_live;
++
++	mutex_unlock(&mixer->palette_lock);
++
++	/*
++	 * Staging only: the commit path owns the hardware. With a layer
++	 * already up nothing else may commit for a while, so ask for one --
++	 * delayed, so a commit of the writer's own can claim the swap first.
++	 * With everything off the enabling commit will pick it up anyway.
++	 */
++	if (live)
++		schedule_delayed_work(&mixer->palette_work,
++				      SUN8I_MIXER_PALETTE_WORK_DELAY);
++
++	return count;
++}
++
++static const struct bin_attribute sun8i_mixer_palette_attr = {
++	.attr	= { .name = "palette", .mode = 0644 },
++	.size	= SUN8I_MIXER_PALETTE_ENTRIES * 4,
++	.read	= sun8i_mixer_palette_read,
++	.write	= sun8i_mixer_palette_write,
++};
++
+ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 			      void *data)
+ {
+@@ -667,6 +1107,9 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 		return PTR_ERR(mixer->engine.regs);
+ 	}
+ 
++	/* The vblank palette upload cannot take the regmap's mutex. */
++	mixer->palette_regs = regs;
++
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE33) {
+ 		regs = devm_platform_ioremap_resource_byname(pdev, "top");
+ 		if (IS_ERR(regs))
+@@ -760,6 +1203,18 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 
+ 	sun8i_mixer_init(mixer);
+ 
++	/* Also guards the staged-write journal, palette or not. */
++	spin_lock_init(&mixer->palette_hw_lock);
++
++	if (sun8i_mixer_has_palette(mixer)) {
++		mutex_init(&mixer->palette_lock);
++		INIT_DELAYED_WORK(&mixer->palette_work,
++				  sun8i_mixer_palette_work);
++		if (sysfs_create_bin_file(&dev->kobj,
++					  &sun8i_mixer_palette_attr))
++			dev_warn(dev, "Couldn't add palette attribute\n");
++	}
++
+ 	return 0;
+ 
+ err_disable_bus_clk:
+@@ -774,6 +1229,11 @@ static void sun8i_mixer_unbind(struct device *dev, struct device *master,
+ {
+ 	struct sun8i_mixer *mixer = dev_get_drvdata(dev);
+ 
++	if (sun8i_mixer_has_palette(mixer)) {
++		sysfs_remove_bin_file(&dev->kobj, &sun8i_mixer_palette_attr);
++		cancel_delayed_work_sync(&mixer->palette_work);
++	}
++
+ 	list_del(&mixer->engine.list);
+ 
+ 	clk_disable_unprepare(mixer->mod_clk);
+@@ -891,6 +1351,7 @@ static const struct sun8i_mixer_cfg sun20i_d1_mixer0_cfg = {
+ 		.scaler_mask	= 0x3,
+ 		.scanline_yuv	= 2048,
+ 		.de2_fcc_alpha	= 1,
++		.has_palette	= 1,
+ 		/*
+ 		 * Only two channels here, so without this a compositor gets two
+ 		 * planes total. Splitting the UI channel into its four overlays
+@@ -912,6 +1373,8 @@ static const struct sun8i_mixer_cfg sun20i_d1_mixer1_cfg = {
+ 		.scaler_mask	= 0x1,
+ 		.scanline_yuv	= 1024,
+ 		.de2_fcc_alpha	= 1,
++		/* No UI channel here, so nothing can reach the palette yet. */
++		.has_palette	= 1,
+ 	},
+ 	.de_type	= SUN8I_MIXER_DE2,
+ 	.mod_rate	= 297000000,
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+index 8b43182f9..f26537715 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -7,8 +7,11 @@
+ #define _SUN8I_MIXER_H_
+ 
+ #include <linux/clk.h>
++#include <linux/mutex.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
+ #include <drm/drm_plane.h>
+ 
+ #include "sunxi_engine.h"
+@@ -105,6 +108,18 @@
+ #define SUN8I_MIXER_FBFMT_RGBA1010102	22
+ #define SUN8I_MIXER_FBFMT_BGRA1010102	23
+ 
++/*
++ * Indexed formats, 24..27 being 1/2/4/8 bits per pixel. Only the D1/T113
++ * generation of DE2 has them (the vendor driver gates them on SUN20IW1 and
++ * SUN8IW20), which is what sun8i_layer_cfg.has_palette selects. The 8-bit
++ * one is the only one wired up: below a byte per pixel the vendor code
++ * still computes addresses as if pixels were bytes, so its cropping is
++ * wrong and there is nothing to copy from.
++ */
++#define SUN8I_MIXER_FBFMT_PALETTE8	27
++
++#define SUN8I_MIXER_PALETTE_ENTRIES	256
++
+ #define SUN8I_MIXER_FBFMT_YUYV		0
+ #define SUN8I_MIXER_FBFMT_UYVY		1
+ #define SUN8I_MIXER_FBFMT_YVYU		2
+@@ -191,6 +206,7 @@ struct sun8i_layer_cfg {
+ 	unsigned int	de_type;
+ 	unsigned int	scanline_yuv;
+ 	unsigned int	de2_fcc_alpha : 1;
++	unsigned int	has_palette : 1;
+ 	int		ui_ovl_num;
+ };
+ 
+@@ -214,6 +230,17 @@ struct sun8i_mixer_cfg {
+ 	unsigned int		map[6];
+ };
+ 
++/*
++ * Enough for four UI overlays, a VI channel's worth of planes and the
++ * blender in one commit.
++ */
++#define SUN8I_MIXER_STAGE_MAX		96
++
++struct sun8i_staged_write {
++	u32	offset;
++	u32	value;
++};
++
+ struct sun8i_mixer {
+ 	struct sunxi_engine		engine;
+ 
+@@ -226,6 +253,69 @@ struct sun8i_mixer {
+ 
+ 	struct regmap			*top_regs;
+ 	struct regmap			*disp_regs;
++
++	/*
++	 * Shadow of the UI channel's palette RAM. The RAM is write-only --
++	 * it always reads back as zero -- so this is the only way to answer
++	 * a read, and it is also what gets replayed into the hardware once a
++	 * layer is up to accept it.
++	 *
++	 * The write port is gated on overlay 0's EN as *latched by dbuff*,
++	 * not the value just put in the shadow registers -- and reading the
++	 * attribute back only returns the shadow, so the latched state has
++	 * to be tracked in software: palette_live is overlay 0's EN as the
++	 * last finished commit latched it.
++	 *
++	 * The RAM itself is written from the TCON vblank interrupt only
++	 * (sun8i_mixer_vblank_quirk): unlike everything else a commit
++	 * touches it is not behind dbuff, so a write from process context
++	 * can land while the scanout is fetching palette entries and wreck
++	 * the frame for every plane sharing the channel. A commit merely
++	 * *arms* an upload; palette_work only provides a commit when nobody
++	 * else does. Everything under palette_hw_lock belongs to the
++	 * interrupt side.
++	 */
++	struct mutex			palette_lock;
++	struct delayed_work		palette_work;
++	struct drm_crtc			*palette_crtc;
++	bool				palette_live;
++	bool				palette_dirty;
++	u32				palette[SUN8I_MIXER_PALETTE_ENTRIES];
++
++	spinlock_t			palette_hw_lock;
++	void __iomem			*palette_regs;
++	bool				palette_pending;
++	u32				palette_hw[SUN8I_MIXER_PALETTE_ENTRIES];
++
++	/*
++	 * Journal of register writes staged for the vblank interrupt.
++	 *
++	 * The D1's DE2 has no working register double buffering: despite the
++	 * GLOBAL_DBUFF register being there, every write lands live (verified
++	 * by poking overlay EN/COORD over /dev/mem mid-scanout -- the change
++	 * is immediate and the frame tears). The BSP is built around the same
++	 * fact: it writes hardware only from the vsync interrupt's "safe
++	 * period". So with several overlays per UI channel in play, anything
++	 * the scanout can see -- overlay and VI plane attributes, geometry,
++	 * the blender setup -- is journaled here by the commit and replayed
++	 * by sun8i_mixer_vblank_quirk() inside the blanking, ahead of a
++	 * pending palette upload so the palette's EN gate is already up to
++	 * date.
++	 *
++	 * Two-level: the commit path fills build[] (safe unlocked, commits
++	 * are serialised per CRTC) and publishes it to stage[] as one atomic
++	 * merge when it arms the flush. The interrupt only ever sees whole
++	 * commits -- flushing a commit's writes piecemeal would program
++	 * inconsistent geometry, which can hang the DE outright (no more
++	 * frames pushed, no more TRI_FINISH, flip_done times out). stage[]
++	 * and the flags belong to palette_hw_lock's interrupt side.
++	 */
++	struct drm_crtc			*stage_crtc;
++	bool				stage_pending;
++	unsigned int			build_n;
++	struct sun8i_staged_write	build[SUN8I_MIXER_STAGE_MAX];
++	unsigned int			stage_n;
++	struct sun8i_staged_write	stage[SUN8I_MIXER_STAGE_MAX];
+ };
+ 
+ enum {
+@@ -241,6 +331,7 @@ struct sun8i_layer {
+ 	int				overlay;
+ 	struct regmap			*regs;
+ 	const struct sun8i_layer_cfg	*cfg;
++	struct sun8i_mixer		*mixer;
+ };
+ 
+ static inline struct sun8i_layer *
+@@ -280,4 +371,6 @@ sun8i_channel_base(struct sun8i_layer *layer)
+ }
+ 
+ int sun8i_mixer_drm_format_to_hw(u32 format, u32 *hw_format);
++void sun8i_mixer_stage_write(struct sun8i_mixer *mixer, u32 offset, u32 value);
++bool sun8i_mixer_stage_peek(struct sun8i_mixer *mixer, u32 offset, u32 *value);
+ #endif /* _SUN8I_MIXER_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+index e07be1032..05ff64646 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+@@ -26,12 +26,27 @@
+ #include "sun8i_ui_scaler.h"
+ #include "sun8i_vi_scaler.h"
+ 
++/*
++ * With several overlays exposed per channel (D1) the hardware has no working
++ * register double buffering, so writes the scanout can see are journaled and
++ * performed inside the vblank by sun8i_mixer_vblank_quirk(). The historical
++ * one-plane-per-channel targets keep the direct write and their dbuff.
++ */
++static void sun8i_ui_layer_write(struct sun8i_layer *layer, u32 offset,
++				 u32 value)
++{
++	if (layer->cfg->ui_ovl_num > 1)
++		sun8i_mixer_stage_write(layer->mixer, offset, value);
++	else
++		regmap_write(layer->regs, offset, value);
++}
++
+ static void sun8i_ui_layer_disable(struct sun8i_layer *layer)
+ {
+ 	u32 ch_base = sun8i_channel_base(layer);
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, layer->overlay), 0);
++	sun8i_ui_layer_write(layer,
++			     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, layer->overlay), 0);
+ }
+ 
+ static void sun8i_ui_layer_update_attributes(struct sun8i_layer *layer,
+@@ -52,8 +67,8 @@ static void sun8i_ui_layer_update_attributes(struct sun8i_layer *layer,
+ 	val |= hw_fmt << SUN8I_MIXER_CHAN_UI_LAYER_ATTR_FBFMT_OFFSET;
+ 	val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN;
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, layer->overlay), val);
++	sun8i_ui_layer_write(layer,
++			     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, layer->overlay), val);
+ }
+ 
+ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+@@ -75,6 +90,14 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ 	dst_w = drm_rect_width(&state->dst);
+ 	dst_h = drm_rect_height(&state->dst);
+ 
++	if (layer->cfg->ui_ovl_num > 1) {
++		/* Let the channel window clip the right and bottom edges. */
++		if (state->crtc_x >= 0)
++			src_w = state->src_w >> 16;
++		if (state->crtc_y >= 0)
++			src_h = state->src_h >> 16;
++	}
++
+ 	hphase = state->src.x1 & 0xffff;
+ 	vphase = state->src.y1 & 0xffff;
+ 
+@@ -85,9 +108,9 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ 	DRM_DEBUG_DRIVER("Layer source offset X: %d Y: %d\n",
+ 			 state->src.x1 >> 16, state->src.y1 >> 16);
+ 	DRM_DEBUG_DRIVER("Layer source size W: %d H: %d\n", src_w, src_h);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_SIZE(ch_base, layer->overlay),
+-		     insize);
++	sun8i_ui_layer_write(layer,
++			     SUN8I_MIXER_CHAN_UI_LAYER_SIZE(ch_base, layer->overlay),
++			     insize);
+ 
+ 	if (layer->cfg->ui_ovl_num > 1) {
+ 		/*
+@@ -151,15 +174,15 @@ static void sun8i_ui_layer_update_buffer(struct sun8i_layer *layer,
+ 
+ 	/* Set the line width */
+ 	DRM_DEBUG_DRIVER("Layer line width: %d bytes\n", fb->pitches[0]);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_PITCH(ch_base, layer->overlay),
+-		     fb->pitches[0]);
++	sun8i_ui_layer_write(layer,
++			     SUN8I_MIXER_CHAN_UI_LAYER_PITCH(ch_base, layer->overlay),
++			     fb->pitches[0]);
+ 
+ 	DRM_DEBUG_DRIVER("Setting buffer address to %pad\n", &dma_addr);
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_TOP_LADDR(ch_base, layer->overlay),
+-		     lower_32_bits(dma_addr));
++	sun8i_ui_layer_write(layer,
++			     SUN8I_MIXER_CHAN_UI_LAYER_TOP_LADDR(ch_base, layer->overlay),
++			     lower_32_bits(dma_addr));
+ }
+ 
+ void sun8i_ui_layer_set_coord(struct sun8i_layer *layer, int x, int y)
+@@ -169,9 +192,9 @@ void sun8i_ui_layer_set_coord(struct sun8i_layer *layer, int x, int y)
+ 	DRM_DEBUG_DRIVER("UI channel %d overlay %d at %d,%d in window\n",
+ 			 layer->channel, layer->overlay, x, y);
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_COORD(ch_base, layer->overlay),
+-		     SUN8I_MIXER_COORD(x, y));
++	sun8i_ui_layer_write(layer,
++			     SUN8I_MIXER_CHAN_UI_LAYER_COORD(ch_base, layer->overlay),
++			     SUN8I_MIXER_COORD(x, y));
+ }
+ 
+ void sun8i_ui_layer_set_ovl_size(struct sun8i_layer *layer, int w, int h)
+@@ -181,8 +204,8 @@ void sun8i_ui_layer_set_ovl_size(struct sun8i_layer *layer, int w, int h)
+ 	DRM_DEBUG_DRIVER("UI channel %d window %dx%d\n",
+ 			 layer->channel, w, h);
+ 
+-	regmap_write(layer->regs, SUN8I_MIXER_CHAN_UI_OVL_SIZE(ch_base),
+-		     SUN8I_MIXER_SIZE(w, h));
++	sun8i_ui_layer_write(layer, SUN8I_MIXER_CHAN_UI_OVL_SIZE(ch_base),
++			     SUN8I_MIXER_SIZE(w, h));
+ }
+ 
+ static int sun8i_ui_layer_atomic_check(struct drm_plane *plane,
+@@ -214,8 +237,13 @@ static int sun8i_ui_layer_atomic_check(struct drm_plane *plane,
+ 	min_scale = DRM_PLANE_NO_SCALING;
+ 	max_scale = DRM_PLANE_NO_SCALING;
+ 
+-	/* The channel's one scaler cannot be shared between its overlays. */
++	/*
++	 * The channel's one scaler cannot be shared between its overlays, and
++	 * it interpolates colours -- an interpolated palette index is a
++	 * different colour entirely, not an intermediate one.
++	 */
+ 	if (layer->cfg->ui_ovl_num <= 1 &&
++	    fmt->format != DRM_FORMAT_C8 &&
+ 	    layer->cfg->scaler_mask & BIT(layer->channel)) {
+ 		min_scale = SUN8I_UI_SCALER_SCALE_MIN;
+ 		max_scale = SUN8I_UI_SCALER_SCALE_MAX;
+@@ -280,6 +308,11 @@ static const u32 sun8i_ui_layer_formats[] = {
+ 	DRM_FORMAT_RGBX8888,
+ 	DRM_FORMAT_XBGR8888,
+ 	DRM_FORMAT_XRGB8888,
++	/*
++	 * Keep C8 last: only the D1/T113 DE2 can do indexed colour, and the
++	 * rest are handed this same list one entry shorter.
++	 */
++	DRM_FORMAT_C8,
+ };
+ 
+ static const uint64_t sun8i_layer_modifiers[] = {
+@@ -294,9 +327,13 @@ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 					    int overlay, int plane_cnt,
+ 					    const struct sun8i_layer_cfg *cfg)
+ {
++	unsigned int format_cnt = ARRAY_SIZE(sun8i_ui_layer_formats);
+ 	struct sun8i_layer *layer;
+ 	int ret;
+ 
++	if (!cfg->has_palette)
++		format_cnt--;
++
+ 	layer = devm_kzalloc(drm->dev, sizeof(*layer), GFP_KERNEL);
+ 	if (!layer)
+ 		return ERR_PTR(-ENOMEM);
+@@ -311,8 +348,7 @@ struct sun8i_layer *sun8i_ui_layer_init_one(struct drm_device *drm,
+ 	/* possible crtcs are set later */
+ 	ret = drm_universal_plane_init(drm, &layer->plane, 0,
+ 				       &sun8i_ui_layer_funcs,
+-				       sun8i_ui_layer_formats,
+-				       ARRAY_SIZE(sun8i_ui_layer_formats),
++				       sun8i_ui_layer_formats, format_cnt,
+ 				       sun8i_layer_modifiers, type, NULL);
+ 	if (ret) {
+ 		dev_err(drm->dev, "Couldn't initialize layer\n");
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.h b/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
+index 6377ce7c5..2ed33afa2 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.h
+@@ -34,9 +34,13 @@
+ 			((base) + 0x84)
+ #define SUN8I_MIXER_CHAN_UI_OVL_SIZE(base) \
+ 			((base) + 0x88)
++#define SUN8I_MIXER_CHAN_UI_PALETTE(base) \
++			((base) + 0x400)
+ 
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN		BIT(0)
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_MASK	GENMASK(2, 1)
++/* The write window must see a fresh 0 -> 1 transition for every upload. */
++#define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_PALETTE_ACCESS	BIT(3)
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_FBFMT_MASK	GENMASK(12, 8)
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_FBFMT_OFFSET	8
+ #define SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MASK	GENMASK(31, 24)
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index 3da6c9c76..ea6c228f1 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -20,12 +20,29 @@
+ #include "sun8i_vi_layer.h"
+ #include "sun8i_vi_scaler.h"
+ 
++/*
++ * On the D1 (the only ui_ovl_num > 1 target) no mixer register is double
++ * buffered, so writes the scanout can see must land inside the blanking:
++ * they are journaled and performed by sun8i_mixer_vblank_quirk(). This also
++ * keeps the VI channel's enable in the same frame as the blender's pipe
++ * setup, which sun8i_mixer_commit() journals -- pipe and channel disagreeing
++ * for a frame can hang the DE. Other targets keep the direct write.
++ */
++static void sun8i_vi_layer_write(struct sun8i_layer *layer, u32 offset,
++				 u32 value)
++{
++	if (layer->cfg->ui_ovl_num > 1)
++		sun8i_mixer_stage_write(layer->mixer, offset, value);
++	else
++		regmap_write(layer->regs, offset, value);
++}
++
+ static void sun8i_vi_layer_disable(struct sun8i_layer *layer)
+ {
+ 	u32 ch_base = sun8i_channel_base(layer);
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), 0);
++	sun8i_vi_layer_write(layer,
++			     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), 0);
+ }
+ 
+ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+@@ -50,13 +67,13 @@ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+ 			SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_COMBINED;
+ 	}
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), val);
++	sun8i_vi_layer_write(layer,
++			     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), val);
+ 
+ 	if (layer->cfg->de2_fcc_alpha) {
+-		regmap_write(layer->regs,
+-			     SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG,
+-			     SUN8I_MIXER_FCC_GLOBAL_ALPHA(state->alpha >> 8));
++		sun8i_vi_layer_write(layer,
++				     SUN8I_MIXER_FCC_GLOBAL_ALPHA_REG,
++				     SUN8I_MIXER_FCC_GLOBAL_ALPHA(state->alpha >> 8));
+ 	}
+ }
+ 
+@@ -115,12 +132,12 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 			 (state->src.x1 >> 16) & ~(format->hsub - 1),
+ 			 (state->src.y1 >> 16) & ~(format->vsub - 1));
+ 	DRM_DEBUG_DRIVER("Layer source size W: %d H: %d\n", src_w, src_h);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_SIZE(ch_base, layer->overlay),
+-		     insize);
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_OVL_SIZE(ch_base),
+-		     insize);
++	sun8i_vi_layer_write(layer,
++			     SUN8I_MIXER_CHAN_VI_LAYER_SIZE(ch_base, layer->overlay),
++			     insize);
++	sun8i_vi_layer_write(layer,
++			     SUN8I_MIXER_CHAN_VI_OVL_SIZE(ch_base),
++			     insize);
+ 
+ 	/*
+ 	 * Scaler must be enabled for subsampled formats, so it scales
+@@ -173,22 +190,22 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 		sun8i_vi_scaler_enable(layer, false);
+ 	}
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_HDS_Y(ch_base),
+-		     SUN8I_MIXER_CHAN_VI_DS_N(hn) |
+-		     SUN8I_MIXER_CHAN_VI_DS_M(hm));
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_HDS_UV(ch_base),
+-		     SUN8I_MIXER_CHAN_VI_DS_N(hn) |
+-		     SUN8I_MIXER_CHAN_VI_DS_M(hm));
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_VDS_Y(ch_base),
+-		     SUN8I_MIXER_CHAN_VI_DS_N(vn) |
+-		     SUN8I_MIXER_CHAN_VI_DS_M(vm));
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_VDS_UV(ch_base),
+-		     SUN8I_MIXER_CHAN_VI_DS_N(vn) |
+-		     SUN8I_MIXER_CHAN_VI_DS_M(vm));
++	sun8i_vi_layer_write(layer,
++			     SUN8I_MIXER_CHAN_VI_HDS_Y(ch_base),
++			     SUN8I_MIXER_CHAN_VI_DS_N(hn) |
++			     SUN8I_MIXER_CHAN_VI_DS_M(hm));
++	sun8i_vi_layer_write(layer,
++			     SUN8I_MIXER_CHAN_VI_HDS_UV(ch_base),
++			     SUN8I_MIXER_CHAN_VI_DS_N(hn) |
++			     SUN8I_MIXER_CHAN_VI_DS_M(hm));
++	sun8i_vi_layer_write(layer,
++			     SUN8I_MIXER_CHAN_VI_VDS_Y(ch_base),
++			     SUN8I_MIXER_CHAN_VI_DS_N(vn) |
++			     SUN8I_MIXER_CHAN_VI_DS_M(vm));
++	sun8i_vi_layer_write(layer,
++			     SUN8I_MIXER_CHAN_VI_VDS_UV(ch_base),
++			     SUN8I_MIXER_CHAN_VI_DS_N(vn) |
++			     SUN8I_MIXER_CHAN_VI_DS_M(vm));
+ }
+ 
+ static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
+@@ -210,18 +227,18 @@ static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
+ 		/* Set the line width */
+ 		DRM_DEBUG_DRIVER("Layer %d. line width: %d bytes\n",
+ 				 i + 1, fb->pitches[i]);
+-		regmap_write(layer->regs,
+-			     SUN8I_MIXER_CHAN_VI_LAYER_PITCH(ch_base,
+-							     layer->overlay, i),
+-			     fb->pitches[i]);
++		sun8i_vi_layer_write(layer,
++				     SUN8I_MIXER_CHAN_VI_LAYER_PITCH(ch_base,
++								     layer->overlay, i),
++				     fb->pitches[i]);
+ 
+ 		DRM_DEBUG_DRIVER("Setting %d. buffer address to %pad\n",
+ 				 i + 1, &dma_addr);
+ 
+-		regmap_write(layer->regs,
+-			     SUN8I_MIXER_CHAN_VI_LAYER_TOP_LADDR(ch_base,
+-								 layer->overlay, i),
+-			     lower_32_bits(dma_addr));
++		sun8i_vi_layer_write(layer,
++				     SUN8I_MIXER_CHAN_VI_LAYER_TOP_LADDR(ch_base,
++									 layer->overlay, i),
++				     lower_32_bits(dma_addr));
+ 	}
+ }
+ 

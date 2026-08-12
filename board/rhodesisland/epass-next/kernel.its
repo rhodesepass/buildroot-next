@@ -1,0 +1,48 @@
+/*
+ * FIT holding a gzipped kernel and the board dtb.
+ *
+ * RISC-V has no self-decompressing image and U-Boot's booti will not take a
+ * compressed one, so compression has to come from the container: bootm
+ * inflates the kernel into memory itself. That is worth roughly 44% of the
+ * kernel partition -- 8.3M of Image becomes about 4.7M here.
+ *
+ * load/entry sit at 0x40200000, the same place the FEL path pushes a raw
+ * Image to, which keeps one address to remember rather than two.
+ *
+ * No dtb here: the device trees live in their own bundle (dtbs.itb, built by
+ * mkdt.sh) because which one to use depends on the board revision and panel
+ * recorded in the bootenv partition, and U-Boot has to layer overlays over it
+ * before booting. Both FITs share the boot partition -- dtbs in a 1M slot at
+ * the front, this one right after.
+ */
+/dts-v1/;
+
+/ {
+	description = "Arknights ePass Next (D1s)";
+	#address-cells = <1>;
+
+	images {
+		kernel {
+			description = "Linux";
+			data = /incbin/("./Image.gz");
+			type = "kernel";
+			arch = "riscv";
+			os = "linux";
+			compression = "gzip";
+			load = <0x40200000>;
+			entry = <0x40200000>;
+			hash {
+				algo = "crc32";
+			};
+		};
+	};
+
+	configurations {
+		default = "conf";
+
+		conf {
+			description = "Linux";
+			kernel = "kernel";
+		};
+	};
+};

@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 9/13] iommu: sunxi: invalidate whole ranges when zapping
+
+The BSP zap only invalidates a few pages at each end of the range and
+leaves everything in between to the prefetch-valid logic. Cover the whole
+range instead: stale middle entries stay invisible until a mapping large
+enough to span them lands on previously-used IOVAs, and then reads go
+through the old translation.
+
+(The driver is currently compiled out -- see the board dts for why the
+D1 IOMMU is unused -- this keeps the port correct for whoever revives it.)
+---
+diff --git a/drivers/iommu/sunxi-iommu.c b/drivers/iommu/sunxi-iommu.c
+index dd0da4fad..b6fe6b5dd 100644
+--- a/drivers/iommu/sunxi-iommu.c
++++ b/drivers/iommu/sunxi-iommu.c
+@@ -282,10 +282,15 @@ static void sunxi_zap_tlb(struct sunxi_iommu_dev *iommu,
+ 
+ 	/* --- TLB invalidation --- */
+ 	if (q->tlb_ivld_range) {
++		/*
++		 * Cover the whole range, not just its ends. Only touching the
++		 * first and last few pages leaves stale entries for everything
++		 * in between, which stays invisible until a mapping large
++		 * enough to span them lands on IOVAs that were used before --
++		 * the middle of the buffer then reads through the previous
++		 * translation and the image comes out banded.
++		 */
+ 		sunxi_tlb_invalid_range(iommu, iova,
+-					iova + 2 * SPAGE_SIZE);
+-		sunxi_tlb_invalid_range(iommu,
+-					iova + size - SPAGE_SIZE,
+ 					iova + size + 8 * SPAGE_SIZE);
+ 	} else {
+ 		sunxi_tlb_invalid_addr(iommu, iova, (u32)IOMMU_PT_MASK);
+@@ -299,12 +304,9 @@ static void sunxi_zap_tlb(struct sunxi_iommu_dev *iommu,
+ 
+ 	/* --- PTW cache invalidation --- */
+ 	if (q->ptw_ivld_range) {
+-		/* V4: range-based PTW */
++		/* V4: range-based PTW -- again, the whole range. */
+ 		sunxi_ptw_cache_invalid_range(iommu, iova,
+-					      iova + SPD_SIZE);
+-		sunxi_ptw_cache_invalid_range(iommu,
+-					      iova + size - SPD_SIZE,
+-					      iova + size);
++					      iova + size + SPD_SIZE);
+ 	} else if (!q->tlb_ivld_range) {
+ 		/* V1 / V2: always 4 PTW invalidations */
+ 		sunxi_ptw_cache_invalid_addr(iommu, iova);

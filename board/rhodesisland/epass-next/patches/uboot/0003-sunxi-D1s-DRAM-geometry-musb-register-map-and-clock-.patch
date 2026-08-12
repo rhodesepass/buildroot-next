@@ -1,0 +1,770 @@
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 3/5] sunxi: D1s DRAM geometry, musb register map and clock
+ fixes
+
+musb_regs.h picks the sunxi register layout on CONFIG_ARCH_SUNXI, which is
+an ARM-only symbol -- the RISC-V sunxi SoCs declare BOARD_SUNXI instead. The
+D1 therefore got the generic map, where POWER is at 0x01 rather than 0x40
+and FADDR at 0x00 rather than 0x98, so every access landed somewhere else.
+Nothing complains: musb_start() writes POWER and INTRUSBE, they read back as
+zero, the controller is never configured, and the gadget appears to the host
+as a full-speed device that then answers no control transfer at all. With
+the guard widened, POWER reads f0 (ISOUPDATE|SOFTCONN|HSENAB|HSMODE) and
+DEVCTL 98, the device enumerates at high speed and dfu-util transfers
+verify byte for byte.
+
+The D1s carries in-package DDR2 at 1.8V where the T113-s3 has DDR3, so the
+DRAM driver gains parameterised timings, a structured rank geometry and AC
+remapping. Three bugs fixed along the way:
+
+  - mctl_com_init() indexed config->ranks[] with the dram_para1 bit offset
+    instead of the rank number, so a dual-rank part read past the array.
+    Single-rank hardware never reaches the second iteration, which is why
+    it went unnoticed.
+  - The dram_para1 defaults in init_DRAM() (row 13 / page 2 / bank 1) and
+    in auto_scan_dram_rank_width() (row 11 / page 0 / bank 0) had been
+    collapsed into one value. Equivalent when autoscan runs and overwrites
+    it, wrong when dram_tpr13 says the size is already known.
+  - BA2 probing at A22 does not work on DDR2; it now picks A11 for DDR2
+    and leaves the other types at A22 so T113/R528 DDR3 is unaffected.
+
+The driver addresses registers as bare physical integers, which ARM's
+readl/writel accept and RISC-V's do not. Rather than redefine the
+accessors, wrap them in self-referential macros -- a function-like macro is
+not expanded again inside its own expansion -- under CONFIG_RISCV only.
+
+musb gains a has_sram flag instead of the unconditional call to
+USBC_ConfigFIFO_Base(). All four existing ARM configs set it, so their
+behaviour is unchanged; D1 does not. This matters because the syscon at
+0x3000000 is not a USB FIFO mux on D1 -- it assigns SRAM C between the CPU,
+VE and DE, and writing it pulls memory out from under whoever holds it.
+D1's dts falls back to allwinner,sun8i-a33-musb, so the D1 compatible is
+added ahead of it to win the match.
+
+The clock changes add the SPL-stage CCU hook that raises PLL_CPUX to
+1008MHz, and sunxi_mmc.c gets D1 onto the same PLL6 halving path as R528.
+
+spi-sunxi.c has the same wrinkle as the DRAM driver, found the same way: its
+SPI_REG() macro yields a bare u32 physical address, which ARM's accessors
+take and RISC-V's do not. Cast in the macro rather than at every call site.
+---
+diff --git a/drivers/clk/sunxi/clk_d1.c b/drivers/clk/sunxi/clk_d1.c
+index b990a118..fba5583b 100644
+--- a/drivers/clk/sunxi/clk_d1.c
++++ b/drivers/clk/sunxi/clk_d1.c
+@@ -6,6 +6,7 @@
+ #include <clk-uclass.h>
+ #include <dm.h>
+ #include <errno.h>
++#include <asm/io.h>
+ #include <clk/sunxi.h>
+ #include <dt-bindings/clock/sun20i-d1-ccu.h>
+ #include <dt-bindings/reset/sun20i-d1-ccu.h>
+@@ -75,9 +76,21 @@ static struct ccu_reset d1_resets[] = {
+ 	[RST_BUS_LRADC]		= RESET(0xa9c, BIT(16)),
+ };
+ 
++static void d1_ccu_init(struct udevice *dev)
++{
++	struct ccu_plat *plat = dev_get_plat(dev);
++
++	/*
++	 * Raise PLL_CPUX to 1008 MHz. Nothing claims the CPU clock through DM,
++	 * so without this the core stays at the boot ROM's default rate.
++	 */
++	clrsetbits_le32(plat->base + 0x000, 0xff << 8, 0x29 << 8);
++}
++
+ const struct ccu_desc d1_ccu_desc = {
+ 	.gates	= d1_gates,
+ 	.resets	= d1_resets,
+ 	.num_gates = ARRAY_SIZE(d1_gates),
+ 	.num_resets = ARRAY_SIZE(d1_resets),
++	.init = d1_ccu_init,
+ };
+diff --git a/drivers/clk/sunxi/clk_sunxi.c b/drivers/clk/sunxi/clk_sunxi.c
+index 842a0541..f93c1df4 100644
+--- a/drivers/clk/sunxi/clk_sunxi.c
++++ b/drivers/clk/sunxi/clk_sunxi.c
+@@ -78,6 +78,7 @@ static int sunxi_clk_bind(struct udevice *dev)
+ 
+ static int sunxi_clk_probe(struct udevice *dev)
+ {
++	struct ccu_plat *plat = dev_get_plat(dev);
+ 	struct clk_bulk clk_bulk;
+ 	struct reset_ctl_bulk rst_bulk;
+ 	int ret;
+@@ -90,6 +91,9 @@ static int sunxi_clk_probe(struct udevice *dev)
+ 	if (!ret)
+ 		reset_deassert_bulk(&rst_bulk);
+ 
++	if (IS_ENABLED(CONFIG_XPL_BUILD) && plat->desc->init)
++		plat->desc->init(dev);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/mmc/sunxi_mmc.c b/drivers/mmc/sunxi_mmc.c
+index e28c81af..3289dff3 100644
+--- a/drivers/mmc/sunxi_mmc.c
++++ b/drivers/mmc/sunxi_mmc.c
+@@ -97,7 +97,8 @@ static int mmc_set_mod_clk(struct sunxi_mmc_priv *priv, unsigned int hz)
+ 		 * like for the older SoCs. However we still have the hidden
+ 		 * divider of 2x, so compensate for that here.
+ 		 */
+-		if (IS_ENABLED(CONFIG_MACH_SUN8I_R528))
++		if (IS_ENABLED(CONFIG_MACH_SUN8I_R528) ||
++		    IS_ENABLED(CONFIG_TARGET_SUN20I_D1))
+ 			pll_hz /= 2;
+ 
+ 		/*
+diff --git a/drivers/ram/sunxi/dram_sun20i_d1.c b/drivers/ram/sunxi/dram_sun20i_d1.c
+index 79cf0a51..89b7e868 100644
+--- a/drivers/ram/sunxi/dram_sun20i_d1.c
++++ b/drivers/ram/sunxi/dram_sun20i_d1.c
+@@ -14,11 +14,25 @@
+ 
+ #include <asm/io.h>
+ #include <config.h>
++#include <cpu_func.h>
++
++#ifdef CONFIG_RISCV
++/*
++ * This driver addresses every register by its bare physical address. The ARM
++ * readl()/writel() take an integer, but the RISC-V ones are typed
++ * (void __iomem *), so wrap them here rather than casting at ~80 call sites.
++ * A function-like macro is not re-expanded inside its own expansion, so these
++ * do resolve to the real accessors.
++ */
++#define readl(a)	readl((const volatile void __iomem *)(ulong)(a))
++#define writel(v, a)	writel((v), (volatile void __iomem *)(ulong)(a))
++#endif
+ #ifdef CONFIG_RAM
+   #include <dm.h>
+   #include <ram.h>
+ #endif
+ #include <linux/delay.h>
++#include <linux/string.h>
+ 
+ #include "dram_sun20i_d1.h"
+ 
+@@ -595,15 +609,18 @@ static void mctl_com_init(const dram_para_t *para, const dram_config_t *config)
+ 		width = 16;
+ 
+ 	ptr = 0x3102000;
++	/* i is the bit offset of the rank inside Allwinner's dram_para1 */
+ 	for (i = 0; i < width; i += 16) {
++		const struct rank_para *rank = &config->ranks[i / 16];
++
+ 		val = readl(ptr) & 0xfffff000;
+ 
+ 		val |= (config->dram_para2 >> 12) & 0x3; // rank
+-		val |= ((config->dram_para1 >> (i + 12)) << 2) & 0x4; // bank - 2
+-		val |= (((config->dram_para1 >> (i + 4)) - 1) << 4) & 0xff; // row - 1
++		val |= (rank->bank_bits << 2) & 0x4; // bank - 2
++		val |= ((rank->row_bits - 1) << 4) & 0xff; // row - 1
+ 
+ 		// convert from page size to column addr width - 3
+-		switch ((config->dram_para1 >> i) & 0xf) {
++		switch (rank->page_size & 0xf) {
+ 		case 8: val |= 0xa00; break;
+ 		case 4: val |= 0x900; break;
+ 		case 2: val |= 0x800; break;
+@@ -675,7 +692,11 @@ static void mctl_phy_ac_remapping(const dram_para_t *para,
+ 		return;
+ 
+ 	if (para->dram_type == SUNXI_DRAM_TYPE_DDR2) {
+-		if (fuse == 15)
++		/*
++		 * Fuse 10 is the D1s' in-package DDR2, whose address lines are
++		 * already straight through; remapping it breaks training.
++		 */
++		if (fuse == 10 || fuse == 15)
+ 			return;
+ 		cfg = ac_remapping_tables[6];
+ 	} else {
+@@ -1043,7 +1064,8 @@ static int mctl_core_init(const dram_para_t *para, const dram_config_t *config)
+  * this is tested.
+  * Next the BA2 line is checked. This seems to be placed above the column,
+  * BA0-1 and row addresses. Finally, the column address is allocated 13 lines
+- * and these are tested. The results are placed in dram_para1 and dram_para2.
++ * and these are tested. The results are placed in config->ranks and
++ * dram_para2.
+  */
+ 
+ static uint32_t get_payload(bool odd, unsigned long int ptr)
+@@ -1056,8 +1078,7 @@ static uint32_t get_payload(bool odd, unsigned long int ptr)
+ 
+ static int auto_scan_dram_size(const dram_para_t *para, dram_config_t *config)
+ {
+-	unsigned int rval, i, j, rank, maxrank, offs;
+-	unsigned int shft;
++	unsigned int i, j, rank, maxrank, offs;
+ 	unsigned long ptr, mc_work_mode, chk;
+ 
+ 	if (mctl_core_init(para, config) == 0) {
+@@ -1094,13 +1115,7 @@ static int auto_scan_dram_size(const dram_para_t *para, dram_config_t *config)
+ 		if (i > 16)
+ 			i = 16;
+ 		debug("rank %d row = %d\n", rank, i);
+-
+-		/* Store rows in para 1 */
+-		shft = offs + 4;
+-		rval = config->dram_para1;
+-		rval &= ~(0xff << shft);
+-		rval |= i << shft;
+-		config->dram_para1 = rval;
++		config->ranks[rank].row_bits = i;
+ 
+ 		if (rank == 1)		/* Set bank mode for rank0 */
+ 			clrsetbits_le32(0x3102000, 0xffc, 0x6a4);
+@@ -1108,9 +1123,19 @@ static int auto_scan_dram_size(const dram_para_t *para, dram_config_t *config)
+ 		/* Set bank mode for current rank */
+ 		clrsetbits_le32(mc_work_mode, 0xffc, 0x6a4);
+ 		udelay(1);
+-
+-		// Test if bit A23 is BA2 or mirror XXX A22?
+-		chk = CFG_SYS_SDRAM_BASE + (1U << 22);
++		/* the probe below reads back what was written above */
++		flush_dcache_all();
++
++		/*
++		 * Test whether the line above the column address is BA2 or a
++		 * mirror of a lower one. The co-packaged DDR2 puts BA2 right
++		 * above the 2 KB page (A11); the DDR3 parts this driver was
++		 * written against have it up at A22.
++		 */
++		if (para->dram_type == SUNXI_DRAM_TYPE_DDR2)
++			chk = CFG_SYS_SDRAM_BASE + (1U << 11);
++		else
++			chk = CFG_SYS_SDRAM_BASE + (1U << 22);
+ 		ptr = CFG_SYS_SDRAM_BASE;
+ 		for (i = 0, j = 0; i < 64; i++) {
+ 			if (readl(chk) != get_payload(i & 1, ptr)) {
+@@ -1122,13 +1147,7 @@ static int auto_scan_dram_size(const dram_para_t *para, dram_config_t *config)
+ 		}
+ 
+ 		debug("rank %d bank = %d\n", rank, (j + 1) << 2); /* 4 or 8 */
+-
+-		/* Store banks in para 1 */
+-		shft = 12 + offs;
+-		rval = config->dram_para1;
+-		rval &= ~(0xf << shft);
+-		rval |= j << shft;
+-		config->dram_para1 = rval;
++		config->ranks[rank].bank_bits = j;
+ 
+ 		if (rank == 1)		/* Set page mode for rank0 */
+ 			clrsetbits_le32(0x3102000, 0xffc, 0xaa0);
+@@ -1136,6 +1155,7 @@ static int auto_scan_dram_size(const dram_para_t *para, dram_config_t *config)
+ 		/* Set page mode for current rank */
+ 		clrsetbits_le32(mc_work_mode, 0xffc, 0xaa0);
+ 		udelay(1);
++		flush_dcache_all();
+ 
+ 		// Scan per address line, until address wraps (i.e. see shadow)
+ 		for (i = 9; i < 14; i++) {
+@@ -1155,13 +1175,7 @@ static int auto_scan_dram_size(const dram_para_t *para, dram_config_t *config)
+ 
+ 		unsigned int pgsize = (i == 9) ? 0 : (1 << (i - 10));
+ 		debug("rank %d page size = %d KB\n", rank, pgsize);
+-
+-		/* Store page size */
+-		shft = offs;
+-		rval = config->dram_para1;
+-		rval &= ~(0xf << shft);
+-		rval |= pgsize << shft;
+-		config->dram_para1 = rval;
++		config->ranks[rank].page_size = pgsize;
+ 
+ 		// Move to next rank
+ 		rank++;
+@@ -1180,8 +1194,9 @@ static int auto_scan_dram_size(const dram_para_t *para, dram_config_t *config)
+ 	}
+ 	if (maxrank == 2) {
+ 		config->dram_para2 &= 0xfffff0ff;
+-		/* note: rval is equal to para->dram_para1 here */
+-		if ((rval & 0xffff) == (rval >> 16)) {
++		if (config->ranks[0].page_size == config->ranks[1].page_size &&
++		    config->ranks[0].row_bits  == config->ranks[1].row_bits  &&
++		    config->ranks[0].bank_bits == config->ranks[1].bank_bits) {
+ 			debug("rank1 config same as rank0\n");
+ 		} else {
+ 			config->dram_para2 |= BIT(8);
+@@ -1202,9 +1217,13 @@ static int auto_scan_dram_rank_width(const dram_para_t *para,
+ 				     dram_config_t *config)
+ {
+ 	unsigned int s1 = config->dram_tpr13;
+-	unsigned int s2 = config->dram_para1;
++	struct rank_para s2[2];
++
++	memcpy(s2, config->ranks, sizeof(s2));
+ 
+-	config->dram_para1 = 0x00b000b0;
++	/* the unpacked form of Allwinner's dram_para1 = 0x00b000b0 */
++	config->ranks[0] = (struct rank_para){ .row_bits = 11 };
++	config->ranks[1] = (struct rank_para){ .row_bits = 11 };
+ 	config->dram_para2 = (config->dram_para2 & ~0xf) | BIT(12);
+ 
+ 	/* set DQS probe mode */
+@@ -1219,7 +1238,7 @@ static int auto_scan_dram_rank_width(const dram_para_t *para,
+ 		return 0;
+ 
+ 	config->dram_tpr13 = s1;
+-	config->dram_para1 = s2;
++	memcpy(config->ranks, s2, sizeof(s2));
+ 
+ 	return 1;
+ }
+@@ -1254,7 +1273,10 @@ static int auto_scan_dram_config(const dram_para_t *para,
+ static int init_DRAM(int type, const dram_para_t *para)
+ {
+ 	dram_config_t config = {
+-		.dram_para1	= 0x000010d2,
++		/* the unpacked form of Allwinner's dram_para1 = 0x000010d2 */
++		.ranks		= {
++			[0] = { .page_size = 2, .row_bits = 13, .bank_bits = 1 },
++		},
+ 		.dram_para2	= 0,
+ 		.dram_tpr13	= CONFIG_DRAM_SUNXI_TPR13,
+ 	};
+@@ -1373,7 +1395,7 @@ static const dram_para_t para = {
+ 	.dram_zq	= CONFIG_DRAM_ZQ,
+ 	.dram_odt_en	= CONFIG_DRAM_SUNXI_ODT_EN,
+ 	.dram_mr0	= 0x1c70,
+-	.dram_mr1	= 0x42,
++	.dram_mr1	= CONFIG_DRAM_SUNXI_MR1,
+ 	.dram_mr2	= 0x18,
+ 	.dram_mr3	= 0,
+ 	.dram_tpr0	= 0x004a2195,
+diff --git a/drivers/ram/sunxi/dram_sun20i_d1.h b/drivers/ram/sunxi/dram_sun20i_d1.h
+index 83ae7eb3..73624e6c 100644
+--- a/drivers/ram/sunxi/dram_sun20i_d1.h
++++ b/drivers/ram/sunxi/dram_sun20i_d1.h
+@@ -66,9 +66,21 @@ typedef struct dram_para {
+ 	const u32	dram_tpr12;
+ } dram_para_t;
+ 
++/*
++ * Autodetected geometry, one entry per rank. Allwinner's boot0 packs this
++ * into the dram_para1 bitfield (page size in bits 0-3, rows in 4-11, banks in
++ * 12-15, second rank in the upper half); unpacking it makes the scanning code
++ * in auto_scan_dram_size() readable and the rank comparison exact.
++ */
++struct rank_para {
++	u16 page_size;
++	u8 row_bits;
++	u8 bank_bits;
++};
++
+ typedef struct dram_config {
+ 	/* control configuration */
+-	u32	dram_para1;
++	struct rank_para ranks[2];
+ 	u32	dram_para2;
+ 	/* contains a bitfield of DRAM setup settings */
+ 	u32	dram_tpr13;
+diff --git a/drivers/usb/musb-new/musb_regs.h b/drivers/usb/musb-new/musb_regs.h
+index a54da45d..dae06aef 100644
+--- a/drivers/usb/musb-new/musb_regs.h
++++ b/drivers/usb/musb-new/musb_regs.h
+@@ -188,8 +188,17 @@
+ /* HUBADDR */
+ #define MUSB_HUBADDR_MULTI_TT		0x80
+ 
+-/* SUNXI has different reg addresses, but identical r/w functions */
+-#ifndef CONFIG_ARCH_SUNXI
++/*
++ * SUNXI has different reg addresses, but identical r/w functions.
++ *
++ * ARCH_SUNXI is ARM-only: the RISC-V sunxi SoCs (D1/D1s) declare BOARD_SUNXI
++ * instead. Testing only the former silently gives them the generic register
++ * map, so every access lands at the wrong offset -- POWER writes go to 0x01
++ * rather than 0x40 and read back as zero, the controller is never actually
++ * configured, and the gadget enumerates at full speed and then answers
++ * nothing.
++ */
++#if !defined(CONFIG_ARCH_SUNXI) && !defined(CONFIG_BOARD_SUNXI)
+ 
+ /*
+  * Common USB registers
+@@ -293,7 +302,7 @@
+ #define MUSB_BUSCTL_OFFSET(_epnum, _offset) \
+ 	(0x80 + (8*(_epnum)) + (_offset))
+ 
+-#else /* CONFIG_ARCH_SUNXI */
++#else /* sunxi */
+ 
+ /*
+  * Common USB registers
+@@ -370,7 +379,7 @@
+ /* Endpoint is selected with MUSB_INDEX. */
+ #define MUSB_BUSCTL_OFFSET(_epnum, _offset) (_offset)
+ 
+-#endif /* CONFIG_ARCH_SUNXI */
++#endif /* sunxi */
+ 
+ static inline void musb_write_txfifosz(void __iomem *mbase, u8 c_size)
+ {
+@@ -394,7 +403,7 @@ static inline void  musb_write_rxfifoadd(void __iomem *mbase, u16 c_off)
+ 
+ static inline void musb_write_ulpi_buscontrol(void __iomem *mbase, u8 val)
+ {
+-#ifndef CONFIG_ARCH_SUNXI /* No ulpi on sunxi */
++#if !defined(CONFIG_ARCH_SUNXI) && !defined(CONFIG_BOARD_SUNXI) /* No ulpi on sunxi */
+ 	musb_writeb(mbase, MUSB_ULPI_BUSCONTROL, val);
+ #endif
+ }
+@@ -421,7 +430,7 @@ static inline u16  musb_read_rxfifoadd(void __iomem *mbase)
+ 
+ static inline u8 musb_read_ulpi_buscontrol(void __iomem *mbase)
+ {
+-#ifdef CONFIG_ARCH_SUNXI /* No ulpi on sunxi */
++#if defined(CONFIG_ARCH_SUNXI) || defined(CONFIG_BOARD_SUNXI) /* No ulpi on sunxi */
+ 	return 0;
+ #else
+ 	return musb_readb(mbase, MUSB_ULPI_BUSCONTROL);
+@@ -441,7 +450,7 @@ static inline u8 musb_read_configdata(void __iomem *mbase)
+ 
+ static inline u16 musb_read_hwvers(void __iomem *mbase)
+ {
+-#ifdef CONFIG_ARCH_SUNXI
++#if defined(CONFIG_ARCH_SUNXI) || defined(CONFIG_BOARD_SUNXI)
+ 	return 0; /* Unknown version */
+ #else
+ 	return musb_readw(mbase, MUSB_HWVERS);
+diff --git a/drivers/usb/musb-new/sunxi.c b/drivers/usb/musb-new/sunxi.c
+index 0747f025..b19070f0 100644
+--- a/drivers/usb/musb-new/sunxi.c
++++ b/drivers/usb/musb-new/sunxi.c
+@@ -83,6 +83,15 @@
+ 
+ struct sunxi_musb_config {
+ 	struct musb_hdrc_config *config;
++	/*
++	 * Whether the SoC muxes part of its SRAM into the USB FIFO, and so
++	 * needs the SRAM controller poked before the FIFO is usable. Linux
++	 * only sets the equivalent flag for sun4i-a10; here it stays set for
++	 * every ARM part this driver already supported, so their behaviour is
++	 * unchanged, and is only cleared where the register at
++	 * SUNXI_SRAMC_BASE + 4 means something else.
++	 */
++	bool has_sram;
+ };
+ 
+ struct sunxi_glue {
+@@ -172,13 +181,18 @@ static void USBC_ForceVbusValidToHigh(__iomem void *base)
+ 
+ static void USBC_ConfigFIFO_Base(void)
+ {
++	/*
++	 * The cast is a no-op on ARM, where readl() takes an integer, but the
++	 * RISC-V accessors are typed.
++	 */
++	void __iomem *sramc = (void __iomem *)(ulong)SUNXI_SRAMC_BASE;
+ 	u32 reg_value;
+ 
+ 	/* config usb fifo, 8kb mode */
+-	reg_value = readl(SUNXI_SRAMC_BASE + 0x04);
++	reg_value = readl(sramc + 0x04);
+ 	reg_value &= ~(0x03 << 0);
+ 	reg_value |= BIT(0);
+-	writel(reg_value, SUNXI_SRAMC_BASE + 0x04);
++	writel(reg_value, sramc + 0x04);
+ }
+ 
+ /******************************************************************************
+@@ -311,7 +325,8 @@ static int sunxi_musb_init(struct musb *musb)
+ 
+ 	musb->isr = sunxi_musb_interrupt;
+ 
+-	USBC_ConfigFIFO_Base();
++	if (glue->cfg->has_sram)
++		USBC_ConfigFIFO_Base();
+ 	USBC_EnableDpDmPullUp(musb->mregs);
+ 	USBC_EnableIdPullUp(musb->mregs);
+ 
+@@ -517,18 +532,32 @@ static int musb_usb_remove(struct udevice *dev)
+  */
+ static const struct sunxi_musb_config sun4i_a10_cfg = {
+ 	.config = &musb_config,
++	.has_sram = true,
+ };
+ 
+ static const struct sunxi_musb_config sun6i_a31_cfg = {
+ 	.config = &musb_config,
++	.has_sram = true,
+ };
+ 
+ static const struct sunxi_musb_config sun8i_h3_cfg = {
+ 	.config = &musb_config_h3,
++	.has_sram = true,
+ };
+ 
+ static const struct sunxi_musb_config suniv_f1c100s_cfg = {
+ 	.config = &musb_config,
++	.has_sram = true,
++};
++
++/*
++ * The D1 would otherwise fall back to the sun8i-a33 compatible, which would
++ * take the has_sram path. Its syscon at 0x3000000 has no USB FIFO mux -- the
++ * register there assigns SRAM C between the CPU, VE and DE instead, so
++ * writing it would move memory out from under whoever is using it.
++ */
++static const struct sunxi_musb_config sun20i_d1_cfg = {
++	.config = &musb_config,
+ };
+ 
+ static const struct udevice_id sunxi_musb_ids[] = {
+@@ -542,6 +571,8 @@ static const struct udevice_id sunxi_musb_ids[] = {
+ 			.data = (ulong)&sun8i_h3_cfg },
+ 	{ .compatible = "allwinner,suniv-f1c100s-musb",
+ 			.data = (ulong)&suniv_f1c100s_cfg },
++	{ .compatible = "allwinner,sun20i-d1-musb",
++			.data = (ulong)&sun20i_d1_cfg },
+ 	{ }
+ };
+ 
+diff --git a/include/clk/sunxi.h b/include/clk/sunxi.h
+index c298195c..efd41741 100644
+--- a/include/clk/sunxi.h
++++ b/include/clk/sunxi.h
+@@ -72,6 +72,12 @@ struct ccu_desc {
+ 	const struct ccu_reset *resets;
+ 	u8 num_gates;
+ 	u8 num_resets;
++	/*
++	 * Optional one-shot setup run from the SPL's probe, for PLLs that
++	 * have no clock consumer to drive them but still need to be raised
++	 * off the boot ROM's default.
++	 */
++	void (*init)(struct udevice *dev);
+ };
+ 
+ /**
+diff --git a/drivers/spi/spi-sunxi.c b/drivers/spi/spi-sunxi.c
+index 08b603f0..7702f85e 100644
+--- a/drivers/spi/spi-sunxi.c
++++ b/drivers/spi/spi-sunxi.c
+@@ -31,6 +31,7 @@
+ 
+ #include <asm/bitops.h>
+ #include <asm/io.h>
++#include <asm/arch/clock.h>
+ 
+ #include <linux/iopoll.h>
+ 
+@@ -81,8 +82,26 @@
+ #define SUN4I_SPI_DEFAULT_RATE		1000000
+ #define SUN4I_SPI_TIMEOUT_MS		1000
+ 
+-#define SPI_REG(priv, reg)		((priv)->base + \
+-					(priv)->variant->regs[reg])
++/*
++ * Mod clock register, for the variants whose divider sits in the CCU rather
++ * than in the SPI block. Same layout as every other sunxi peripheral clock:
++ *
++ *	rate = src / (1 << N) / (M + 1)
++ */
++#define SUNXI_CCM_SPI_CLK_SRC_HOSC	(0x0 << 24)
++#define SUNXI_CCM_SPI_CLK_SRC_PLL6	(0x1 << 24)
++#define SUNXI_CCM_SPI_CLK_N(n)		((n) << 8)
++#define SUNXI_CCM_SPI_CLK_M(m)		((m) << 0)
++#define SUNXI_CCM_SPI_CLK_GATE		BIT(31)
++
++/*
++ * base is a u32 of physical address, which ARM's readl/writel accept as-is
++ * and RISC-V's do not. Cast here rather than at every call site; the result
++ * is what the accessors want on both.
++ */
++#define SPI_REG(priv, reg)		((void __iomem *)(uintptr_t) \
++					((priv)->base + \
++					 (priv)->variant->regs[reg]))
+ #define SPI_BIT(priv, bit)		((priv)->variant->bits[bit])
+ #define SPI_CS(priv, cs)		(((cs) << SPI_BIT(priv, SPI_TCR_CS_SEL)) & \
+ 					SPI_BIT(priv, SPI_TCR_CS_MASK))
+@@ -127,6 +146,14 @@ struct sun4i_spi_variant {
+ 	bool has_soft_reset;
+ 	bool has_burst_ctl;
+ 	bool has_clk_ctl;
++	/*
++	 * CCU offset of the mod clock, for the variants that have no divider
++	 * of their own. Zero means the rate is whatever the boot ROM left,
++	 * which is the oscillator.
++	 */
++	u16 mod_clk_off;
++	/* Ceiling for the above; 0 falls back to SUN4I_SPI_MAX_RATE. */
++	u32 max_rate;
+ };
+ 
+ struct sun4i_spi_plat {
+@@ -277,6 +304,11 @@ static void sun4i_spi_set_speed_mode(struct udevice *dev)
+ 	}
+ 
+ 	writel(reg, SPI_REG(priv, SPI_CCR));
++}
++
++static void sun4i_spi_set_cpol_cpha(struct sun4i_spi_priv *priv)
++{
++	u32 reg;
+ 
+ 	reg = readl(SPI_REG(priv, SPI_TCR));
+ 	reg &= ~(SPI_BIT(priv, SPI_TCR_CPOL) | SPI_BIT(priv, SPI_TCR_CPHA));
+@@ -290,6 +322,57 @@ static void sun4i_spi_set_speed_mode(struct udevice *dev)
+ 	writel(reg, SPI_REG(priv, SPI_TCR));
+ }
+ 
++/*
++ * Program the mod clock in the CCU and return the rate it actually lands on.
++ *
++ * The sunxi clock driver models these as a bare gate, so clk_set_rate() on the
++ * mod clock does nothing and the block would sit at the boot ROM's default of
++ * HOSC/1 forever. Poking the register here is the same thing the MMC driver
++ * does for its own mod clock. Note there is no hidden post-divider on SPI --
++ * MMC has one, SPI does not.
++ */
++static u32 sun4i_spi_set_mod_clk(struct sun4i_spi_priv *priv)
++{
++	void __iomem *reg = (void __iomem *)(uintptr_t)(SUNXI_CCM_BASE +
++					priv->variant->mod_clk_off);
++	unsigned int div, m, p;
++	u32 src_hz, val;
++
++	if (priv->freq <= 24000000) {
++		val = SUNXI_CCM_SPI_CLK_SRC_HOSC;
++		src_hz = 24000000;
++	} else {
++		/*
++		 * Mux value 1 is PLL_PERIPH0(1X), which is what
++		 * clock_get_pll6() reports: measured on hardware,
++		 * PLL_PERI0_CTRL reads 0xf8216300, so N=100 and P0=2 give a
++		 * 1200MHz 2X output and the helper's final /2 lands on 600MHz.
++		 *
++		 * Do not "fix" this by halving it again to match the MMC
++		 * driver. That /2 compensates for MMC's hidden post-divider,
++		 * which SPI does not have.
++		 */
++		val = SUNXI_CCM_SPI_CLK_SRC_PLL6;
++		src_hz = clock_get_pll6();
++	}
++
++	div = DIV_ROUND_UP(src_hz, priv->freq);
++	for (p = 0; div > 16 && p < 3; p++)
++		div = DIV_ROUND_UP(div, 2);
++	if (div > 16)
++		div = 16;
++	m = div - 1;
++
++	/*
++	 * Writing the source and dividers with bit 31 clear closes the gate for
++	 * the duration, so the block never sees a half-retimed clock.
++	 */
++	writel(val | SUNXI_CCM_SPI_CLK_N(p) | SUNXI_CCM_SPI_CLK_M(m), reg);
++	setbits_le32(reg, SUNXI_CCM_SPI_CLK_GATE);
++
++	return src_hz / (1 << p) / (m + 1);
++}
++
+ static int sun4i_spi_claim_bus(struct udevice *dev)
+ {
+ 	struct sun4i_spi_priv *priv = dev_get_priv(dev->parent);
+@@ -311,11 +394,34 @@ static int sun4i_spi_claim_bus(struct udevice *dev)
+ 
+ 	if (priv->variant->has_clk_ctl) {
+ 		sun4i_spi_set_speed_mode(dev->parent);
++	} else if (priv->variant->mod_clk_off) {
++		u32 hz = sun4i_spi_set_mod_clk(priv);
++		u32 sample;
++
++		/*
++		 * Sampling has to track the clock, or the data lines are read
++		 * at the wrong point once the bus is fast enough for round-trip
++		 * delay to matter:
++		 *
++		 *   normal            CLK <= 24MHz  SDM=1 SDC=0
++		 *   delay half cycle  CLK <= 40MHz  SDM=0 SDC=0
++		 *   delay one cycle   CLK >= 80MHz  SDM=0 SDC=1
++		 */
++		if (hz <= 24000000)
++			sample = SPI_BIT(priv, SPI_TCR_SDM);
++		else if (hz >= 80000000)
++			sample = SPI_BIT(priv, SPI_TCR_SDC);
++		else
++			sample = 0;
++
++		clrsetbits_le32(SPI_REG(priv, SPI_TCR),
++				SPI_BIT(priv, SPI_TCR_SDC) |
++				SPI_BIT(priv, SPI_TCR_SDM), sample);
+ 	} else {
+ 		/*
+-		 * At this moment there is no ability to change input clock.
+-		 * Therefore, we can only use default HOSC@24MHz clock and
+-		 * set SPI sampling mode to normal
++		 * No divider here and none described in the CCU either, so the
++		 * bus runs at the boot ROM's default HOSC@24MHz. Normal
++		 * sampling is the right mode for that.
+ 		 */
+ 		clrsetbits_le32(SPI_REG(priv, SPI_TCR),
+ 				SPI_BIT(priv, SPI_TCR_SDC) |
+@@ -323,6 +429,8 @@ static int sun4i_spi_claim_bus(struct udevice *dev)
+ 				SPI_BIT(priv, SPI_TCR_SDM));
+ 	}
+ 
++	sun4i_spi_set_cpol_cpha(priv);
++
+ 	return 0;
+ }
+ 
+@@ -410,9 +518,10 @@ static int sun4i_spi_xfer(struct udevice *dev, unsigned int bitlen,
+ static int sun4i_spi_set_speed(struct udevice *dev, uint speed)
+ {
+ 	struct sun4i_spi_priv *priv = dev_get_priv(dev);
++	u32 max_rate = priv->variant->max_rate ?: SUN4I_SPI_MAX_RATE;
+ 
+-	if (speed > SUN4I_SPI_MAX_RATE)
+-		speed = SUN4I_SPI_MAX_RATE;
++	if (speed > max_rate)
++		speed = max_rate;
+ 
+ 	if (speed < SUN4I_SPI_MIN_RATE)
+ 		speed = SUN4I_SPI_MIN_RATE;
+@@ -570,6 +679,27 @@ static const struct sun4i_spi_variant sun50i_r329_spi_variant = {
+ 	.has_burst_ctl		= true,
+ };
+ 
++/*
++ * Same block as the R329, but with the mod clock filled in. Kept as its own
++ * entry rather than added to the R329 variant because the CCU layout around
++ * it is per-SoC, and D1 is the one that has been measured.
++ *
++ * 0x940 is SPI0's mod clock specifically, so this variant must never bind to
++ * SPI1 (whose clock is 0x944). It does not: D1's SPI1 is the DBI-capable
++ * block, and its dts node is compatible with "allwinner,sun20i-d1-spi-dbi"
++ * and the R329 strings, never with the "allwinner,sun20i-d1-spi" matched
++ * below. Adding an instance here means revisiting that.
++ */
++static const struct sun4i_spi_variant sun20i_d1_spi_variant = {
++	.regs			= sun6i_spi_regs,
++	.bits			= sun6i_spi_bits,
++	.fifo_depth		= 64,
++	.has_soft_reset		= true,
++	.has_burst_ctl		= true,
++	.mod_clk_off		= 0x940,
++	.max_rate		= 100000000,
++};
++
+ static const struct udevice_id sun4i_spi_ids[] = {
+ 	{
+ 	  .compatible = "allwinner,sun4i-a10-spi",
+@@ -583,6 +713,10 @@ static const struct udevice_id sun4i_spi_ids[] = {
+ 	  .compatible = "allwinner,sun8i-h3-spi",
+ 	  .data = (ulong)&sun8i_h3_spi_variant,
+ 	},
++	{
++	  .compatible = "allwinner,sun20i-d1-spi",
++	  .data = (ulong)&sun20i_d1_spi_variant,
++	},
+ 	{
+ 	  .compatible = "allwinner,sun50i-r329-spi",
+ 	  .data = (ulong)&sun50i_r329_spi_variant,

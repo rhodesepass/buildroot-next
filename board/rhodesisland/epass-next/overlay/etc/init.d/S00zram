@@ -1,0 +1,26 @@
+#!/bin/sh
+#
+# zram swap.
+
+case "$1" in
+    start | restart | reload) ;;
+    stop)
+        exit 0
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+[ -e /sys/block/zram0/disksize ] || exit 0
+
+size=24M
+mem_limit=8M
+
+echo lzo-rle > /sys/block/zram0/comp_algorithm
+echo $size > /sys/block/zram0/disksize || exit 0
+echo $mem_limit > /sys/block/zram0/mem_limit
+mkswap /dev/zram0 > /dev/null 2>&1 && swapon /dev/zram0
+
+echo 100 > /proc/sys/vm/swappiness

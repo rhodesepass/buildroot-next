@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 11/13] Input: axp20x-pek - allow overriding the reported keycode
+
+On the ePass boards the AXP209 PEK line is wired to the panel's "0" key
+rather than a real power button, so the fixed KEY_POWER report is wrong.
+The pek MFD cell carries no of_node of its own, so read an optional
+"x-powers,pek-keycode" from the parent PMIC node and use it for the
+press/release reports. Falls back to KEY_POWER when the property is
+absent, preserving the previous behaviour on every other board.
+
+Same change as the F1C tree's 0023-axp20x-pek-configurable-keycode.patch,
+refreshed for 7.1.6 where the PEK_EDGE/PEK_TIME split is gone.
+---
+diff --git a/drivers/input/misc/axp20x-pek.c b/drivers/input/misc/axp20x-pek.c
+index 24f9e9d89..cf8cd8a9c 100644
+--- a/drivers/input/misc/axp20x-pek.c
++++ b/drivers/input/misc/axp20x-pek.c
+@@ -22,6 +22,7 @@
+ #include <linux/kernel.h>
+ #include <linux/mfd/axp20x.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_data/x86/soc.h>
+ #include <linux/platform_device.h>
+ #include <linux/regmap.h>
+@@ -43,6 +44,7 @@ struct axp20x_pek {
+ 	struct axp20x_info *info;
+ 	int irq_dbr;
+ 	int irq_dbf;
++	unsigned int keycode;
+ };
+ 
+ struct axp20x_time {
+@@ -205,9 +207,9 @@ static irqreturn_t axp20x_pek_irq(int irq, void *pwr)
+ 	 * means it is pressed.
+ 	 */
+ 	if (irq == axp20x_pek->irq_dbf)
+-		input_report_key(idev, KEY_POWER, true);
++		input_report_key(idev, axp20x_pek->keycode, true);
+ 	else if (irq == axp20x_pek->irq_dbr)
+-		input_report_key(idev, KEY_POWER, false);
++		input_report_key(idev, axp20x_pek->keycode, false);
+ 
+ 	input_sync(idev);
+ 
+@@ -221,6 +223,14 @@ static int axp20x_pek_probe_input_device(struct axp20x_pek *axp20x_pek,
+ 	struct input_dev *idev;
+ 	int error;
+ 
++	/*
++	 * The MFD pek cell has no of_node of its own; the keycode override
++	 * lives on the parent PMIC node. Defaults to KEY_POWER when absent.
++	 */
++	axp20x_pek->keycode = KEY_POWER;
++	of_property_read_u32(pdev->dev.parent->of_node, "x-powers,pek-keycode",
++			     &axp20x_pek->keycode);
++
+ 	axp20x_pek->irq_dbr = platform_get_irq_byname(pdev, "PEK_DBR");
+ 	if (axp20x_pek->irq_dbr < 0)
+ 		return axp20x_pek->irq_dbr;
+@@ -243,7 +253,7 @@ static int axp20x_pek_probe_input_device(struct axp20x_pek *axp20x_pek,
+ 	idev->phys = "m1kbd/input2";
+ 	idev->dev.parent = &pdev->dev;
+ 
+-	input_set_capability(idev, EV_KEY, KEY_POWER);
++	input_set_capability(idev, EV_KEY, axp20x_pek->keycode);
+ 
+ 	input_set_drvdata(idev, axp20x_pek);
+ 

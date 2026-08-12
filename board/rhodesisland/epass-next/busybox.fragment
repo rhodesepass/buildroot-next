@@ -1,0 +1,4 @@
+# 首次启动时在 SD 卡剩余空间上格式化 share 分区用 (S00sdsetup)
+CONFIG_MKFS_VFAT=y
+# S00sdsetup 用 blkid 的 TYPE= 判断是否已有文件系统;默认 busybox 不打印 TYPE
+CONFIG_FEATURE_BLKID_TYPE=y

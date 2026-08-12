@@ -1,0 +1,441 @@
+media: sun8i-rotate: support the D1/T113 G2D rotate unit
+
+D1 has the same rotate core the sun8i-rotate driver already drives on A83T
+and A64, but not where the driver expects it. On those SoCs it is a DE
+sub-block at DE+0x20000, clocked by the DE clock controller. On D1 it was
+moved into G2D, at G2D+0x28000, and is clocked from the main CCU.
+
+That the two are the same IP is not a guess. DE2.0 Spec section 5.13 ("DE
+Rotation Specification") documents this core, and its register list matches
+sun8i-rotate.h field for field: GLB_CTL bit31 START / bit30 RESET /
+[21:16] burst / bit7 HFLIP / bit6 VFLIP / [5:4] clockwise 0-270 /
+[1:0] "01: copy&rotation", INT bit16 FINISH_IRQ_EN / bit0 FINISH-write-1-to-
+clear, then IFMT/ISIZE/IPITCHn/IADDRn and the OSIZE/OPITCHn/OADDRn block at
+the same offsets. The vendor BSP's g2d_rotate.c pokes exactly those offsets
+at G2D+0x28000.
+
+D1's DE does not have it: the DE chapter of the D1-H manual lists no rotation
+(all four "rotate" hits in that manual are in the G2D feature list), the DE2
+clock controller D1 uses exposes no CLK_ROT/RST_ROT, the BSP dtsi has no
+rotate node under DE, and the vendor DE driver rotates framebuffers by
+calling into G2D (disp2/disp/fb_g2d_rot.c).
+
+So this only adds the shell around the existing driver, via a variant:
+
+  - a second reg range for the G2D TOP block, whose bit 1 gates the rotate
+    engine and holds its soft reset. Bit 0 there is the G2D mixer, which has
+    no driver and is left in reset.
+  - a third clock, the G2D MBUS gate, which the DE-resident instances do not
+    have.
+
+Ordering in runtime_resume matters and is deliberate: the module clock must
+be running before the reset is released. Releasing the reset with the module
+clock gated makes the G2D MBUS master port issue unclocked transactions and
+wedges MBUS; since the CPU fetches through MBUS too, the SoC stops dead and
+not even the EN reset line recovers it -- only a power cycle does. This was
+measured on the board, twice. The MBUS gate goes last, matching the vendor
+driver's order.
+
+The A83T/A64 path is unchanged: its variant leaves both flags false, so no
+second reg range and no third clock are looked up.
+
+One behaviour change beyond the plumbing, also variant-gated:
+rotate_set_cap_format() forces every YUV input to V4L2_PIX_FMT_YUV420 on
+output. DE2.0 Spec 5.13.4 backs that ("for YUV422/YUV420 input, all output
+will be in YUV 420 planer"), but the vendor g2d_rotate.c disagrees, and on
+the board the vendor is right: feeding NV12 whose U and V bytes carry
+different constants, the capture buffer comes back with them still
+interleaved.
+
+That is not a cosmetic mislabel. The declared capture format decides the
+chroma pitch programmed into OUT_PITCH1, and I420's bpl/2 is half of what an
+interleaved plane needs. Writing a row index into U and reading it back
+showed the chroma rows advancing every bpl/2 bytes instead of every bpl, so
+each row lands on top of the previous one -- correct luma, ruined chroma.
+With the passthrough mapping the pitch comes out right.
+
+Only 4:2:2 is decimated (NV61->NV21, NV16->NV12, YUV422P->YUV420); packed
+4:2:2 follows the vendor driver's fallthrough and is not measured. A83T and
+A64 keep the old unconditional I420 behaviour.
+
+---
+diff --git a/Documentation/devicetree/bindings/media/allwinner,sun8i-a83t-de2-rotate.yaml b/Documentation/devicetree/bindings/media/allwinner,sun8i-a83t-de2-rotate.yaml
+index c2f292dd0..98727aa0d 100644
+--- a/Documentation/devicetree/bindings/media/allwinner,sun8i-a83t-de2-rotate.yaml
++++ b/Documentation/devicetree/bindings/media/allwinner,sun8i-a83t-de2-rotate.yaml
+@@ -15,29 +15,42 @@ description: |-
+   The Allwinner A83T and A64 have a rotation core used for
+   rotating and flipping images.
+ 
++  On the D1/T113 the very same core is not part of the display engine.  It is
++  embedded in the G2D block at offset 0x28000, is clocked from the main CCU
++  instead of the display engine clock controller, and its gating and soft reset
++  live in the G2D TOP registers, which are described by a second reg range.
++
+ properties:
+   compatible:
+     oneOf:
+       - const: allwinner,sun8i-a83t-de2-rotate
++      - const: allwinner,sun20i-d1-g2d-rotate
+       - items:
+           - const: allwinner,sun50i-a64-de2-rotate
+           - const: allwinner,sun8i-a83t-de2-rotate
+ 
+   reg:
+-    maxItems: 1
++    minItems: 1
++    items:
++      - description: Rotate engine registers
++      - description: G2D TOP registers holding the rotate gating and soft reset
+ 
+   interrupts:
+     maxItems: 1
+ 
+   clocks:
++    minItems: 2
+     items:
+       - description: Rotate interface clock
+       - description: Rotate module clock
++      - description: Rotate MBUS clock
+ 
+   clock-names:
++    minItems: 2
+     items:
+       - const: bus
+       - const: mod
++      - const: mbus
+ 
+   resets:
+     maxItems: 1
+@@ -48,6 +61,29 @@ required:
+   - interrupts
+   - clocks
+ 
++allOf:
++  - if:
++      properties:
++        compatible:
++          contains:
++            const: allwinner,sun20i-d1-g2d-rotate
++    then:
++      properties:
++        reg:
++          minItems: 2
++        clocks:
++          minItems: 3
++        clock-names:
++          minItems: 3
++    else:
++      properties:
++        reg:
++          maxItems: 1
++        clocks:
++          maxItems: 2
++        clock-names:
++          maxItems: 2
++
+ additionalProperties: false
+ 
+ examples:
+diff --git a/drivers/media/platform/sunxi/sun8i-rotate/sun8i-formats.h b/drivers/media/platform/sunxi/sun8i-rotate/sun8i-formats.h
+index 697cd5fad..8f9073393 100644
+--- a/drivers/media/platform/sunxi/sun8i-rotate/sun8i-formats.h
++++ b/drivers/media/platform/sunxi/sun8i-rotate/sun8i-formats.h
+@@ -20,6 +20,6 @@ struct rotate_format {
+ };
+ 
+ const struct rotate_format *rotate_find_format(u32 pixelformat);
+-int rotate_enum_fmt(struct v4l2_fmtdesc *f, bool dst);
++int rotate_enum_fmt(struct v4l2_fmtdesc *f, bool dst, bool yuv_dst);
+ 
+ #endif
+diff --git a/drivers/media/platform/sunxi/sun8i-rotate/sun8i-rotate.h b/drivers/media/platform/sunxi/sun8i-rotate/sun8i-rotate.h
+index 32ade97ba..39bb057cf 100644
+--- a/drivers/media/platform/sunxi/sun8i-rotate/sun8i-rotate.h
++++ b/drivers/media/platform/sunxi/sun8i-rotate/sun8i-rotate.h
+@@ -96,6 +96,17 @@
+ 
+ #define ROTATE_SIZE(w, h)	(((h) - 1) << 16 | ((w) - 1))
+ 
++/*
++ * On D1/T113 this IP does not live in the DE; it sits inside the G2D block at
++ * offset 0x28000, and its clock gating and soft reset are in the G2D TOP block
++ * (the second reg range) rather than in the DE clock controller.  Bit 1 is the
++ * rotate engine, bit 0 is the G2D mixer which has no driver and is left alone.
++ */
++#define G2D_TOP_SCLK_GATE		0x00
++#define G2D_TOP_HCLK_GATE		0x04
++#define G2D_TOP_AHB_RESET		0x08
++#define G2D_TOP_ROT				BIT(1)
++
+ #define ROTATE_MIN_WIDTH	8U
+ #define ROTATE_MIN_HEIGHT	8U
+ #define ROTATE_MAX_WIDTH	4096U
+@@ -115,6 +126,15 @@ struct rotate_ctx {
+ 	u32 rotate;
+ };
+ 
++struct rotate_variant {
++	/* rotate engine is embedded in G2D: gating/reset live in reg range 1 */
++	bool	has_g2d_top;
++	/* G2D has its own MBUS master port with a separate gate */
++	bool	has_mbus_clk;
++	/* YUV output keeps the input's layout instead of always being I420 */
++	bool	yuv_out_passthrough;
++};
++
+ struct rotate_dev {
+ 	struct v4l2_device	v4l2_dev;
+ 	struct video_device	vfd;
+@@ -125,11 +145,15 @@ struct rotate_dev {
+ 	struct mutex		dev_mutex;
+ 
+ 	void __iomem		*base;
++	void __iomem		*top;
+ 
+ 	struct clk		*bus_clk;
+ 	struct clk		*mod_clk;
++	struct clk		*mbus_clk;
+ 
+ 	struct reset_control	*rstc;
++
++	const struct rotate_variant *variant;
+ };
+ 
+ #endif
+diff --git a/drivers/media/platform/sunxi/sun8i-rotate/sun8i_formats.c b/drivers/media/platform/sunxi/sun8i-rotate/sun8i_formats.c
+index cebfbc5de..c1fc7e894 100644
+--- a/drivers/media/platform/sunxi/sun8i-rotate/sun8i_formats.c
++++ b/drivers/media/platform/sunxi/sun8i-rotate/sun8i_formats.c
+@@ -249,15 +249,20 @@ const struct rotate_format *rotate_find_format(u32 pixelformat)
+ 	return NULL;
+ }
+ 
+-int rotate_enum_fmt(struct v4l2_fmtdesc *f, bool dst)
++int rotate_enum_fmt(struct v4l2_fmtdesc *f, bool dst, bool yuv_dst)
+ {
+ 	int i, index;
+ 
+ 	index = 0;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(rotate_formats); i++) {
+-		/* not all formats can be used for capture buffers */
+-		if (dst && !(rotate_formats[i].flags & ROTATE_FLAG_OUTPUT))
++		/*
++		 * Not all formats can be used for capture buffers. Where the
++		 * hardware hands YUV back in the layout it was given, the YUV
++		 * entries are capture formats too.
++		 */
++		if (dst && !(rotate_formats[i].flags & ROTATE_FLAG_OUTPUT) &&
++		    !(yuv_dst && (rotate_formats[i].flags & ROTATE_FLAG_YUV)))
+ 			continue;
+ 
+ 		if (index == f->index) {
+diff --git a/drivers/media/platform/sunxi/sun8i-rotate/sun8i_rotate.c b/drivers/media/platform/sunxi/sun8i-rotate/sun8i_rotate.c
+index 12e438c67..5a8bf73b3 100644
+--- a/drivers/media/platform/sunxi/sun8i-rotate/sun8i_rotate.c
++++ b/drivers/media/platform/sunxi/sun8i-rotate/sun8i_rotate.c
+@@ -11,6 +11,7 @@
+ #include <linux/iopoll.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
++#include <linux/of.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
+@@ -223,13 +224,14 @@ static int rotate_querycap(struct file *file, void *priv,
+ static int rotate_enum_fmt_vid_cap(struct file *file, void *priv,
+ 				   struct v4l2_fmtdesc *f)
+ {
+-	return rotate_enum_fmt(f, true);
++	return rotate_enum_fmt(f, true,
++			       rotate_file2ctx(file)->dev->variant->yuv_out_passthrough);
+ }
+ 
+ static int rotate_enum_fmt_vid_out(struct file *file, void *priv,
+ 				   struct v4l2_fmtdesc *f)
+ {
+-	return rotate_enum_fmt(f, false);
++	return rotate_enum_fmt(f, false, false);
+ }
+ 
+ static int rotate_enum_framesizes(struct file *file, void *priv,
+@@ -265,10 +267,37 @@ static int rotate_set_cap_format(struct rotate_ctx *ctx,
+ 	if (!fmt)
+ 		return -EINVAL;
+ 
+-	if (fmt->flags & ROTATE_FLAG_YUV)
+-		f->pixelformat = V4L2_PIX_FMT_YUV420;
+-	else
++	if (!(fmt->flags & ROTATE_FLAG_YUV)) {
+ 		f->pixelformat = ctx->src_fmt.pixelformat;
++	} else if (!ctx->dev->variant->yuv_out_passthrough) {
++		f->pixelformat = V4L2_PIX_FMT_YUV420;
++	} else {
++		/*
++		 * Measured on D1: only 4:2:2 is decimated, and the semi-planar
++		 * layout survives -- NV12 in gives NV12 out, byte for byte.
++		 * This is what the vendor g2d_rotate.c does, and it contradicts
++		 * DE2.0 Spec 5.13.4 ("all output will be in YUV 420 planer").
++		 * Declaring planar here is not just a mislabel: the capture
++		 * format decides the chroma pitch programmed into OUT_PITCH1,
++		 * and I420's bpl/2 makes the hardware lay interleaved UV rows
++		 * down at half the stride they need, so every chroma row lands
++		 * on top of the previous one.
++		 */
++		switch (ctx->src_fmt.pixelformat) {
++		case V4L2_PIX_FMT_NV61:
++			f->pixelformat = V4L2_PIX_FMT_NV21;
++			break;
++		case V4L2_PIX_FMT_NV16:
++			f->pixelformat = V4L2_PIX_FMT_NV12;
++			break;
++		case V4L2_PIX_FMT_YUV422P:
++			f->pixelformat = V4L2_PIX_FMT_YUV420;
++			break;
++		default:
++			f->pixelformat = ctx->src_fmt.pixelformat;
++			break;
++		}
++	}
+ 
+ 	f->field = V4L2_FIELD_NONE;
+ 
+@@ -549,7 +578,12 @@ static int rotate_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	dst_vq->io_modes = VB2_MMAP | VB2_DMABUF;
+ 	dst_vq->drv_priv = ctx;
+ 	dst_vq->buf_struct_size = sizeof(struct v4l2_m2m_buffer);
+-	dst_vq->min_queued_buffers = 2;
++	/*
++	 * 上游写 2:vb2 会攒到 2 个 capture buffer 才开流,单 buffer 同步用法
++	 * (QBUF 一对 → DQBUF 一对)下 device_run 永不调度,DQBUF 永等。一次
++	 * 任务只消费一个 dst,没有任何硬件理由要 2。
++	 */
++	dst_vq->min_queued_buffers = 1;
+ 	dst_vq->ops = &rotate_qops;
+ 	dst_vq->mem_ops = &vb2_dma_contig_memops;
+ 	dst_vq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_COPY;
+@@ -742,6 +776,10 @@ static int rotate_probe(struct platform_device *pdev)
+ 	dev->vfd = rotate_video_device;
+ 	dev->dev = &pdev->dev;
+ 
++	dev->variant = of_device_get_match_data(&pdev->dev);
++	if (!dev->variant)
++		return -EINVAL;
++
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq <= 0)
+ 		return irq;
+@@ -758,6 +796,21 @@ static int rotate_probe(struct platform_device *pdev)
+ 	if (IS_ERR(dev->base))
+ 		return PTR_ERR(dev->base);
+ 
++	if (dev->variant->has_g2d_top) {
++		dev->top = devm_platform_ioremap_resource(pdev, 1);
++		if (IS_ERR(dev->top))
++			return PTR_ERR(dev->top);
++	}
++
++	if (dev->variant->has_mbus_clk) {
++		dev->mbus_clk = devm_clk_get(dev->dev, "mbus");
++		if (IS_ERR(dev->mbus_clk)) {
++			dev_err(dev->dev, "Failed to get mbus clock\n");
++
++			return PTR_ERR(dev->mbus_clk);
++		}
++	}
++
+ 	dev->bus_clk = devm_clk_get(dev->dev, "bus");
+ 	if (IS_ERR(dev->bus_clk)) {
+ 		dev_err(dev->dev, "Failed to get bus clock\n");
+@@ -859,6 +912,13 @@ static int rotate_runtime_resume(struct device *device)
+ 		goto err_bus_clk;
+ 	}
+ 
++	/*
++	 * Order matters on D1: the module clock has to be running before the
++	 * reset is released, otherwise the G2D MBUS master port starts issuing
++	 * transactions unclocked and wedges MBUS.  Since the CPU also fetches
++	 * through MBUS, the whole SoC stops dead and not even the EN reset line
++	 * brings it back.  The MBUS gate goes last, matching the vendor driver.
++	 */
+ 	ret = reset_control_deassert(dev->rstc);
+ 	if (ret) {
+ 		dev_err(dev->dev, "Failed to apply reset\n");
+@@ -866,8 +926,31 @@ static int rotate_runtime_resume(struct device *device)
+ 		goto err_mod_clk;
+ 	}
+ 
++	if (dev->mbus_clk) {
++		ret = clk_prepare_enable(dev->mbus_clk);
++		if (ret) {
++			dev_err(dev->dev, "Failed to enable mbus clock\n");
++
++			goto err_reset;
++		}
++	}
++
++	if (dev->top) {
++		writel(readl(dev->top + G2D_TOP_SCLK_GATE) | G2D_TOP_ROT,
++		       dev->top + G2D_TOP_SCLK_GATE);
++		writel(readl(dev->top + G2D_TOP_HCLK_GATE) | G2D_TOP_ROT,
++		       dev->top + G2D_TOP_HCLK_GATE);
++		/* 0 -> 1 releases the engine from soft reset */
++		writel(readl(dev->top + G2D_TOP_AHB_RESET) & ~G2D_TOP_ROT,
++		       dev->top + G2D_TOP_AHB_RESET);
++		writel(readl(dev->top + G2D_TOP_AHB_RESET) | G2D_TOP_ROT,
++		       dev->top + G2D_TOP_AHB_RESET);
++	}
++
+ 	return 0;
+ 
++err_reset:
++	reset_control_assert(dev->rstc);
+ err_mod_clk:
+ 	clk_disable_unprepare(dev->mod_clk);
+ err_bus_clk:
+@@ -880,6 +963,18 @@ static int rotate_runtime_suspend(struct device *device)
+ {
+ 	struct rotate_dev *dev = dev_get_drvdata(device);
+ 
++	if (dev->top) {
++		writel(readl(dev->top + G2D_TOP_AHB_RESET) & ~G2D_TOP_ROT,
++		       dev->top + G2D_TOP_AHB_RESET);
++		writel(readl(dev->top + G2D_TOP_HCLK_GATE) & ~G2D_TOP_ROT,
++		       dev->top + G2D_TOP_HCLK_GATE);
++		writel(readl(dev->top + G2D_TOP_SCLK_GATE) & ~G2D_TOP_ROT,
++		       dev->top + G2D_TOP_SCLK_GATE);
++	}
++
++	if (dev->mbus_clk)
++		clk_disable_unprepare(dev->mbus_clk);
++
+ 	reset_control_assert(dev->rstc);
+ 
+ 	clk_disable_unprepare(dev->mod_clk);
+@@ -888,8 +983,24 @@ static int rotate_runtime_suspend(struct device *device)
+ 	return 0;
+ }
+ 
++static const struct rotate_variant sun8i_a83t_rotate = {
++};
++
++static const struct rotate_variant sun20i_d1_rotate = {
++	.has_g2d_top		= true,
++	.has_mbus_clk		= true,
++	.yuv_out_passthrough	= true,
++};
++
+ static const struct of_device_id rotate_dt_match[] = {
+-	{ .compatible = "allwinner,sun8i-a83t-de2-rotate" },
++	{
++		.compatible = "allwinner,sun8i-a83t-de2-rotate",
++		.data = &sun8i_a83t_rotate,
++	},
++	{
++		.compatible = "allwinner,sun20i-d1-g2d-rotate",
++		.data = &sun20i_d1_rotate,
++	},
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, rotate_dt_match);

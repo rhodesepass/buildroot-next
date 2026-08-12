@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+for nvmem in /sys/bus/nvmem/devices/*/nvmem; do
+	[ -e "$nvmem" ] || continue
+	case "$(readlink -f "$(dirname "$nvmem")/device/of_node")" in
+	*/rtc@7090000)
+		printf '\115\124\123\115' | dd of="$nvmem" bs=1 seek=28 conv=notrunc 2>/dev/null
+		value=$(dd if="$nvmem" bs=1 skip=28 count=4 2>/dev/null | od -An -tx4)
+		[ "$value" = " 4d53544d" ] || {
+			echo "mstm-fel: RTC MSTM write verification failed" >&2
+			exit 1
+		}
+		sync
+		echo "mstm-fel: restarting into FEL"
+		exec reboot
+		;;
+	esac
+done
+
+echo "mstm-fel: D1 RTC NVMEM not found" >&2
+exit 1

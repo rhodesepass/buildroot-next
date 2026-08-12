@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:01 2001
+From: shirogane <artoriapendragon123@gmail.com>
+Subject: [PATCH 15/15] media: cedrus: align untiled output to 32x32
+
+The VE reconstructs frames in 32x32 blocks (VE_MODE_REC_WR_MODE_2MB is
+hardwired in cedrus_engine_enable), and on the D1-generation core the
+untiled reference readback assumes the same geometry. With the 16-aligned
+layout the mainline driver programs, any video whose coded size is not a
+multiple of 32 gets its reference frames misread by motion compensation:
+the I-frame shows slight edge corruption, and every P-frame compounds the
+error by reading chroma from unwritten (zeroed) memory, drifting the
+picture green until the next I-frame resets it.
+
+The BSP never exposes a 16-aligned untiled buffer to this core: the Tina
+d1s/d1-h/t113 cedarx configs all set gpu_align_bitwidth = 32, and
+libcedarc's fbm.c rounds both width and height up to it before
+allocating.
+
+Align bytesperline and height to 32 in cedrus_prepare_format, and keep
+cedrus_dst_format_set's chroma_size and stride registers in sync. The
+chroma plane offset everywhere (kernel and userspace) derives from
+bytesperline * height as reported by G_FMT, so the layout stays
+consistent end to end without application changes.
+
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index 0eb7b5b8a..9467ceb7a 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -89,7 +89,8 @@ void cedrus_dst_format_set(struct cedrus_dev *dev,
+ 	case V4L2_PIX_FMT_NV21:
+ 	case V4L2_PIX_FMT_YUV420:
+ 	case V4L2_PIX_FMT_YVU420:
+-		chroma_size = ALIGN(width, 16) * ALIGN(height, 16) / 2;
++		/* 必须与 cedrus_prepare_format 的 32 对齐布局一致 */
++		chroma_size = ALIGN(width, 32) * ALIGN(height, 32) / 2;
+ 
+ 		switch (fmt->pixelformat) {
+ 		case V4L2_PIX_FMT_NV12:
+@@ -111,8 +112,8 @@ void cedrus_dst_format_set(struct cedrus_dev *dev,
+ 		reg = chroma_size / 2;
+ 		cedrus_write(dev, VE_PRIMARY_CHROMA_BUF_LEN, reg);
+ 
+-		reg = VE_PRIMARY_FB_LINE_STRIDE_LUMA(ALIGN(width, 16)) |
+-		      VE_PRIMARY_FB_LINE_STRIDE_CHROMA(ALIGN(width, 16) / 2);
++		reg = VE_PRIMARY_FB_LINE_STRIDE_LUMA(ALIGN(width, 32)) |
++		      VE_PRIMARY_FB_LINE_STRIDE_CHROMA(ALIGN(width, 32) / 2);
+ 		cedrus_write(dev, VE_PRIMARY_FB_LINE_STRIDE, reg);
+ 
+ 		break;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+index ad4ec3490..52313864e 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -153,11 +153,15 @@ void cedrus_prepare_format(struct v4l2_pix_format *pix_fmt)
+ 	case V4L2_PIX_FMT_NV21:
+ 	case V4L2_PIX_FMT_YUV420:
+ 	case V4L2_PIX_FMT_YVU420:
+-		/* 16-aligned stride. */
+-		bytesperline = ALIGN(width, 16);
++		/*
++		 * Reconstruction writeback works on 32x32 blocks
++		 * (VE_MODE_REC_WR_MODE_2MB), so both stride and height must
++		 * be 32-aligned or reference frames of non-mod-32 videos get
++		 * misread by motion compensation (BSP uses align 32 too).
++		 */
++		bytesperline = ALIGN(width, 32);
+ 
+-		/* 16-aligned height. */
+-		height = ALIGN(height, 16);
++		height = ALIGN(height, 32);
+ 
+ 		/* Luma plane size. */
+ 		sizeimage = bytesperline * height;

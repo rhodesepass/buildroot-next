@@ -1,0 +1,97 @@
+#!/bin/sh
+#
+# overlayfs preinit (PID 1, entered through init=/preinit in bootargs)
+#
+# Assembles / as an overlay: read-only lower (the system) over a writable
+# upper (the data), then pivot_root into it. System and data live on
+# different MTD partitions, so reflashing rewrites the system and never
+# touches the data -- a full flash is still a data-preserving upgrade.
+#
+#   lower    = the ro UBIFS root the kernel already mounted (ubi0, rootfs)
+#   /overlay = ubi1 (the data partition, attached by ubi.mtd=data),
+#              volume rootfs_data, holding upper/ and work/
+#
+# Ported from the F1C board, minus its SD path: no card slot is populated
+# here, so root= is always ubi.
+#
+# If the data partition will not mount -- first flash, migration leftovers,
+# damaged media -- rebuild it in place. That amounts to factory-resetting the
+# data while leaving the system alone; only a second failure is fatal.
+#
+# pivot_root rather than chroot so the old root stays reachable under /rom
+# and every mount point is still visible in /proc/mounts.
+#
+# die: leave the reason in kmsg, then let PID 1 exit so the kernel panics.
+# No fallback boot, no half-working state.
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+export PATH
+
+die() {
+    echo "preinit: $*" > /dev/kmsg
+    echo "preinit: $*"
+    exit 1
+}
+
+mount -t proc proc /proc || die "cannot mount /proc"
+# the ubi tools (libubi/libmtd) work through /sys/class/ubi and
+# /sys/class/mtd; without sysfs they report "UBI is not present in the system"
+mount -t sysfs sysfs /sys || die "cannot mount /sys"
+
+root=
+for x in $(cat /proc/cmdline); do
+    case "$x" in
+        root=*) root="${x#root=}" ;;
+    esac
+done
+
+case "$root" in
+    ubi*)
+        if ! mount -t ubifs -o rw,noatime ubi1:rootfs_data /overlay; then
+            echo "preinit: rootfs_data mount failed, rebuilding data partition" > /dev/kmsg
+            mtdnum=$(sed -n 's/^mtd\([0-9]*\):.*"data"$/\1/p' /proc/mtd)
+            [ -n "$mtdnum" ] || die "no data mtd partition"
+            ubidetach -m "$mtdnum" 2> /dev/null
+            # ubiformat keeps erase counters and the bad block table;
+            # re-attaching then yields the lowest free number, ubi1
+            ubiformat -y -q "/dev/mtd${mtdnum}" || die "ubiformat data failed"
+            ubiattach -m "$mtdnum" || die "ubiattach data failed"
+            ubimkvol /dev/ubi1 -N rootfs_data -m || die "ubimkvol rootfs_data failed"
+            mount -t ubifs -o rw,noatime ubi1:rootfs_data /overlay \
+                || die "rootfs_data mount failed after rebuild"
+        fi
+        ;;
+    *)
+        die "unsupported root=$root"
+        ;;
+esac
+
+umount /sys
+umount /proc
+
+# Factory reset: something drops a flag in the upper root and reboots,
+# because the wipe can only happen before the overlay is up -- the running
+# root *is* that overlay, the binaries executing right now live in the upper,
+# and overlayfs forbids changing upper/work from underneath itself.
+# Remove the directories wholesale rather than globbing upper/* (which would
+# miss dotfiles); the flag goes with them, so this cannot repeat. Losing
+# power mid-wipe costs at worst one more wipe on the next boot.
+if [ -e /overlay/upper/.factory_reset ]; then
+    echo "preinit: factory reset, wiping upper" > /dev/kmsg
+    rm -rf /overlay/upper /overlay/work || die "factory reset failed"
+fi
+
+mkdir -p /overlay/upper /overlay/work || die "cannot create upper/work"
+mount -t overlay overlayfs:root \
+    -o "rw,noatime,lowerdir=/,upperdir=/overlay/upper,workdir=/overlay/work" \
+    /newroot || die "overlay mount failed"
+
+cd /newroot || die "cannot cd /newroot"
+pivot_root . rom || die "pivot_root failed"
+
+# the old root is /rom now; carry devtmpfs and the upper storage across
+mount -o move /rom/dev /dev || die "move /dev failed"
+mount -o move /rom/overlay /overlay || die "move /overlay failed"
+
+exec /sbin/init
+die "cannot exec /sbin/init"

@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shirogane Tsumugi <inapp@iccmc.cc>
+Date: Wed, 5 Aug 2026 03:59:36 +0800
+Subject: [PATCH 3/13] drm/sun4i: tcon_top: register clocks at probe instead of
+ bind
+
+sun8i_tcon_top registered its clock provider from bind(), which only runs
+once the whole DRM component master is assembled. On SoCs where DSI is the
+only output this deadlocks: sun6i_mipi_dsi's probe needs the "dsi" clock
+that tcon_top provides, so DSI never probes, so the master never completes,
+so bind() never runs. The symptom is an endless
+
+  sun6i-mipi-dsi 5450000.dsi: Couldn't get the DSI mod clock
+
+and no DRM device at all.
+
+Nothing in that setup path needs the master -- it only touches this device's
+own reset line, bus clock and registers -- so move it to probe() and leave
+bind() empty.
+---
+ drivers/gpu/drm/sun4i/sun8i_tcon_top.c | 41 ++++++++++++++++++++++----
+ 1 file changed, 35 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_tcon_top.c b/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
+index 8adda578c..87fdac080 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
++++ b/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
+@@ -121,10 +121,17 @@ static struct clk_hw *sun8i_tcon_top_register_gate(struct device *dev,
+ 				    bit, 0, lock);
+ };
+ 
+-static int sun8i_tcon_top_bind(struct device *dev, struct device *master,
+-			       void *data)
++/*
++ * Everything here only touches this device's own reset line, bus clock and
++ * registers -- none of it needs the DRM master. It used to run from bind(),
++ * but that deadlocks on SoCs where DSI is the only output: DSI's probe needs
++ * the "dsi" clock this function registers, so DSI never probes, so the
++ * component master never completes, so bind() never runs. Do it at probe time
++ * instead and leave bind() empty.
++ */
++static int sun8i_tcon_top_setup(struct platform_device *pdev)
+ {
+-	struct platform_device *pdev = to_platform_device(dev);
++	struct device *dev = &pdev->dev;
+ 	struct clk_hw_onecell_data *clk_data;
+ 	struct sun8i_tcon_top *tcon_top;
+ 	const struct sun8i_tcon_top_quirks *quirks;
+@@ -234,8 +241,7 @@ static int sun8i_tcon_top_bind(struct device *dev, struct device *master,
+ 	return ret;
+ }
+ 
+-static void sun8i_tcon_top_unbind(struct device *dev, struct device *master,
+-				  void *data)
++static void sun8i_tcon_top_teardown(struct device *dev)
+ {
+ 	struct sun8i_tcon_top *tcon_top = dev_get_drvdata(dev);
+ 	struct clk_hw_onecell_data *clk_data = tcon_top->clk_data;
+@@ -250,6 +256,18 @@ static void sun8i_tcon_top_unbind(struct device *dev, struct device *master,
+ 	reset_control_assert(tcon_top->rst);
+ }
+ 
++static int sun8i_tcon_top_bind(struct device *dev, struct device *master,
++			       void *data)
++{
++	/* clocks are already live; see sun8i_tcon_top_setup() */
++	return 0;
++}
++
++static void sun8i_tcon_top_unbind(struct device *dev, struct device *master,
++				  void *data)
++{
++}
++
+ static const struct component_ops sun8i_tcon_top_ops = {
+ 	.bind	= sun8i_tcon_top_bind,
+ 	.unbind	= sun8i_tcon_top_unbind,
+@@ -257,12 +275,23 @@ static const struct component_ops sun8i_tcon_top_ops = {
+ 
+ static int sun8i_tcon_top_probe(struct platform_device *pdev)
+ {
+-	return component_add(&pdev->dev, &sun8i_tcon_top_ops);
++	int ret;
++
++	ret = sun8i_tcon_top_setup(pdev);
++	if (ret)
++		return ret;
++
++	ret = component_add(&pdev->dev, &sun8i_tcon_top_ops);
++	if (ret)
++		sun8i_tcon_top_teardown(&pdev->dev);
++
++	return ret;
+ }
+ 
+ static void sun8i_tcon_top_remove(struct platform_device *pdev)
+ {
+ 	component_del(&pdev->dev, &sun8i_tcon_top_ops);
++	sun8i_tcon_top_teardown(&pdev->dev);
+ }
+ 
+ static const struct sun8i_tcon_top_quirks sun8i_r40_tcon_top_quirks = {
