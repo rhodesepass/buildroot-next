@@ -1,0 +1,18 @@
+config BR2_PACKAGE_LVGL
+	bool "lvgl"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_FREETYPE
+	select BR2_PACKAGE_LIBPNG
+	select BR2_PACKAGE_JPEG
+	help
+	  LVGL (Light and Versatile Graphics Library) built as a shared
+	  library against a fixed lv_conf.h shipped by this package.
+
+	  Backends enabled: FreeType text, libpng, libjpeg-turbo JPEG,
+	  QR code. Consumers link -llvgl and pull the same lv_conf.h from
+	  the sysroot, so all users share one ABI.
+
+	  https://lvgl.io
+
+comment "lvgl needs a toolchain w/ threads"
+	depends on !BR2_TOOLCHAIN_HAS_THREADS

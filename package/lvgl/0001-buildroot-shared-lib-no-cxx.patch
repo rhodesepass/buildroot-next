@@ -1,0 +1,62 @@
+Build LVGL as a shared library on a C-only Buildroot toolchain.
+
+Three changes needed to package LVGL 9.5 as a standalone shared library
+against a toolchain without a C++ frontend (BR2_INSTALL_LIBSTDCPP off):
+
+  1. Drop the unconditional enable_language(CXX) - nothing we build is C++
+     (ThorVG internal is disabled via CONFIG_LV_USE_THORVG_INTERNAL=OFF).
+  2. Drop src/*.cpp from the source glob - the optional C++ bridges
+     (glTF/TFT_eSPI/LovyanGFX/vg_lite_tvg) would otherwise be compiled
+     unconditionally and need cc1plus.
+  3. Link freetype/libpng/libjpeg into the lvgl target itself. Upstream
+     leaves those symbols for the final application to resolve, which only
+     works when lvgl is statically embedded; a shared object must record
+     the NEEDED entries at its own link time.
+
+Signed-off-by: epass board
+
+--- a/CMakeLists.txt	2026-07-15 02:15:39.509162559 +0800
++++ b/CMakeLists.txt	2026-07-15 02:15:47.682968677 +0800
+@@ -10,7 +10,7 @@
+       HOMEPAGE_URL https://github.com/lvgl/lvgl)
+   endif()
+   if(NOT (CMAKE_C_COMPILER_ID STREQUAL "MSVC"))
+-    enable_language(CXX ASM)
++    enable_language(ASM)
+   else()
+     enable_language(CXX)
+   endif()
+--- a/env_support/cmake/os_desktop.cmake	2026-07-15 02:15:39.511223679 +0800
++++ b/env_support/cmake/os_desktop.cmake	2026-07-15 02:16:00.153681201 +0800
+@@ -59,7 +59,6 @@
+ 
+ # Set sources used for LVGL components
+ file(GLOB_RECURSE SOURCES ${LVGL_ROOT_DIR}/src/*.c
+-                          ${LVGL_ROOT_DIR}/src/*.cpp
+                           ${LVGL_ROOT_DIR}/src/*.S)
+ file(GLOB_RECURSE EXAMPLE_SOURCES ${LVGL_ROOT_DIR}/examples/*.c)
+ file(GLOB_RECURSE DEMO_SOURCES ${LVGL_ROOT_DIR}/demos/*.c)
+@@ -81,6 +80,23 @@
+ add_library(lvgl ${SOURCES})
+ add_library(lvgl::lvgl ALIAS lvgl)
+ 
++# buildroot(shared lvgl): upstream 把 freetype/libpng/libjpeg 的符号解析留给最终 app,
++# 静态时没问题; 编成 .so 后库自身必须在构建期链上这些外部依赖, 否则留下未定义符号。
++if(LV_USE_FREETYPE OR NOT DEFINED LV_USE_FREETYPE)
++  find_package(Freetype)
++  if(Freetype_FOUND)
++    target_link_libraries(lvgl PUBLIC Freetype::Freetype)
++  endif()
++endif()
++find_package(PNG)
++if(PNG_FOUND)
++  target_link_libraries(lvgl PUBLIC PNG::PNG)
++endif()
++find_package(JPEG)
++if(JPEG_FOUND)
++  target_link_libraries(lvgl PUBLIC JPEG::JPEG)
++endif()
++
+ if (NOT LV_BUILD_USE_KCONFIG)
+ 
+     # Default - use the lv_conf.h configuration file
