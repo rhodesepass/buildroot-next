@@ -1,0 +1,8 @@
+config BR2_PACKAGE_EPASS_DRM_APP
+	bool "epass_drm_app"
+	select BR2_PACKAGE_LVGL
+	select BR2_PACKAGE_SRGNVDEC
+	help
+	  Electronic Pass main program.
+
+	  https://github.com/rhodesepass/drm_app_neo
