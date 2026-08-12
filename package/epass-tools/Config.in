@@ -1,0 +1,8 @@
+config BR2_PACKAGE_EPASS_TOOLS
+	bool "epass-tools"
+	help
+	  Board-specific diagnostic tools for ePass Next:
+	  - cedrus-probe: inspect Cedrus V4L2 formats and buffer layouts
+	  - rot-probe: exercise and verify the sun8i-rotate device
+	  - vectest: verify and benchmark the xtheadvector (RVV 0.7.1)
+	    kernel plumbing and musl string routines on the C906
