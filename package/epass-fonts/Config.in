@@ -1,0 +1,31 @@
+config BR2_PACKAGE_EPASS_FONTS
+	bool "epass-fonts"
+	help
+	  Shared UI fonts for epass devices (body/title/display/icon).
+
+	  Master fonts are subsetted on the host and installed to
+	  /usr/share/fonts/epass. Also provides pkg-config 'epass-fonts'
+	  (build-time: fontsdir / per-role paths) and /usr/bin/epass-font
+	  (runtime path resolver).
+
+	  https://github.com/rhodesepass/epass-fonts
+
+if BR2_PACKAGE_EPASS_FONTS
+
+config BR2_PACKAGE_EPASS_FONTS_CHARSET_FILES
+	string "CJK charset files"
+	default "board/rhodesisland/epass-next/fonts/charset/common.txt board/rhodesisland/epass-next/fonts/charset/operators.txt board/rhodesisland/epass-next/fonts/charset/literals.txt board/rhodesisland/epass-next/fonts/charset/anime_games.txt"
+	help
+	  Space-separated list of UTF-8 text files. Every character in
+	  these files is kept in the subsetted CJK fonts (body/title).
+	  Paths are relative to the Buildroot top directory.
+
+config BR2_PACKAGE_EPASS_FONTS_ICONS_FILE
+	string "icon codepoints file"
+	default "board/rhodesisland/epass-next/fonts/icons.txt"
+	help
+	  File with hexadecimal codepoints (one per line, '#' comments)
+	  kept in the subsetted icon font. Path is relative to the
+	  Buildroot top directory.
+
+endif
