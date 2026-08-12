@@ -1,0 +1,27 @@
+config BR2_PACKAGE_SRGNVDEC
+	bool "srgnvdec"
+	help
+	  Allwinner cedrus stateless H.264 decode stack: mp4 demux,
+	  NAL/SPS/PPS/slice parser, DPB reordering and the V4L2 request
+	  API decode engine. Outputs dmabuf fds for zero-copy scanout.
+
+	  Split out of drm_app_neo so both product lines and other
+	  video-decoding programs share one copy.
+
+	  https://github.com/rhodesepass/srgnvdec
+
+if BR2_PACKAGE_SRGNVDEC
+
+config BR2_PACKAGE_SRGNVDEC_TOOLS
+	bool "srgnvdec_play (minimal player / bring-up tool)"
+	depends on BR2_PACKAGE_LIBDRM
+	default y
+	help
+	  Standalone player that runs the whole chain without the app:
+	  mp4 -> parse -> DPB -> cedrus decode -> DRM plane. Useful for
+	  bring-up and for telling decode bugs apart from app bugs.
+
+comment "srgnvdec_play needs libdrm"
+	depends on !BR2_PACKAGE_LIBDRM
+
+endif
