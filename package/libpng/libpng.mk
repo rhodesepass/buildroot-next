@@ -20,6 +20,10 @@ LIBPNG_CONFIG_SCRIPTS = libpng$(LIBPNG_SERIES)-config libpng-config
 LIBPNG_CONF_OPTS = --disable-tools
 LIBPNG_CFLAGS = $(TARGET_CFLAGS)
 
+ifneq ($(findstring xtheadvector,$(call qstrip,$(BR2_RISCV_ISA_EXTRA))),)
+LIBPNG_CONF_OPTS += --disable-riscv-rvv
+endif
+
 ifeq ($(BR2_aarch64),y)
 LIBPNG_CONF_OPTS += --enable-arm-neon
 else ifeq ($(BR2_ARM_CPU_HAS_NEON):$(BR2_ARM_SOFT_FLOAT),y:)

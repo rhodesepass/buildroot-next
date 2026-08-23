@@ -1,0 +1,21 @@
+config BR2_PACKAGE_EPASS_APPLICATIONS
+	bool "epass applications"
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_USE_MMU
+	depends on BR2_USE_WCHAR
+	select BR2_PACKAGE_DOSFSTOOLS
+	select BR2_PACKAGE_DOSFSTOOLS_MKFS_FAT
+	select BR2_PACKAGE_E2FSPROGS
+	select BR2_PACKAGE_EPASS_FONTS
+	select BR2_PACKAGE_FREETYPE
+	select BR2_PACKAGE_LIBDRM
+	select BR2_PACKAGE_LIBPNG
+	select BR2_PACKAGE_LVGL
+	select BR2_PACKAGE_SRGNVDEC
+	help
+	  Applications for the Electronic Pass, installed below /app.
+
+	  https://github.com/rhodesepass/epass-applications
+
+comment "epass applications needs a toolchain w/ threads, wchar, MMU"
+	depends on !BR2_TOOLCHAIN_HAS_THREADS || !BR2_USE_WCHAR || !BR2_USE_MMU
