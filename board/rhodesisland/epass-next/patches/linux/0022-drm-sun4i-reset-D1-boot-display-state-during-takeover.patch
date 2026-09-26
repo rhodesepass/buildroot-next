@@ -1,0 +1,88 @@
+From: ePass maintainers
+Subject: [PATCH] drm: sun4i: reset D1 boot display state during takeover
+
+Stop inherited mixer DMA before removing simpledrm and releasing its reserved
+framebuffer. Reset the DSI instruction engine before the PHY acquires its
+shared reset reference, keeping the shared reset accounting balanced.
+This lets firmware retain its splash until the native DRM components bind.
+
+diff --git a/drivers/gpu/drm/sun4i/sun6i_mipi_dsi.c b/drivers/gpu/drm/sun4i/sun6i_mipi_dsi.c
+--- a/drivers/gpu/drm/sun4i/sun6i_mipi_dsi.c
++++ b/drivers/gpu/drm/sun4i/sun6i_mipi_dsi.c
+@@ -713,6 +713,33 @@
+ 	return 0;
+ }
+ 
++static int sun6i_dsi_reset_boot_state(struct sun6i_dsi *dsi)
++{
++	int ret;
++
++	if (!of_device_is_compatible(dsi->dev->of_node,
++				     "allwinner,sun20i-d1-mipi-dsi"))
++		return 0;
++
++	ret = clk_prepare_enable(dsi->bus_clk);
++	if (ret)
++		return ret;
++
++	/* The PHY has not acquired its shared reset reference yet. */
++	ret = reset_control_deassert(dsi->reset);
++	if (ret)
++		goto disable_clock;
++
++	sun6i_dsi_inst_abort(dsi);
++	ret = reset_control_assert(dsi->reset);
++	if (!ret)
++		udelay(10);
++
++disable_clock:
++	clk_disable_unprepare(dsi->bus_clk);
++	return ret;
++}
++
+ static void sun6i_dsi_encoder_enable(struct drm_encoder *encoder)
+ {
+ 	struct drm_display_mode *mode = &encoder->crtc->state->adjusted_mode;
+@@ -728,6 +755,13 @@
+ 	err = regulator_enable(dsi->regulator);
+ 	if (err)
+ 		dev_warn(dsi->dev, "failed to enable VCC-DSI supply: %d\n", err);
++
++	err = sun6i_dsi_reset_boot_state(dsi);
++	if (err) {
++		dev_err(dsi->dev, "Failed to reset boot DSI state: %d\n", err);
++		regulator_disable(dsi->regulator);
++		return;
++	}
+ 
+ 	reset_control_deassert(dsi->reset);
+ 	clk_prepare_enable(dsi->mod_clk);
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <linux/component.h>
++#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/io.h>
+ #include <linux/sysfs.h>
+@@ -1140,6 +1141,17 @@
+ 		return PTR_ERR(mixer->reset);
+ 	}
+ 
++	if (of_device_is_compatible(dev->of_node,
++				    "allwinner,sun20i-d1-de2-mixer-0") ||
++	    of_device_is_compatible(dev->of_node,
++				    "allwinner,sun20i-d1-de2-mixer-1")) {
++		/* Stop firmware DMA before simpledrm releases its framebuffer. */
++		ret = reset_control_assert(mixer->reset);
++		if (ret)
++			return dev_err_probe(dev, ret, "Couldn't stop boot mixer\n");
++		udelay(10);
++	}
++
+ 	ret = reset_control_deassert(mixer->reset);
+ 	if (ret) {
+ 		dev_err(dev, "Couldn't deassert our reset line\n");

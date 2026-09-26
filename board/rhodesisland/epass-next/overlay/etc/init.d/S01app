@@ -21,7 +21,7 @@ log() {
     echo "epass_app: $*" > /dev/kmsg
 }
 
-# 不能读 /sys/class/drm/card0-*/modes:FBDEV_EMULATION 关了,app 自己
+# 不能读 /sys/class/drm/card*-*/modes:FBDEV_EMULATION 关了,app 自己
 # 打开 DRM 之前没人 probe connector,modes 恒为空
 #
 # 面板挂在 DSI 总线下(soc/dsi@*/panel@0),不是 F1C 那种根节点 /panel
@@ -64,19 +64,24 @@ supervise() {
     # (simple-framebuffer 节点), 真正的 sun4i 驱动编成了模块, 现在才加载 --
     # 面板复位重初始化那 ~0.4s 黑屏因此贴着 app 首帧, 而不是落在 boot 中间。
     # 组件驱动先注册, 最后 sun4i-drm 主驱动进来 bind 整条流水线并踢掉
-    # simpledrm(card0 号会被复用, app 打开的还是 card0)。
+    # simpledrm；card 编号由注册时序决定，APP 按驱动发现设备。
     # 没有 splash 时这些 modprobe 也一样要做, 顺序无所谓, 失败单独容忍。
     for m in panel-sitronix-st7703 phy-sun6i-mipi-dphy sun8i-tcon-top \
              sun8i-mixer sun4i-tcon sun6i-mipi-dsi sun4i-drm; do
         modprobe "$m" 2> /dev/null
     done
-    # bind 是异步的(component framework), 等 DSI 接上再放 app 进去,
-    # 免得首启动打开 /dev/dri/card0 扑空; 3s 等不到就不拦了
+    # simpledrm 仍占用 card0 时，原生驱动可能注册为 card1。
     n=0
-    while [ ! -e /sys/class/drm/card0-DSI-1 ] && [ "$n" -lt 30 ]; do
+    while [ "$n" -lt 30 ]; do
+        ready=0
+        for connector in /sys/class/drm/card*-DSI-1; do
+            [ -e "$connector" ] && ready=1 && break
+        done
+        [ "$ready" -eq 1 ] && break
         sleep 0.1
         n=$((n + 1))
     done
+    [ "$ready" -eq 1 ] || log "DSI connector not ready after 3s"
 
     # 首次开机：SD 已挂载，再跑 quick_start，之后才进主 app。
     # 二进制不在(epass_applications 还没搬过来)时不落标记,

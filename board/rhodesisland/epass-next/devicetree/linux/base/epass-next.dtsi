@@ -267,7 +267,17 @@
 
 /* --- display: DE2.0 -> mixer0 -> tcon_top -> tcon_lcd0 -> dsi --- */
 &de {
+	allwinner,pipelines = <&mixer0>;
 	status = "okay";
+};
+
+/* The unused pipeline otherwise holds its mixer and TCON bus clocks on. */
+&mixer1 {
+	status = "disabled";
+};
+
+&tcon_tv0 {
+	status = "disabled";
 };
 
 &tcon_top {

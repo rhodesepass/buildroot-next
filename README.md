@@ -1,5 +1,8 @@
 # ePass Next（Allwinner D1s）
 
+显示接管先停止固件 DMA 再释放 splash 保留内存；启动脚本按 DSI connector
+发现设备，并仅启用 mixer0，关闭未使用的 mixer1/tcon_tv0。
+
 修复 D1 codec 路由、HPLDO/DAC/RAMP 上电顺序，以及 TinyALSA SYNC_PTR
 状态查询误写 appl_ptr 导致的播放提前结束。
 

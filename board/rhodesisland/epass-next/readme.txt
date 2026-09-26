@@ -1,3 +1,6 @@
+Display takeover stops firmware DMA before releasing splash memory. Startup
+discovers DSI connectors dynamically; only the mixer0 pipeline remains enabled.
+
 Audio fixes cover D1 codec routes and HPLDO/DAC/RAMP sequencing plus TinyALSA
 SYNC_PTR status queries preserving the application pointer.
 
