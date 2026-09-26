@@ -1,22 +1,181 @@
 # ePass Next（Allwinner D1s）
 
-BMC/TP 从各自 origin/master 构建，保留固定独立工具链和镜像/协议校验。
-先推送固件再发布 Buildroot，刷新缓存后分步 dirclean/build；生成统一发布清单。
+## 当前构建与仓库关系
 
-刷写源码集中在 flasher/，发布包提供 USB 和 BLE/Wi-Fi 入口。
-WCH/ESP 必须显式选择，--dry-run 可在无硬件时检查计划，详见 FLASHING.md。
+本仓库维护 D1s Linux/U-Boot 补丁、设备树、根文件系统、固件包和刷写工具。
+BMC 与触控固件分别维护于 `rhodesepass/bmc_fw`、`rhodesepass/tp_fw`；三个
+仓库独立提交，通过 Buildroot Git 包关联，不使用 submodule 或本地目录隐式依赖。
+两个固件包均拉取 `origin/master`，不固定源码提交或源码哈希。
 
-显示接管先停止固件 DMA 再释放 splash 保留内存；启动脚本按 DSI connector
-发现设备，并仅启用 mixer0，关闭未使用的 mixer1/tcon_tv0。
+```sh
+make epass_next_defconfig
+make -j8
+```
 
-修复 D1 codec 路由、HPLDO/DAC/RAMP 上电顺序，以及 TinyALSA SYNC_PTR
-状态查询误写 appl_ptr 导致的播放提前结束。
+产物位于 `output/images/`；USB 使用 `flasher/flash.py`，无线升级使用
+`flasher/ota.py`，先加 `--dry-run` 核对更新范围。默认不更新 WCH/ESP，需分别
+指定 `--wch`、`--esp`；完整说明见 [FLASHING.md](FLASHING.md)。
 
-Linux 设备树与现板引脚对齐，内建 BMC 电量/READY/关机驱动及 CH32 触摸驱动；
-触摸协议头在 post-image 与实际内核源码比对，内核与 rootfs 应成套更新。
+发布顺序为：先提交、测试并推送 BMC/TP，再提交和推送依赖它们的 Buildroot。
+推送固件后，普通 `make` 仍可能使用旧下载缓存；在本目录执行：
 
-启动链按现板接线使用 SPI0 BMC SPL、SPI1 NAND 和 PG8/PG9 UART3；
-统一外部 FIT OTA，增加 CH32 SWIO 更新和 SPL SRAM 布局校验。
+```sh
+rm -f dl/epass-bmc-firmware/epass-bmc-firmware-origin_master-git4.tar.gz
+rm -f dl/ch32-touch-firmware/ch32-touch-firmware-origin_master-git4.tar.gz
+make epass-bmc-firmware-dirclean ch32-touch-firmware-dirclean
+make epass-bmc-firmware ch32-touch-firmware
+make -j8
+```
+
+自定义 `BR2_DL_DIR` 时调整缓存路径，清理和构建必须分步完成。
+发布清单中的 `origin/master` 是下载引用，不是解析后的提交号；产物通过长度、
+SHA256、工具链及协议检查核验。首次启用 BMC 深睡须一并升级配套 bootloader，
+应用 OTA 无法更新 bootloader。用户应用需支持显式 READY，才能启用正常控电。
+
+## 本次提交整理验证（2026-09-26）
+
+- BMC ESP-IDF 构建、78 项主机测试及 bootloader 救援测试通过；拆分提交的
+  中间版本另行检查充电、运行态和深睡测试。TP 独立 make 与协议/触摸测试通过。
+- U-Boot 7 个、Linux 24 个补丁从下载的原始源码顺序应用通过，未使用模糊匹配。
+  DT FIT 编译、SPL SRAM 布局、内核/固件触摸协议核验通过。
+- Buildroot 75 项刷写和 33 项固件/清单测试通过，新增包格式检查 279 行、
+  0 警告；全新输出目录的 defconfig 和包依赖解析通过。
+
+本次未重新构建整套 Buildroot 镜像，未刷新发布镜像，也未进行新的实板刷写或
+功耗/充电验收。下面历史记录的构建与板测结果只适用于对应轮次。
+
+## 历史验证记录
+
+以下按日期记录各轮结果；旧轮次的源码锁策略、产物大小和实板结论不代表当前版本。
+
+2026-09-26：实际 DT FIT 的公共板级 `epass-next.dtsi` 只保留 mixer0 显示管线，
+禁用未使用的 mixer1、tcon_tv0。Wi-Fi OTA 实验固件保留同一 kernel，板上启动
+及播放状态正常；mixer1、bus-mixer1、bus-tcon-tv 的 enable count 为 0，硬件门控
+均为关闭。相同 Spine 测试下电池侧平均功率从 1028.55 mW 降至 1003.84 mW，
+约省 24.71 mW（2.4%）；面板仍用原生时序。板级源码另行 dtc 验证，不重建或覆盖
+现有 images。证据见工作区 `power_measure/test-results/20260926-022314-explore/`，
+实验构建见 `power_measure/experiments/display-dt/`。
+
+2026-09-23：CH32 触摸驱动迁入内核树，使用 `CONFIG_INPUT_CH32_TOUCH_SLIDER=y`
+随内核构建并直接内建。移除独立 `ch32-touch-slider` 包和 S35 模块加载脚本。
+驱动源码由 Linux 补丁 0024 提供；CH32 固件协议检查使用板级协议头，
+post-image 核对其与实际内核源码一致。驱动更新须同时部署新内核和 rootfs。
+干净内核构建、完整 Buildroot 构建、协议测试和 40 项固件/清单测试通过；
+确认驱动已链接进 vmlinux，rootfs 无旧模块和启动脚本，发布哈希一致。未刷板。
+
+2026-09-21：CH32V006 触控固件独立维护于 `rhodesepass/tp_fw` 的 `master`，
+工作区入口为 `../tp_fw/`，支持独立编译、主机测试及 WCH-LinkE/GDB 调试。
+`ch32-touch-firmware` 从 Git 远端 master 构建，包内不保存重复固件源码，
+不固定 commit 或源码哈希；发布清单仍检查镜像完整性及完整驱动协议。
+此前固定版本的独立构建、7 项回归、完整构建及 11 个发布产物哈希核验通过。
+维护方式见 [触控固件包说明](package/ch32-touch-firmware/README.md)。
+
+2026-09-21：BMC 固件包通过 Git 获取 `rhodesepass/bmc_fw` 的 master，
+不固定 commit 或源码哈希。使用原独立 IDF 工具链，版本标记为 `br-master`。
+两包的普通增量构建会复用下载缓存；更新远端代码后需清除对应 origin_master 归档，
+再执行包的 dirclean/build，详见各包说明。此前固定版本的 BMC 干净构建、
+32 项构建/清单测试和实际产物 dry-run 通过；本次未刷板。
+
+2026-09-21：ESP 单目标实板测试通过：USB 完整回读一致，Wi-Fi OTA 13.15 秒、
+BLE OTA（ATT 244）723.02 秒，均持久化 1255424 字节。重启后版本和运行槽
+核验通过，Linux/APP READY 正常、OTA pending 清零。101 项主机测试复验通过。
+未实板测试三芯片组合升级或断电恢复；详见工作区
+`ota/artifacts/board-test/20260921-buildroot-esp/README.md`。
+
+2026-09-20：ESP32-C3 固件纳入 `epass-bmc-firmware`，独立固定 ESP-IDF 6.0.2、
+工具链与 Python 依赖，源码快照校验后构建到 `images/esp/`，不依赖用户 IDF。
+`flasher/ota.py --esp` 支持 BLE/Wi-Fi 单独或组合升级，先暂存 ESP 备用槽，
+全部目标完成后统一提交并重启；默认仍不更新 ESP。详见
+[BMC 构建说明](package/epass-bmc-firmware/README.md) 和 [烧录说明](flasher/README.md)。
+独立 SDK 构建、完整 `make`、post-image 清单验证及 101 项主机测试通过；
+ESP 应用为 1255424 字节，本次未实板刷写或验证新固件启动。
+
+2026-09-20：烧录源码集中在 `flasher/`，不再从外部未跟踪目录打包无线客户端。
+`flasher/flash.py` 用于首次/完整 USB 系统烧录，`flasher/ota.py` 用于 BLE/Wi-Fi OTA。
+`--wch/--no-wch`、`--esp/--no-esp` 独立选择外设，默认都不更新；
+`--no-system` 可只更新外设，`--dry-run` 检查镜像并显示计划。
+WCH 支持三种通道；ESP 当前也已支持 BLE/Wi-Fi OTA。OTA 默认只更新 boot/rootfs，
+保留 data 上的可写 overlay；目前没有独立 overlay OTA 安装协议。
+`make clean` 只清理打包副本，保留 flasher 源码。主机测试及真实镜像 dry-run
+通过，本次未执行实板刷写。完整参数、依赖与示例见 [烧录说明](flasher/README.md)。
+
+2026-09-20：CH32 触控固件已纳入普通 Buildroot 构建。独立固定源码快照与
+WCH GCC12 工具链，输出 `ch32-touch.bin/.elf/.map`、`ch32-touch.json`，
+post-image 生成统一 `release-manifest.json`。构建核对源码锁、Linux协议一致性、
+长度和对齐；touch 始终为显式选择的 OTA 目标，不随普通 Linux 更新自动刷写。
+完整构建通过，10352字节产物与此前实板程序有效内容逐字一致。
+维护及更新方式见 `package/ch32-touch-firmware/README.md`。
+
+2026-09-20：U-Boot 增加 PG13/PG15 SWIO 的 CH32V006 触控烧录命令，
+OTA 新增 `touch` 目标。完整固件先在 RAM 校验 SHA256，再逐页擦写回读；
+只允许最多 62 KiB 主 Flash，保留末页范围外数据，不修改选项字节或读保护。
+BMC、Python 和网页客户端同步支持触控单目标事务。补丁已同步且往返
+校验通过，Buildroot 已 dirclean 后重新应用补丁并构建；Wi-Fi触控单目标
+OTA 63488 字节写入、独立读回一致和重启input探测已通过。详细实板状态见
+工作区 `ota/artifacts/board-test/20260920-touch/README.md`。
+
+2026-09-19：n0.2 接入 SPI0 BMC 运行时驱动，内建电量/版本/电源状态接口。
+APP 完整初始化及首帧后显式 READY 才允许 BMC 控电，正常关机通过内核
+sys-off prepare 通知 BMC。APP 通信失败不使用旧电量触发关机。
+BMC 另有五秒长按强关及独立 bootloader ROM 救援。内核、DT FIT、APP 交叉
+构建及主机测试通过；已上板验证 READY、软关机、实体五秒强关/短按开机。
+无电池时容量/电压失效，USB 状态仍有效。一轮故障注入走通 FEL/uopbridge；
+最新救援手势/计数、带电池 QON 及冷启动毛刺复位仍有验证边界。本轮部署
+boot 与 APP720，rootfs/data 保留。详见工作区 epass_bmc/docs/app-runtime.md。
+
+2026-09-19：修复 D1 codec 数字路由引用不存在的 Left/Right ADC，改为模拟侧
+实际注册的 ADC1/ADC2。内核已构建、仅更新 NAND boot 内核区域并 SHA256
+回读一致，重启后 D1 Audio Codec 注册成功。发现 TinyALSA 2.0 在 RISC-V
+SYNC_PTR 回退路径读取状态时回写旧 appl_ptr，已加入包补丁修复。
+直接 PCM 写入并 drain 实测 480000 帧耗时 10.015 秒；修复库实板 A/B 使
+tinyplay 同一 10 秒 WAV 从 0.31 秒恢复至 9.96 秒，修复库已安装并哈希校验。
+后续示波器发现双路 HPOUT 固定高电平：对照 Tina BSP 补齐 HPLDO 供电、
+30 ms 等待和左右 DAC 解除静音，用户确认双路波形出现。已持久化到 DAPM，
+耳机 RAMP 按 DAC 之后上电、之前下电排序并等待 100 ms。新内核 #4 已刷写
+回读校验并重启，首次播放、停止、再次播放的供电/静音寄存器切换通过。
+用户已用示波器确认重启后双路波形均正常，持久修复完成实板播放闭环。
+A 版芯片手动 HP2 序列不在本次验证范围内。
+详细证据与测试工具见工作区 ota/artifacts/board-test/20260919-codec/。
+
+2026-09-18：n0.2 接入 PG10 电源键为 `KEY_0`，低有效、内部上拉、20 ms 去抖。
+上拉通过 GPIO descriptor 标志配置，避免静态 pinctrl 与 GPIO 申请冲突。
+CH32 增加 `ABS_MISC` 状态：bit0 位置有效、bit1 多点、bit2 取消，与
+`BTN_TOUCH/ABS_X` 同帧提交；通信错误立即取消手势，持续失败 100 ms 释放。
+恢复后仍按住的接触保持取消直到实际松开。普通松手状态为 0，保留最后 X。
+该接口用于应用区分真实滑动和异常释放；本次没有实板刷写或功能验收。
+
+2026-09-13：BMC 无线更新统一为外部完整 U-Boot FIT → RAM → NAND，
+正常启动与更新共用 `u-boot.itb`，USB FEL/DFU 也先外部加载完整 U-Boot。
+BMC 仅保存两份正常 SPL；同一 SPL 根据更新请求选择外部 FIT 或正常
+NAND 启动，更新不依赖 NAND 现有程序或环境。
+BMC 已另行实现 BLE 引导 STA/AP 与 Wi-Fi HTTP 通道（ESP-IDF 工程，
+不属于 Linux Buildroot 包）；已编译及host测试；Wi-Fi实板提速版本约40–47 KiB/s，但中断看门狗未解决，
+不能作为稳定发布。板子已恢复测试前BMC，见工作区Wi-Fi板测记录。
+已上板通过正常启动、外部 FIT 加载、256 KiB 校验及 NAND U-Boot 更新回读，
+并重启 Linux/app_720。实板修复 SRAM 布局与 FIT 对齐读问题，Buildroot
+同步重建通过。详见工作区 `ota/README.md` 和本树板级 readme。
+
+2026-09-13：加入 `ch32-touch-slider` 内核模块包，n0.2 集成六电极滑条
+`0x2a`，输出 BTN_TOUCH/ABS_X。FPC 针号直连使用 GPIO I²C：SCL=PG7、
+SDA=PG6，IRQ=PG14（内部上拉、低有效）；保留 PG13/PG15 调试/复位。
+驱动源码和协议头随 Buildroot 保存，不依赖 MounRiver 工程路径。
+构建启用 I2C_GPIO、i2c-tools 与开机模块加载。完整镜像及上板启动通过，
+GPIO I²C 总线已注册，但 CH32 0x2a 实物无 ACK，两种线序和复位均未恢复，
+尚未产生 input 设备；详细验证记录见板级 readme。
+
+2026-09-10：按主板导出网表同步 APP：背光 PWM5/PG4、屏复位 PG12、DSI 三 lane；
+PG6/PG7 改 I2C2 键盘 FPC 总线，删除旧 GPIO 按键及不存在的 AXP209 节点，
+关闭 SPL AXP209 初始化与未接线 USB1 host。SD、耳机、UART3、SPI1 保持网表对应连接。
+当前 n0.2 名称不变，键盘 MCU 地址/协议、电源键 PG10（经 D2）/键盘 IRQ PG14（经 R25）的驱动和板级显示测试待确认。
+
+2026-09-10：启动链改为 ESP32-C3 在 SPI0 提供 SPL，SPL 切 SPI1 从物理 NAND
+0x40000 加载 U-Boot。U-Boot/Linux NAND 使用原理图 PD10–PD15（IO2=PD15、IO3=PD14），
+保留原分区偏移；原 SPI0 实测结论不覆盖本次接线，SPI1 启动仍待上板验证。
+
+2026-09-10：调试串口从 PB6/PB7 迁到 C3 对应的 PG8/PG9（UART3，115200），
+覆盖 SPL early UART、U-Boot/OpenSBI 设备树和 Linux ttyS3；原控制台编号不变。
+C3 提供独立 1 KiB eGON FEL 镜像，跳 ROM 0x20 前关闭 I-cache，供后续 uopbridge 下载恢复。
+以上调试路径尚未验证实板。
 
 图例：
 
@@ -191,3 +350,8 @@ make
 
 - 板级现状：[board/rhodesisland/epass-next/readme.txt](board/rhodesisland/epass-next/readme.txt)
 
+
+2026-09-10 实板验证：ESP32-C3 经 BootROM SPI0 提供 SPL，后续从硬件 SPI1 NAND
+启动 OpenSBI、U-Boot、Linux 7.1.6，已到达登录界面并确认 UBIFS/可写 overlay。
+UART3 PG8/PG9 可通过 BMC BLE 双向使用；详见同级 `epass_bmc/README.md`。
+本次 rootfs/Image 使用已核对版本的现有 7.1.6 产物，未声称重新构建整个发行版。

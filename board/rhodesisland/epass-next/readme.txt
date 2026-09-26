@@ -1,20 +1,301 @@
-Peripheral packages follow origin/master with isolated pinned toolchains and
-image/protocol checks. Publish firmware first, refresh caches, then build releases.
+Repository dependencies and release order (2026-09-26)
+----------------------------------------------------
+BMC (rhodesepass/bmc_fw), TP (rhodesepass/tp_fw), and Buildroot are independent
+repositories, not submodules. Both peripheral packages fetch origin/master;
+local uncommitted or unpushed changes are not included. Commit/test/push firmware
+first, then publish the matching Buildroot integration. Keep floating source
+references; retain toolchain hashes, image integrity and wire-protocol checks.
+Remove each package's origin_master-git4 download archive before refreshing it,
+then complete package dirclean before starting its build. Adjust paths for
+BR2_DL_DIR. Source revision fields name the reference, not the resolved commit.
+Initial BMC deep-sleep deployment requires the matching bootloader as well as
+the application; OTA updates only the application. APP must explicitly send READY.
+The dated records below describe earlier validation, not a fresh board acceptance.
 
-Flashing sources live in flasher/ with packaged USB and BLE/Wi-Fi launchers.
-WCH/ESP updates require explicit selection; use --dry-run and see FLASHING.md.
+Commit preparation validation (2026-09-26)
+----------------------------------------
+BMC IDF build, 78 host tests and bootloader rescue tests passed; intermediate
+BMC commits also ran their available charging/runtime/sleep tests. TP make and
+touch/protocol tests passed. All 7 U-Boot and 24 Linux patches applied in order
+to pristine downloaded sources with zero fuzz. DT FIT compilation, SPL SRAM
+layout and kernel/firmware touch protocol checks passed. Buildroot flasher tests
+(75), firmware/manifest tests (33), new package format checks (279 lines, zero
+warnings), and a fresh-output defconfig/dependency parse passed.
+This preparation did not rebuild the complete Buildroot image set, refresh
+release images, flash hardware, or repeat power/charging acceptance tests.
 
-Display takeover stops firmware DMA before releasing splash memory. Startup
-discovers DSI connectors dynamically; only the mixer0 pipeline remains enabled.
+Single display pipeline power test (2026-09-26)
+---------------------------------------------
+The DT FIT source, devicetree/linux/base/epass-next.dtsi, now selects only
+mixer0 and disables mixer1 and tcon_tv0. Wi-Fi OTA of the isolated DT change
+with the same kernel booted and retained normal playback state. Board clock
+readback showed mixer1, bus-mixer1 and bus-tcon-tv at enable_count=0 with
+hardware gates off. The matched Spine battery-side samples averaged
+1028.55 mW with both pipelines and 1003.84 mW with one, a 24.71 mW (2.4%)
+reduction. The panel keeps its native timing. The source DT is compiled
+separately for validation; existing images are not rebuilt or overwritten.
+Evidence: workspace power_measure/test-results/20260926-022314-explore/;
+isolated construction: power_measure/experiments/display-dt/.
 
-Audio fixes cover D1 codec routes and HPLDO/DAC/RAMP sequencing plus TinyALSA
-SYNC_PTR status queries preserving the application pointer.
+CH32 built-in input driver (2026-09-23)
+------------------------------------
+Linux patch 0024 integrates the driver into drivers/input/misc with
+CONFIG_INPUT_CH32_TOUCH_SLIDER=y. It probes from device tree during boot;
+the standalone Buildroot package and S35touch-slider are removed.
+The firmware manifest uses src/touch_protocol.h; post-image compares that
+header with the actual kernel driver header before assembling images.
+After source edits, update patch 0024, run make linux-dirclean, then make.
+Deploy kernel and rootfs together to remove the old module/startup script.
+Existing deployed overlays containing those files must also be cleaned.
+Validation: clean Linux extraction/patch/build and full Buildroot make passed.
+vmlinux contains the driver init/probe, modules.builtin records it, and
+rootfs.tar contains neither the old .ko nor S35touch-slider. Boot/rootfs
+hashes match release-manifest.json. In-tree snapshot and firmware encoder
+tests plus 40 firmware/manifest Python tests passed. No board flash/test.
 
-Linux board wiring now includes built-in BMC runtime and CH32 touch drivers.
-post-image compares the touch protocol header; deploy kernel and rootfs together.
+BMC Git source integration (2026-09-21)
+-------------------------------------
+epass-bmc-firmware now fetches ssh://git@github.com/rhodesepass/bmc_fw.git
+at origin/master through Buildroot's Git downloader, without fixed source hashes.
+The embedded source copy is removed. The ESP manifest records the repository,
+origin/master reference and br-master version; image integrity checks remain enabled.
+Both peripheral packages reuse cached origin_master archives. Remove the relevant
+origin_master archive and run package dirclean/build to fetch new upstream code.
+The private IDF toolchain and images/esp layout remain unchanged. Initial fetch
+uses host SSH credentials; no credentials are stored in the package.
+Before unpinning, Git download/hash checks, clean BMC compilation, 32 build/manifest tests and
+USB/OTA dry-runs passed. The full-tree make attempt was blocked by a separate
+CH32 package's zero Git revision placeholder; no new board flash was performed.
 
-Boot integration: SPI0 BMC SPL, SPI1 NAND, PG8/PG9 UART3, external FIT OTA,
-CH32 SWIO updates, and post-image SPL SRAM overlap checks.
+ESP single-target board validation (2026-09-21)
+---------------------------------------------
+Packaged USB flasher wrote/read back all 1255424 app bytes on the real board.
+Wi-Fi OTA committed ota_0 -> ota_1 in 13.15 s; BLE with ATT payload 244 committed
+ota_1 -> ota_0 in 723.02 s. Both ENDs reported consumed=durable=1255424, error=0.
+After each explicit reboot, running/boot partitions matched, the version was
+br-29587271d96f, staged/committed were cleared, Linux sync worked, APP armed=1,
+and pending=0. Host regressions: 101 passed. No NAND/WCH update, three-chip
+mixed board test or power-cut test. Evidence: workspace
+ota/artifacts/board-test/20260921-buildroot-esp/README.md.
+
+ESP BMC build and OTA integration (2026-09-20)
+--------------------------------------------
+epass-bmc-firmware builds a source-hashed snapshot with a separately downloaded
+ESP-IDF 6.0.2, compiler and locked private Python environment. Firmware is
+installed only to images/esp; its application, initial layout, normal SPL pair
+and hashes join the release manifest. No user IDF environment is required.
+flasher/ota.py --esp uses bmc target 7 over BLE or Wi-Fi: stage ESP in the
+inactive slot, update requested D1s/CH32 images, then commit and optionally
+reboot. ESP-only OTA needs no FIT. It is opt-in and not a cross-chip atomic
+update. After ESP reboot, reprovision Wi-Fi and query the running version.
+See package/epass-bmc-firmware/README.md and flasher/README.md.
+Validation: independent SDK install and offline Python dependency checks,
+ESP firmware build, full Buildroot make/post-image and 101 host tests passed.
+Application size is 1255424 bytes; packaged ESP-only BLE, mixed Wi-Fi and USB
+dry-runs passed. No board flashing or new-firmware boot validation in this run.
+
+Unified host flasher (2026-09-20)
+--------------------------------
+Sources live in flasher/, outside make clean output paths. flasher/flash.py
+provides initial/full USB FEL/DFU flashing; flasher/ota.py provides BLE/Wi-Fi
+OTA using the local bmc_ota.py client, without external source dependencies.
+WCH and ESP updates are
+independently opt-in (--wch/--esp, explicit --no-wch/--no-esp). --no-system
+allows peripheral-only updates; --dry-run validates inputs without hardware.
+USB defaults to four NAND stages; wireless defaults to boot/rootfs,
+rejecting SPL, wipe/scrub and identity changes. WCH wireless uses target 6.
+USB ESP update reads the partition table and valid OTA selection,
+update the active app and optional bootloader, verify readback, and preserve
+NVS/otadata/partition table/SPL/storage. Blank provisioning is out of scope.
+After system DFU, re-enter FEL for uopbridge. Write/read back WCH before ESP;
+the specified ESP port must belong to uopbridge. post-image packages the local
+flasher/ directory and USB/OTA shell launchers. See flasher/README.md.
+Rootfs OTA replaces the rootfs MTD lower image and preserves the data-backed
+overlay upper. There is no separate overlay OTA target or package installer.
+USB file uploads can write individual merged-root paths; the BLE/Wi-Fi assets
+endpoint has no registered Linux consumer and returns assets_unavailable.
+Host regression tests and real-image dry-runs passed; no new board flashing.
+
+CH32 firmware build integration (2026-09-20)
+-------------------------------------------
+epass_next_defconfig enables ch32-touch-firmware. As of 2026-09-21, sources
+are maintained in rhodesepass/tp_fw (master), with a standalone workspace
+at ../tp_fw supporting make, host tests and WCH-LinkE/GDB debugging.
+The package fetches Git origin/master and uses separately downloaded/
+hashed WCH GCC12 without MounRiver paths or a duplicate package/src tree.
+Images include ch32-touch.bin/.elf/.map and ch32-touch.json; post-image emits
+release-manifest.json with touch explicitly optional. Linux wire-protocol
+mismatches fail the build; post-image checks image integrity, the source
+reference, repository URL and protocol definitions. Firmware is not installed in rootfs
+and normal Linux/USB updates do not implicitly flash it. Before unpinning, full make passed;
+10352-byte firmware matches the previously verified real-board program.
+The 2026-09-21 Git migration passed standalone and full Buildroot builds,
+seven regression tests, check-package (zero warnings), and all 11 release
+artifact hashes. No board flashing or target debug attachment was performed.
+See package/ch32-touch-firmware/README.md for rebuild and license details.
+
+CH32 touch controller OTA (2026-09-20)
+-------------------------------------
+U-Boot adds CONFIG_CH32_SWIO/CONFIG_CMD_CH32 with PG13 SWIO and PG15 reset.
+The touch target (wire target 6) buffers at most 63488 bytes, checks whole-image
+SHA256 before mutation, then erases/programs/verifies 256-byte pages. The final
+partial page preserves bytes outside the image. No option-byte or protection
+changes are exposed. BMC and both BLE/HTTP clients support touch-only finish.
+Patch round-trip and clean Buildroot U-Boot build passed. Real-board HTTP
+touch-only END reported 63488 durable bytes; independent minichlink readback
+matched and Linux registered the CH32 input device after reboot. See workspace
+ota/artifacts/board-test/20260920-touch/README.md for current board evidence.
+
+BMC APP runtime and power control (2026-09-19)
+--------------------------------------------
+n0.2 enables a 2 MHz SPI0 epass,bmc device. CONFIG_BATTERY_EPASS_BMC=y
+provides /sys/class/power_supply/epass-bmc battery data and bmc_version,
+boot_epoch, power_state, boot_ready. Only explicit userspace READY after
+successful APP initialization and first LVGL frame unlocks power cuts.
+The sys-off prepare handler sends POWEROFF after device_shutdown; a failed
+request keeps power. Communication loss invalidates battery data.
+BMC firmware adds the five-second button force-off and a separate early
+bootloader rescue hook, independent of BLE and normal BMC application.
+Kernel/DT FIT and APP cross-builds plus host tests passed. Board tests passed
+READY, soft poweroff, physical five-second force-off and short-press startup.
+USB-only operation returns ENODATA for battery capacity/voltage while status
+remains available. One fault-injection run recovered through FEL/uopbridge;
+latest rescue timing, battery-only QON interaction and intermittent C3 clock
+glitch resets remain outside the passed boundary. Boot and APP720 were
+deployed while preserving rootfs/data. See workspace
+epass_bmc/docs/app-runtime.md. Initial deployment requires both C3 bootloader
+and application updates with identical RTC retention configuration.
+
+BMC update bootstrap (2026-09-13)
+--------------------------------
+Every wireless update receives the complete u-boot.itb (including OpenSBI)
+from the external client through BMC/SPI into RAM before any NAND image.
+BMC holds exactly two normal SPL copies (128 KiB each); no dedicated rescue
+SPL or cached U-Boot FIT. The normal SPL checks BMC update state before NAND:
+normal boot loads NAND, update boot waits for the external FIT. Failed updates
+must stop rather than fall back to NAND. ota-rescue remains a command alias.
+The physical 512 KiB SPL partition is unchanged, with its unused half erased.
+USB flash.py loads complete U-Boot from the host through FEL before DFU;
+u-boot-fel.bin is only a packaging variant. FEL mailbox takes priority over
+BMC state and old NAND environment. There is one U-Boot configuration/FIT.
+BMC firmware and clients stay in workspace epass_bmc (ESP-IDF), not Linux
+rootfs. BMC now implements BLE-guided STA/AP and authenticated HTTP channels;
+Wi-Fi build/host tests pass and STA/AP were board-tested. Fast experimental
+variants reach about 40-47 KiB/s but still exhibit unresolved IWDT resets.
+The BMC/ESP partition table has been rolled back to the pre-test backup.
+The assets channel still needs a Linux SPI consumer.
+See workspace ota/README.md for installation, protocol and test boundaries.
+Validation: patches round-trip; clean Buildroot U-Boot build and post-image
+passed. Board testing found/fixed SRAM overlap (8 KiB early stack/heap) and
+FIT four-byte tail reads. SPI1 selection is explicit in the Buildroot config.
+post-image checks ROM-loaded SPL versus GD/heap/stack reservations.
+Board tests passed normal NAND boot, external FIT to RAM U-Boot, 256 KiB
+verify-only, and NAND U-Boot write/readback (882809 durable bytes), then Linux
+login and app_720 startup. Only uboot was updated in NAND; no boot/rootfs/data
+reflash or power-cut test. Tested workspace artifacts have their own SHA256
+in ota/artifacts/board-test/20260913-single-spl/tested-artifacts.json; do not
+substitute independently rebuilt image hashes for the tested ones.
+
+Power key and touch status (2026-09-18)
+--------------------------------------
+n0.2 gpio-keys reports KEY_0 on PG10, active-low, internally pulled up, with
+20 ms debounce. GPIO_PULL_UP lets gpiod own the bias and mux without a
+competing static pinctrl claim. CONFIG_KEYBOARD_GPIO and INPUT_EVDEV are on.
+CH32 ABS_MISC is a bitmask: 1=position valid, 2=multi-touch, 4=cancelled.
+It is submitted with BTN_TOUCH/ABS_X in one SYN_REPORT. Normal release has
+BTN_TOUCH=0, ABS_MISC=0 and retains the last X. Applications must handle a
+normal release before checking the current position-valid bit.
+The first communication error cancels the gesture immediately; 100 ms of
+failure additionally releases keys. Synthetic releases (restart, contact
+boundary, suspend, stop, failure) carry CANCEL, as do subsequent frames
+until real idle. That idle frame remains cancelled; the next frame clears
+the latch. Firmware wire protocol and optional key mappings are unchanged.
+Driver and MounRiver linux source copies are kept identical. No board
+flashing or real power-key/touch functionality was tested in this change.
+Validation: ch32-touch-slider-rebuild passed against Linux 7.1.6/RISC-V;
+mkdt.sh and boe_035 overlay merge passed. fdtget confirms PG10 flags 0x11,
+KEY_0 (0x0b), and debounce 20. MounRiver linux make test passed both snapshot
+and actual firmware encoder/decoder tests. Package rebuild still reports
+missing .files-list*.before bookkeeping files after successful module
+installation; it exits zero. No full rootfs/boot image repack was performed.
+
+CH32 touch slider integration (2026-09-13)
+------------------------------------------
+Linux patch 0024 contains the driver and v1 protocol headers; clean builds
+do not require the MounRiver firmware directory.
+The n0.2 base includes ch32-touch-slider.dtsi: 7-bit address 0x2a,
+GPIO I2C SDA=PG6/SCL=PG7, IRQ=PG14 active-low with internal pull-up.
+This matches fpc_keys pin numbering, which swaps the hardware I2C2 order.
+I2C2 is disabled on n0.2; PG13/SWIO and PG15/RST remain unclaimed.
+Kernel CONFIG_I2C_GPIO=y supports the slave's clock stretching. The driver
+is built in with CONFIG_INPUT_CH32_TOUCH_SLIDER=y.
+The driver provides BTN_TOUCH and ABS_X (0..1023); swipe-keycodes remains
+optional. Raw 64-byte reads must be one combined I2C transfer, not two
+SMBus block reads. i2c-tools and evtest are available for board validation.
+
+Build: make epass_next_defconfig; make
+Incremental driver after refreshing the patched source: make linux-rebuild
+Diagnostics: i2cdetect -l; cat /proc/bus/input/devices; evtest /dev/input/eventN
+The slave holds IRQ low until its current sequence is acknowledged. Unbind
+the input driver before manually reading/acknowledging the same address.
+
+Board test result (2026-09-13)
+------------------------------
+Full Buildroot build passed; rootfs.tar contains the driver, S35touch-slider,
+i2ctransfer and evtest. The final n0.2 DTB overlays with boe_035 successfully.
+Boot/rootfs were flashed with --only; user data, SPL and U-Boot partitions
+were not selected. BMC was returned from FEL to normal boot mode.
+The first GPIO-I2C probe failed because its own static GPIO pinctrl state
+conflicted with gpiod's claim. Removing that state fixed adapter registration;
+GPIO direction is now owned by i2c-gpio, while PG14 keeps its IRQ pull-up.
+The real board registers i2c-0, but CH32 0x2a returns ENXIO/no ACK. Both wire
+orders and a 50 ms reset pulse were tested; neither order found an address.
+SWIO/PG13=1, IRQ/PG14=0, RST/PG15=1. These logic reads do not prove target
+supply voltage or signal integrity. No CH32 evdev node is registered yet.
+Temporary alternate-bus tests were removed by the final reboot.
+The app package had a stale override-source snapshot hardcoded to DRM card0;
+rebuilding epass_drm_app incorporated the already-present native-DRM selection
+fix. The final flashed system runs the updated app on card1, DSI reports
+connected, and USB epass mode works. Board-side app/module SHA256 values
+match the final Buildroot target files. CH32 still returns no ACK.
+Logs and image hashes: output/ch32-validation/ (not source-controlled).
+Next hardware step: inspect CH32 I2C registers and SCL/SDA at the MCU pins;
+do not infer input or gesture success from successful image flashing.
+
+APP schematic alignment (2026-09-10)
+-----------------------------------
+Export evidence: epass_bmc/build/pin-audit/mainboard.xml (kicad-cli netlist).
+Current n0.2 wiring: LCD PWM5/PG4, reset PG12; three DSI data lanes on
+PD0..PD7 including the clock pair. BOE overlay already selects three lanes.
+U-Boot splash pinmux follows these pins as well. SD remains MMC0/PF0..PF5;
+USB0 remains peripheral, USB1 host controllers are disabled (pins NC).
+Headphone codec routing remains valid. The CH32 key FPC is now described
+by the 2026-09-13 GPIO-I2C/IRQ integration above. CH32 SWIO PG13 and reset
+PG15, and PG10 (PWRBTN via D2) remain unclaimed.
+No separate display touch controller is wired to APP; the CH32 key FPC
+is the input interface described above. BMC GPIO defines
+remain authoritative for the present board; schematic ESP pins are next rev.
+No board has been flashed for this alignment; DTB/U-Boot build validation
+is separate from functional tests on the current assembled board.
+
+Current boot wiring (2026-09-10)
+--------------------------------
+The BROM reads eGON SPL from the ESP32-C3 SPI NAND emulator on SPI0.
+SPL then selects SPI1 (0x04026000, CCU 0x944, PD10..PD13 function 4)
+and reads u-boot.itb from physical NAND offset 0x40000. U-Boot and Linux
+use SPI1 quad mode on PD10..PD15, matching the mainboard schematic.
+UART3 on PG8/PG9 connects to the ESP32-C3 console bridge. The old n0.2
+switch-3/switch-4 GPIO key nodes are removed because they claim these pins.
+PG6/PG7 belong to the key FPC bus (now GPIO I2C); all old discrete GPIO keys are removed.
+The NAND partition offsets are preserved; its boot0 copy is no longer the
+BROM boot source. Program sunxi-spl.bin into the selected BMC raw SPL slot.
+Validation: U-Boot including SPL/FIT builds; Linux DTB and layered dtbs.itb
+build; both patch series round-trip to the working trees. The production SPL
+reader passes a host ASan/UBSan test for byte/page/block offsets, bad blocks
+and partition bounds (tests/test_spl_spinand_read.py in the eprv workspace).
+SPL is 90112 bytes; u-boot.itb is 877289 bytes.
+This wiring migration requires real-board boot validation; the previous
+SPI0 hardware results do not validate this SPI1 route.
 
 Arknights ePass Next (Allwinner D1s)
 ====================================
@@ -24,13 +305,12 @@ different in-package DRAM, and that difference has to be handled in the SPL
 before the DRAM controller is touched at all.
 
   T113-s3   DDR3, 1.35V
-  D1s       DDR2, 1.8V    <- fed from AXP209 DCDC2
+  D1s       DDR2, 1.8V    <- mainboard EA3036 fixed rail
 
-DCDC2 powers up at ~1.25V and the BROM never touches the PMIC, so a stock SPL
-runs DRAM training against an undervolted DDR2 and wedges the SoC hard enough
-to take the FEL loop down with it. patches/uboot/0002 raises it over TWI0
-before uclass init. reg_dcdc2 in the dts must agree with that value, or the
-regulator core drops the supply back the moment the AXP209 driver probes.
+The current mainboard has no AXP209; PB2/PB3/PB4 are unconnected.
+SPL must leave CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2 disabled. The Linux
+PMIC node was removed so it cannot probe a device absent from the board.
+The VCCDRAM selection resistors (R48/R49) must match the fitted D1s DDR2.
 
 Building
 --------
@@ -54,7 +334,7 @@ Flash layout
 128MB SPI NAND, 2K page, 128K erase block; every boundary is a whole number
 of erase blocks.
 
-  0x0000000  boot0    256K  SPL, eGON header, read by the BROM
+  0x0000000  boot0    256K  reserved legacy SPL copy (BROM now reads BMC)
   0x0040000  uboot      1M  u-boot.itb (OpenSBI fw_dynamic + U-Boot proper)
   0x0140000  bootenv  128K  one erase block, so a rewrite is one erase
   0x0160000  boot      10M  dtbs.itb in a 1M slot, then kernel.itb
@@ -64,8 +344,8 @@ of erase blocks.
 The same table appears in three places and nothing checks that they agree:
 the Linux board dts, the U-Boot board dts and post-image.sh.
 
-The bus runs quad: spi0's pinctrl group covers PC6/PC7 (WP and HOLD becoming
-IO2 and IO3) at 20mA, and the flash node carries spi-rx-bus-width and
+The bus runs quad: SPI1 uses PD10 CS, PD11 CLK, PD12 IO0, PD13 IO1,
+PD15 IO2 and PD14 IO3. Its pinctrl group drives all six pads at 20mA, and the flash node carries spi-rx-bus-width and
 spi-tx-bus-width. Both halves are needed. Without the widths spinand never
 gets SPI_RX_QUAD in spi->mode, spi_mem_supports_op rejects every x4 entry in
 the chip's variant table, and it settles on the 1S-1S-1S read without saying
@@ -155,8 +435,8 @@ partition like any other write.
 
 What did not come over: S00dramqos, which programs the F1C's DRAM controller
 port arbiter and means nothing on this SoC; S15battery_hwcd, whose binary is
-not packaged in this tree yet; and the splash handover in S01app, since U-Boot
-here does not paint one.
+not packaged in this tree yet. U-Boot paints a splash; see the DSI handover
+section below for the current ownership boundary.
 
 Output
 ------
@@ -384,7 +664,7 @@ the lower clock saves and nothing more.
 Known gaps
 ----------
 - The GPADC and the LEDC (the WS2812 controller) are left disabled -- neither
-  is wired on this board. AXP209's own ADC covers the battery rails.
+  is wired on this board. Battery management belongs to the BMC; no APP PMIC ADC is described.
 - RISCV_APLIC and RISCV_IMSIC are compiled in although the D1 has only a
   PLIC: arch/riscv/Kconfig selects both unconditionally, so they cannot be
   switched off without patching it.
@@ -584,6 +864,35 @@ mstm_prep is the only thing allowed to touch it.
 
 Keeping the patches in step
 ---------------------------
+2026-09-19 audio: D1 card routes now reference ADC1/ADC2, matching the
+analog widgets. The six missing-route errors prevented the entire sound
+card from registering, including playback. Updated kernel was written at
+boot partition offset 0x100000 and SHA256 readback matched; DT, rootfs,
+bootloader and user data were retained. The rebooted kernel registers
+D1 Audio Codec successfully.
+
+TinyALSA 2.0 also needs the package patch preserving appl_ptr when reading
+state through SYNC_PTR on RISC-V. Direct WRITEI_FRAMES plus DRAIN played
+480000 stereo frames at 48 kHz in 10.015 seconds. Test signal is left 1 kHz,
+right 2 kHz, amplitude 8191/32768, DAC volume 63, front volume 160/160,
+headphone volume 4 (-18 dB). Electrical output awaits oscilloscope evidence.
+Patched TinyALSA was tested on the same board: the same 10-second WAV now
+takes 9.96 seconds in tinyplay, versus 0.31 seconds with the old library.
+The fixed library was atomically installed in the board overlay and its
+SHA256 matched the host build. A fresh 600-second stereo tone was started.
+Further scope testing found DC-only HPOUT on both channels. Comparing the
+local Tina sun20iw1-codec BSP identified missing HPLDO power and DAC unmute.
+Enabling those bits with the BSP's 30 ms delay produced waveforms on both
+channels, confirmed by the user. The driver now implements this in DAPM;
+headphone ramp is an output driver, ordered after DAC power-up and before
+DAC power-down, with 100 ms settling delays. Kernel #4 was flashed and
+readback-verified. After reboot, first play, idle and second play correctly
+toggle power/unmute/ramp without manual register writes. The user confirmed
+both waveforms remain normal on the scope after reboot, completing playback
+validation of the persistent fix. The board revision bits are 3 (automatic ramp);
+the A-silicon manual HP2 sequence is outside this validation.
+See workspace ota/artifacts/board-test/20260919-codec/ for test sources.
+
 The kernel and U-Boot are worked on as ordinary git checkouts next to this
 tree (../linux-7.1.6, ../u-boot-2026.07) and reach the build as the patch
 series in patches/. Those are two separate steps, and forgetting the second
@@ -596,3 +905,50 @@ cycle three times.
 regenerates both series from the working trees, applies each to a pristine
 checkout and compares it against the tree it came from, then dirclean's both
 so the next build re-unpacks. Run it after touching either tree.
+
+2026-09-10 BMC debug route
+--------------------------
+UART3 now uses PG8 TX -> C3 GPIO20 RX and PG9 RX <- C3 GPIO21 TX at
+115200 baud. SPL selects CONFIG_SUNXI_SPL_UART3_PG; the default early-UART
+route remains PB6/PB7 for other boards. U-Boot, OpenSBI stdout-path and Linux
+keep serial3/ttyS3 and select the same PG pins. U-Boot pinctrl handles UART3
+function 5 on PG8/PG9 while retaining function 7 on PB6/PB7.
+
+The C3 recovery image is generated by epass_bmc/tools/make_fel_spl.py: an
+eGON.BT0 image with a 1024-byte checked length. It disables the ROM-enabled
+I-cache, fences instructions and jumps to the locally disassembled ROM
+FEL vector 0x20. It needs no DRAM or saved FEL caller frame. After USB FEL
+enumerates, load uopbridge as usual; do not reuse fel-boot/spl-fel.bin as a
+cold boot image because that image expects an existing FEL return frame.
+Build validation does not establish BLE capture, FEL USB enumeration or
+uopbridge flashing on hardware.
+
+2026-09-10 board validation: ESP32-C3 provides the 90112-byte SPL on BootROM
+SPI0; SPL reads W25N01GV on hardware SPI1 (0x04026000). OpenSBI 1.9,
+U-Boot 2026.07, Linux 7.1.6 and the UBIFS/overlay root reached login.
+UART3 PG8/PG9 was captured and used for a shell through BMC BLE. Linux's
+logical spi0.0 resolves to /soc/4026000.spi; it is the hardware SPI1 bus.
+Independent U-Boot builds must also apply the default environment setting
+normally added by Buildroot's Kconfig fixup, so Mostima/DFU is present.
+
+DSI handover (2026-09-10)
+-------------------------
+LCD reset is PG12, active low, in both the Linux panel DT and U-Boot's
+merged-DT-driven splash. Intermittent Linux DCS B9 -110 was reproduced with
+the running U-Boot splash. Skipping splash passed 3/3 boots; clearing the
+DSI instruction start bit and pulsing CCU MIPI reset passed another 3/3.
+These are small diagnostic samples, not a long-run reliability result.
+
+srgn_splash now owns a board_quiesce_devices() hook: at bootm handover it
+stops the DSI instruction engine, TCON requests and mixer DMA, powers down
+D-PHY, and leaves shared MIPI reset asserted for Linux probe to deassert.
+Bus gates and shared PLL_VIDEO0/PERIPH clocks are retained. Failed panel or
+FDT setup is cleaned up too; the hook is a no-op without hardware ownership.
+The U-Boot logo remains visible until handover, but continuous scanout during
+Linux boot is no longer guaranteed. Framebuffer reservation/free-on-takeover
+metadata is retained. The fixed build still requires board verification.
+See epass_bmc/docs/dsi-handoff.md in the workspace for evidence and limits.
+
+2026-09-11: The srgn_splash OS-handoff cleanup was flashed with --only uboot.
+Five consecutive normal boots reached login without the intermittent DCS -110.
+PG12 reset wiring was retained. Detailed A/B evidence: epass_bmc/docs/dsi-handoff.md.
