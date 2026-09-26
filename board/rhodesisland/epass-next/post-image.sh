@@ -125,36 +125,38 @@ else
 	echo "post-image: no u-boot-nodtb.bin, FEL flashing will not work" >&2
 fi
 
-# Convenience: the exact xfel sequences. These write the SPI NAND directly
-# from FEL, which is slow and cannot honour the mailbox -- flash.py is the
-# normal way to flash a board. Keep them for the case flash.py cannot handle:
-# a chip so far gone that U-Boot will not come up to serve DFU.
-#
-# flash.sh writes the partitions one at a time and stops short of the data
-# partition, so an upgrade keeps user data; flash-all.sh wipes the chip first.
-cat > "${BINARIES_DIR}/flash.sh" <<EOF
+# xfel's direct NAND commands address SPI0, while the physical NAND is on
+# SPI1. Use the board's FEL-to-U-Boot/DFU path for both normal and full erase.
+FLASHER_DIR="${BOARD_DIR}/../../../flasher"
+mkdir -p "${BINARIES_DIR}/flasher"
+for file in flash.py flash_esp.py ota.py bmc_ota.py esp_ota.py README.md; do
+	need "${FLASHER_DIR}/${file}"
+	cp "${FLASHER_DIR}/${file}" "${BINARIES_DIR}/flasher/${file}"
+done
+cp "${BOARD_DIR}/../../../flash.py" "${BINARIES_DIR}/flash.py"
+# Remove obsolete generated copies so old entry points cannot diverge.
+rm -f "${BINARIES_DIR}/flash_esp.py" "${BINARIES_DIR}/bmc_ota.py"
+cat > "${BINARIES_DIR}/flash.sh" <<'EOF'
 #!/bin/sh
-# Reflash the system on an ePass Next, keeping user data.
-# Needs the SPI NAND populated and the board in FEL.
-set -e
-xfel spinand
-xfel spinand erase ${SPL_OFF} $((DATA_OFF - SPL_OFF))
-xfel spinand write ${SPL_OFF} sunxi-spl.bin
-xfel spinand write ${UBOOT_OFF} u-boot.itb
-xfel spinand write ${BOOTENV_OFF} env.txt
-xfel spinand write ${BOOT_OFF} boot.itb
-xfel spinand write ${ROOTFS_OFF} rootfs.ubi
-echo "flashed; data partition untouched. Power-cycle the board."
+set -eu
+IMAGES_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "${IMAGES_DIR}/flasher/flash.py" --images "$IMAGES_DIR" "$@"
 EOF
 chmod +x "${BINARIES_DIR}/flash.sh"
 
-cat > "${BINARIES_DIR}/flash-all.sh" <<EOF
+cat > "${BINARIES_DIR}/flash-all.sh" <<'EOF'
 #!/bin/sh
-# Reflash an ePass Next and DESTROY user data: the data partition is erased,
-# so preinit rebuilds it empty on the next boot.
-set -e
-xfel spinand
-xfel spinand erase ${DATA_OFF} $((FLASH_SIZE - DATA_OFF))
-exec sh "\$(dirname "\$0")/flash.sh"
+# Full-chip force erase and bad block rescan; destroys user data.
+set -eu
+IMAGES_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "${IMAGES_DIR}/flasher/flash.py" --images "$IMAGES_DIR" --scrub "$@"
 EOF
 chmod +x "${BINARIES_DIR}/flash-all.sh"
+
+cat > "${BINARIES_DIR}/ota.sh" <<'EOF'
+#!/bin/sh
+set -eu
+IMAGES_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec python3 "${IMAGES_DIR}/flasher/ota.py" --images "$IMAGES_DIR" "$@"
+EOF
+chmod +x "${BINARIES_DIR}/ota.sh"

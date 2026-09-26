@@ -1,5 +1,8 @@
 # ePass Next（Allwinner D1s）
 
+刷写源码集中在 flasher/，发布包提供 USB 和 BLE/Wi-Fi 入口。
+WCH/ESP 必须显式选择，--dry-run 可在无硬件时检查计划，详见 FLASHING.md。
+
 显示接管先停止固件 DMA 再释放 splash 保留内存；启动脚本按 DSI connector
 发现设备，并仅启用 mixer0，关闭未使用的 mixer1/tcon_tv0。
 

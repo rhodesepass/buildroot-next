@@ -1,3 +1,6 @@
+Flashing sources live in flasher/ with packaged USB and BLE/Wi-Fi launchers.
+WCH/ESP updates require explicit selection; use --dry-run and see FLASHING.md.
+
 Display takeover stops firmware DMA before releasing splash memory. Startup
 discovers DSI connectors dynamically; only the mixer0 pipeline remains enabled.
 
