@@ -160,3 +160,6 @@ IMAGES_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 exec python3 "${IMAGES_DIR}/flasher/ota.py" --images "$IMAGES_DIR" "$@"
 EOF
 chmod +x "${BINARIES_DIR}/ota.sh"
+
+python3 "${BOARD_DIR}/scripts/release-manifest.py" \
+	--images "$BINARIES_DIR" --config "$BR2_CONFIG"

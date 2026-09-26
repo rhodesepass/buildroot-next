@@ -1,0 +1,3 @@
+config BR2_PACKAGE_HOST_WCH_RISCV_TOOLCHAIN_SUPPORTS
+	bool
+	default y if BR2_HOSTARCH = "x86_64"

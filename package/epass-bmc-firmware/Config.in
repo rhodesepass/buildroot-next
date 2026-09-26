@@ -1,0 +1,9 @@
+config BR2_PACKAGE_EPASS_BMC_FIRMWARE
+	bool "epass-bmc-firmware"
+	depends on BR2_PACKAGE_HOST_ESP_IDF_SUPPORTS
+	depends on BR2_TARGET_UBOOT
+	select BR2_PACKAGE_HOST_ESP_IDF
+	help
+	  Build the ESP32-C3 BMC with a pinned, isolated ESP-IDF SDK.
+	  Install ESP firmware and its manifest into images/esp only.
+	  ESP OTA and USB updates remain explicitly selected actions.

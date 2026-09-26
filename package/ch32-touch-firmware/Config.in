@@ -1,0 +1,8 @@
+config BR2_PACKAGE_CH32_TOUCH_FIRMWARE
+	bool "ch32-touch-firmware"
+	depends on BR2_PACKAGE_HOST_WCH_RISCV_TOOLCHAIN_SUPPORTS
+	help
+	  Build the latest CH32V006 touch-controller firmware with its
+	  own WCH bare-metal toolchain. Installs ch32-touch.bin and
+	  its version/hash manifest into images, not the Linux rootfs.
+	  Updating the controller remains an explicit touch OTA action.

@@ -1,0 +1,15 @@
+config BR2_PACKAGE_HOST_ESP_IDF_SUPPORTS
+	bool
+	default y if BR2_HOSTARCH = "x86_64"
+	help
+	  The pinned toolchain and Python wheels require Linux x86_64.
+
+config BR2_PACKAGE_HOST_ESP_IDF
+	bool "host esp-idf"
+	depends on BR2_PACKAGE_HOST_ESP_IDF_SUPPORTS
+	select BR2_PACKAGE_HOST_PYTHON3
+	select BR2_PACKAGE_HOST_PYTHON3_SSL
+	help
+	  ESP-IDF 6.0.2 with its own ESP32-C3 compiler and isolated
+	  Python environment. All downloads are versioned and checked
+	  against their hashes.

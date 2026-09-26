@@ -1,5 +1,8 @@
 # ePass Next（Allwinner D1s）
 
+BMC/TP 从各自 origin/master 构建，保留固定独立工具链和镜像/协议校验。
+先推送固件再发布 Buildroot，刷新缓存后分步 dirclean/build；生成统一发布清单。
+
 刷写源码集中在 flasher/，发布包提供 USB 和 BLE/Wi-Fi 入口。
 WCH/ESP 必须显式选择，--dry-run 可在无硬件时检查计划，详见 FLASHING.md。
 

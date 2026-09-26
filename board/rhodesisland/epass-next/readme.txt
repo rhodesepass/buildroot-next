@@ -1,3 +1,6 @@
+Peripheral packages follow origin/master with isolated pinned toolchains and
+image/protocol checks. Publish firmware first, refresh caches, then build releases.
+
 Flashing sources live in flasher/ with packaged USB and BLE/Wi-Fi launchers.
 WCH/ESP updates require explicit selection; use --dry-run and see FLASHING.md.
 

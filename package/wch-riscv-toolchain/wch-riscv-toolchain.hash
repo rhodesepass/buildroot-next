@@ -1,0 +1,5 @@
+# Locally computed from the official MounRiver V2.4.0 archive.
+sha256  1fae593d27e24466f17c2df0fd00f746143f587fe33e912a78e35142fef82a6d  MRS_Toolchain_Linux_X64_V240.tar.xz
+sha256  8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903  distro-info/licenses/gcc-12.2.0/COPYING3
+sha256  9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74  distro-info/licenses/gcc-12.2.0/COPYING.RUNTIME
+sha256  231f7edcc7352d7734a96eef0b8030f77982678c516876fcb81e25b32d68564c  distro-info/licenses/newlib-4.2.0.20211231/COPYING
