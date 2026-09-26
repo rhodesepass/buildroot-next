@@ -2,9 +2,7 @@
 /*
  * Copyright (C) 2025 Lukas Schmid <lukas.schmid@netcube.li>
  *
- * D1s port of the T113-s3 board. VCC-DRAM comes off AXP209 DCDC2 and must be
- * at 1.8V for the in-package DDR2 before the DRAM controller is touched; see
- * CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2.
+ * The mainboard uses EA3036 fixed rails; no AXP209 is populated.
  *
  * sun20i-d1s.dtsi comes from dts/upstream (the Linux devicetree submodule);
  * only this board file is local, because it is not in upstream Linux.
@@ -22,7 +20,7 @@
 
 	aliases {
 		serial3 = &uart3;
-		spi0 = &spi0;
+		spi1 = &spi1;
 	};
 
 	chosen {
@@ -86,34 +84,32 @@
 	status = "okay";
 };
 
-/*
- * Quad wiring, kept in lockstep with the Linux board dts: the dtsi's
- * spi0_pins covers only the single-lane four, quad also drives PC6 (WP,
- * becoming IO2) and PC7 (HOLD, becoming IO3). The pads default to 10mA and
- * this bus is fast; the BSP's 20mA and the pull-ups on CS/WP/HOLD keep a
- * lane from floating while the controller has it turned around as an input.
- * The SPL is not affected: its loader muxes PC2..PC5 itself and reads
- * single-lane.
- */
+/* SPI0 serves the BMC boot link; the physical NAND is on SPI1 PD10..PD15. */
 &pio {
-	spi0_quad_pins: spi0-quad-pins {
-		pins = "PC2", "PC4", "PC5";
-		function = "spi0";
+	uart3_pg_pins: uart3-pg-pins {
+		pins = "PG8", "PG9";
+		function = "uart3";
+		bootph-all;
+	};
+
+	spi1_quad_pins: spi1-quad-pins {
+		pins = "PD11", "PD12", "PD13";
+		function = "spi1";
 		drive-strength = <20>;
 		bootph-all;
 	};
 
-	spi0_quad_pu_pins: spi0-quad-pu-pins {
-		pins = "PC3", "PC6", "PC7";
-		function = "spi0";
+	spi1_quad_pu_pins: spi1-quad-pu-pins {
+		pins = "PD10", "PD15", "PD14";
+		function = "spi1";
 		drive-strength = <20>;
 		bias-pull-up;
 		bootph-all;
 	};
 };
 
-&spi0 {
-	pinctrl-0 = <&spi0_quad_pins>, <&spi0_quad_pu_pins>;
+&spi1 {
+	pinctrl-0 = <&spi1_quad_pins>, <&spi1_quad_pu_pins>;
 	pinctrl-names = "default";
 	status = "okay";
 	bootph-all;
@@ -184,7 +180,7 @@
 };
 
 &uart3 {
-	pinctrl-0 = <&uart3_pb_pins>;
+	pinctrl-0 = <&uart3_pg_pins>;
 	pinctrl-names = "default";
 	status = "okay";
 };
@@ -195,6 +191,5 @@
 };
 
 &usbphy {
-	usb0_vbus-supply = <&reg_vcc3v3>;
 	status = "okay";
 };

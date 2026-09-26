@@ -1,5 +1,8 @@
 # ePass Next（Allwinner D1s）
 
+启动链按现板接线使用 SPI0 BMC SPL、SPI1 NAND 和 PG8/PG9 UART3；
+统一外部 FIT OTA，增加 CH32 SWIO 更新和 SPL SRAM 布局校验。
+
 图例：
 
 

@@ -112,6 +112,7 @@ fi
 # image, hence the concatenation -- but OpenSBI is handed the tree by address,
 # so it needs a copy of its own as well.
 UBDIR=$(echo "${BUILD_DIR}"/uboot-*/ | head -1)
+python3 "${BOARD_DIR}/scripts/check-spl-layout.py" "$UBDIR"
 if [ -f "${UBDIR}/u-boot-nodtb.bin" ] && [ -f "${UBDIR}/u-boot.dtb" ]; then
 	cat "${UBDIR}/u-boot-nodtb.bin" "${UBDIR}/u-boot.dtb" \
 		> "${BINARIES_DIR}/u-boot-fel.bin"

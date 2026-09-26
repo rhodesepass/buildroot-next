@@ -140,6 +140,51 @@ index 54314992..29919973 100644
  	select PINCTRL_SUNXI
  
  config PINCTRL_SUN55I_A523
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sunxi.c b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+index a8632aea..4294c796 100644
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+@@ -74,6 +74,8 @@ static const char *sunxi_pinctrl_get_function_name(struct udevice *dev,
+ 	return desc->functions[func_selector].name;
+ }
+ 
++static const struct sunxi_pinctrl_desc sun20i_d1_pinctrl_desc;
++
+ static int sunxi_pinctrl_pinmux_set(struct udevice *dev, uint pin_selector,
+ 				    uint func_selector)
+ {
+@@ -81,14 +83,21 @@ static int sunxi_pinctrl_pinmux_set(struct udevice *dev, uint pin_selector,
+ 	struct sunxi_pinctrl_plat *plat = dev_get_plat(dev);
+ 	int bank = pin_selector / SUNXI_GPIOS_PER_BANK;
+ 	int pin	 = pin_selector % SUNXI_GPIOS_PER_BANK;
++	uint mux = desc->functions[func_selector].mux;
++
++	/* D1 UART3 uses a different function number on its PG route. */
++	if (desc == &sun20i_d1_pinctrl_desc && bank == 6 &&
++	    (pin == 8 || pin == 9) &&
++	    !strcmp(desc->functions[func_selector].name, "uart3"))
++		mux = 5;
+ 
+ 	debug("set mux: %-4s => %s (%d)\n",
+ 	      sunxi_pinctrl_get_pin_name(dev, pin_selector),
+ 	      sunxi_pinctrl_get_function_name(dev, func_selector),
+-	      desc->functions[func_selector].mux);
++	      mux);
+ 
+ 	sunxi_gpio_set_cfgbank(plat->base + bank * SUNXI_PINCTRL_BANK_SIZE,
+-			       pin, desc->functions[func_selector].mux);
++			       pin, mux);
+ 
+ 	return 0;
+ }
+@@ -608,6 +617,7 @@ static const struct sunxi_pinctrl_function sun20i_d1_pinctrl_functions[] = {
+ 	{ "mmc1",	2 },	/* PG0-PG5 */
+ 	{ "mmc2",	3 },	/* PC2-PC7 */
+ 	{ "spi0",	2 },	/* PC2-PC7 */
++	{ "spi1",	4 },	/* PD10-PD15 */
+ #if IS_ENABLED(CONFIG_UART0_PORT_F)
+ 	{ "uart0",	3 },	/* PF2,PF4 */
+ #else
 diff --git a/drivers/power/Kconfig b/drivers/power/Kconfig
 index 1b06d8a6..b325c800 100644
 --- a/drivers/power/Kconfig

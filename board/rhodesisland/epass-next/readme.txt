@@ -1,3 +1,6 @@
+Boot integration: SPI0 BMC SPL, SPI1 NAND, PG8/PG9 UART3, external FIT OTA,
+CH32 SWIO updates, and post-image SPL SRAM overlap checks.
+
 Arknights ePass Next (Allwinner D1s)
 ====================================
 

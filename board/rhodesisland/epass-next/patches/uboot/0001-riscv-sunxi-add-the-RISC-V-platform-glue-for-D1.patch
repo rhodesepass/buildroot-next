@@ -563,10 +563,10 @@ index 00000000..04c831eb
 +#endif /* _SUNXI_CPU_H */
 diff --git a/arch/riscv/include/asm/arch-sunxi/fel.h b/arch/riscv/include/asm/arch-sunxi/fel.h
 new file mode 100644
-index 00000000..ae1c474f
+index 00000000..512c2899
 --- /dev/null
 +++ b/arch/riscv/include/asm/arch-sunxi/fel.h
-@@ -0,0 +1,164 @@
+@@ -0,0 +1,173 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
 + * Assembly hooks the D1 SPL needs before anything else runs, kept out of
@@ -580,7 +580,7 @@ index 00000000..ae1c474f
 +
 +#if defined(CONFIG_SUNXI_SPL_EARLY_UART) && defined(CONFIG_XPL_BUILD)
 +/*
-+ * Bring up uart3 (PB6/PB7) before anything else, so CONFIG_DEBUG_UART works
++ * Bring up uart3 (PB6/PB7 or PG8/PG9) before anything else, so CONFIG_DEBUG_UART works
 + * from the very first instruction. This also lets the SPL be the first thing
 + * executed over FEL after a reset: xfel writes SRAM as data and never
 + * invalidates the icache, so running a helper payload to configure the UART
@@ -590,17 +590,26 @@ index 00000000..ae1c474f
 + * 0x02000030: PIO PB_CFG0, PB6/PB7 -> uart3 (function 7)
 + * 0x02500c00: uart3 registers, 8n1 at 24MHz/16/13 = 115200
 + */
++#if defined(CONFIG_SUNXI_SPL_UART3_PG)
++#define SUNXI_UART3_PINCFG 0x02000124
++#define SUNXI_UART3_PINMASK 0xffffff00
++#define SUNXI_UART3_PINMUX 0x00000055
++#else
++#define SUNXI_UART3_PINCFG 0x02000030
++#define SUNXI_UART3_PINMASK 0x00ffffff
++#define SUNXI_UART3_PINMUX 0x77000000
++#endif
 +#define SUNXI_EARLY_UART_INIT		\
 +	li	t0, 0x0200190c;		\
 +	lw	t1, 0(t0);		\
 +	li	t2, 0x00080008;		\
 +	or	t1, t1, t2;		\
 +	sw	t1, 0(t0);		\
-+	li	t0, 0x02000030;		\
++	li	t0, SUNXI_UART3_PINCFG;		\
 +	lw	t1, 0(t0);		\
-+	li	t2, 0x00ffffff;		\
++	li	t2, SUNXI_UART3_PINMASK;		\
 +	and	t1, t1, t2;		\
-+	li	t2, 0x77000000;		\
++	li	t2, SUNXI_UART3_PINMUX;		\
 +	or	t1, t1, t2;		\
 +	sw	t1, 0(t0);		\
 +	li	t0, 0x02500c00;		\
@@ -733,10 +742,10 @@ index 00000000..ae1c474f
 +#endif /* _ASM_ARCH_FEL_H_ */
 diff --git a/arch/riscv/include/asm/arch-sunxi/spl.h b/arch/riscv/include/asm/arch-sunxi/spl.h
 new file mode 100644
-index 00000000..0606513a
+index 00000000..d899d061
 --- /dev/null
 +++ b/arch/riscv/include/asm/arch-sunxi/spl.h
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,37 @@
 +/* SPDX-License-Identifier: GPL-2.0+ */
 +/*
 + * RISC-V counterpart of arch/arm/include/asm/arch-sunxi/spl.h.
@@ -758,10 +767,9 @@ index 00000000..0606513a
 +#define SUNXI_BOOTED_FROM_MMC2	2
 +#define SUNXI_BOOTED_FROM_SPI	3
 +/*
-+ * Not in the ARM header: the ARM parts predate SPI NAND boot, which the D1
-+ * BROM reports as its own source rather than folding into SPI. Established on
-+ * an ePass Next, whose only boot medium is a SPI NAND -- the BROM loaded the
-+ * SPL from it and left 4 here.
++ * D1 BROM uses low nibble 4 for SPI NAND and the high nibble for the backup
++ * copy index: 0x04, 0x14, ... . This encoding does not change the NAND FIT
++ * partition offset. MMC0_HIGH/MMC2_HIGH retain their separate meanings.
 + */
 +#define SUNXI_BOOTED_FROM_SPI_NAND	4
 +#define SUNXI_BOOTED_FROM_MMC0_HIGH	0x10
@@ -796,10 +804,10 @@ index fe357529..60a73c9b 100644
  #endif /* __ASM_RISCV_PROCESSOR_H */
 diff --git a/board/sunxi/Kconfig.riscv b/board/sunxi/Kconfig.riscv
 new file mode 100644
-index 00000000..fa105c79
+index 00000000..1566b4a0
 --- /dev/null
 +++ b/board/sunxi/Kconfig.riscv
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,244 @@
 +# SPDX-License-Identifier: GPL-2.0+
 +#
 +# Sunxi (Allwinner) support for the RISC-V SoCs: D1 and D1s (sun20i).
@@ -917,7 +925,7 @@ index 00000000..fa105c79
 +	  populated. Any other boot source is unaffected.
 +
 +config SUNXI_SPL_EARLY_UART
-+	bool "Configure uart3 (PB6/PB7) at the top of the SPL"
++	bool "Configure uart3 at the top of the SPL"
 +	depends on SPL && DEBUG_UART
 +	help
 +	  Set up uart3 in the first instructions of the SPL, before anything
@@ -930,6 +938,13 @@ index 00000000..fa105c79
 +
 +	  The register addresses are hardcoded for the D1/D1s. Say n if the
 +	  console is on a different UART.
++
++config SUNXI_SPL_UART3_PG
++	bool "Route SPL UART3 to PG8/PG9"
++	depends on SUNXI_SPL_EARLY_UART
++	help
++	  Use the ePass BMC UART pins instead of the default PB6/PB7.
++	  The board device tree must select the same pins for later stages.
 +
 +config SUNXI_DRAM_VCC_AXP209_DCDC2
 +	bool "Raise AXP209 DCDC2 to 1.8V before DRAM init"
@@ -1001,6 +1016,13 @@ index 00000000..fa105c79
 +	  medium is SPI NAND -- which is what the D1s designs are -- cannot
 +	  boot without this.
 +
++config SPL_SPINAND_SUNXI_SPI1
++	bool "Read the physical NAND on SPI1 PD10-PD15"
++	depends on SPL_SPINAND_SUNXI
++	help
++	  Use SPI1 after the BROM loads SPL from the BMC on SPI0.
++	  The physical NAND remains the source of U-Boot and the OS.
++
 +config SYS_SPINAND_U_BOOT_OFFS
 +	hex "Offset of U-Boot proper in the SPI NAND"
 +	depends on SPL_SPINAND_SUNXI
@@ -1009,12 +1031,32 @@ index 00000000..fa105c79
 +	  Where the SPL looks for u-boot.itb. Must be erase block aligned and
 +	  must agree with the partition table in the board device tree.
 +
++config SYS_SPINAND_U_BOOT_SIZE
++	hex "Size of the U-Boot SPI NAND partition"
++	depends on SPL_SPINAND_SUNXI
++	default 0x100000
++	help
++	  Bound bad-block scanning to this partition; must match the board DTS.
++
 +endif
++
++config BMC_OTA
++ bool "ePass BMC SPI0 updater"
++ depends on TARGET_SUN20I_D1
++ select SHA256
++ select CH32_SWIO
++
++config SPL_BMC_OTA
++ bool "Probe ePass BMC for an external update FIT before NAND boot"
++ depends on TARGET_SUN20I_D1 && SPL
++ default y
++ select SPL_SHA256
++ select SPL_CRC32
 diff --git a/board/sunxi/Makefile b/board/sunxi/Makefile
-index ee824931..6a4af93d 100644
+index ee824931..7f150967 100644
 --- a/board/sunxi/Makefile
 +++ b/board/sunxi/Makefile
-@@ -6,7 +6,9 @@
+@@ -6,9 +6,17 @@
  #
  # (C) Copyright 2000-2003
  # Wolfgang Denk, DENX Software Engineering, wd@denx.de.
@@ -1025,12 +1067,403 @@ index ee824931..6a4af93d 100644
  obj-$(CONFIG_SUN7I_GMAC)	+= gmac.o
  obj-$(CONFIG_MACH_SUN4I)	+= dram_sun4i_auto.o
  obj-$(CONFIG_MACH_SUN5I)	+= dram_sun5i_auto.o
+ obj-$(CONFIG_MACH_SUN7I)	+= dram_sun5i_auto.o
+ obj-$(CONFIG_$(PHASE_)CHIP_DIP_SCAN)	+= chip.o
++ifdef CONFIG_XPL_BUILD
++obj-$(CONFIG_SPL_BMC_OTA) += bmc_ota.o
++else
++obj-$(CONFIG_BMC_OTA) += bmc_ota.o
++obj-$(CONFIG_CH32_SWIO) += ch32_swio.o
++endif
+diff --git a/board/sunxi/bmc_ota.c b/board/sunxi/bmc_ota.c
+new file mode 100644
+index 00000000..4e9ce7fa
+--- /dev/null
++++ b/board/sunxi/bmc_ota.c
+@@ -0,0 +1,377 @@
++// SPDX-License-Identifier: GPL-2.0+
++#include <config.h>
++#include <image.h>
++#include <hang.h>
++#include <malloc.h>
++#include <time.h>
++#include <asm/io.h>
++#include <linux/delay.h>
++#include <linux/err.h>
++#include <u-boot/crc.h>
++#include <u-boot/sha256.h>
++#ifdef CONFIG_XPL_BUILD
++#include <spl.h>
++#include <spl_load.h>
++#else
++#include <command.h>
++#include <console.h>
++#include <env.h>
++#include <mtd.h>
++#include <linux/mtd/mtd.h>
++#include <ch32_swio.h>
++#endif
++
++#define OTA_MAGIC 0x31555042
++#define OTA_RAM ((u8 *)0x41000000UL)
++#define OTA_MAX (4 * 1024 * 1024)
++#define OTA_SPI_CDR2 1
++#define OTA_CS_GAP_US 200
++#define OTA_PROBE_TIMEOUT_MS 500
++#define OTA_IDLE_TIMEOUT_MS 120000
++struct ota_frame {
++	u32 magic, op, session, seq, offset, length, arg, status;
++	u8 data[2016];
++	u32 crc;
++};
++static struct ota_frame tx, rx;
++static u32 total, consumed, durable, target, session, seq;
++static u8 expected[32];
++static sha256_context hash;
++#define REG(a) ((void __iomem *)(ulong)(a))
++#define SPI(r) REG(0x04025000 + (r))
++
++static int ota_spi_init(void)
++{
++	u32 v = readl(REG(0x02000060));
++	int n = 100000;
++	writel((v & ~0x00ffff00) | 0x00222200, REG(0x02000060));
++	writel(BIT(31), REG(0x02001940));
++	v = readl(REG(0x0200196c));
++	writel(v & ~BIT(16), REG(0x0200196c));
++	writel(v | BIT(16) | BIT(0), REG(0x0200196c));
++	writel(BIT(31) | BIT(7) | BIT(1) | BIT(0), SPI(4));
++	while (readl(SPI(4)) & BIT(31))
++		if (!--n) return -ETIMEDOUT;
++	writel(BIT(7) | BIT(6) | BIT(2), SPI(8));
++	writel(BIT(12) | OTA_SPI_CDR2, SPI(0x24));
++	return 0;
++}
++
++static int ota_xfer(void)
++{
++	u8 *out = (u8 *)&tx, *in = (u8 *)&rx;
++	unsigned int sent = 0, got = 0, n = 10000000;
++	tx.magic = OTA_MAGIC;
++	tx.crc = crc32(0, out, 2048);
++	udelay(OTA_CS_GAP_US);
++	writel(BIT(31) | BIT(15), SPI(0x18));
++	writel(~0U, SPI(0x14));
++	writel(sizeof(tx), SPI(0x30));
++	writel(sizeof(tx), SPI(0x34));
++	writel(sizeof(tx), SPI(0x38));
++	while (sent < 64) writeb(out[sent++], SPI(0x200));
++	writel((readl(SPI(8)) & ~BIT(7)) | BIT(31), SPI(8));
++	while (got < sizeof(rx)) {
++		u32 fsr = readl(SPI(0x1c));
++		unsigned int r = fsr & 0x7f, room = 64 - ((fsr >> 16) & 0x7f);
++		while (r-- && got < sizeof(rx)) in[got++] = readb(SPI(0x300));
++		while (room-- && sent < sizeof(tx)) writeb(out[sent++], SPI(0x200));
++		if (!--n) goto timeout;
++	}
++	while (readl(SPI(8)) & BIT(31)) if (!--n) goto timeout;
++	writel(readl(SPI(8)) | BIT(7), SPI(8));
++	if (rx.magic != OTA_MAGIC || rx.length > sizeof(rx.data) ||
++					crc32(0, in, 2048) != rx.crc) return -EBADMSG;
++	return 0;
++timeout:
++	writel(readl(SPI(8)) | BIT(7), SPI(8));
++	return -ETIMEDOUT;
++}
++
++#ifndef CONFIG_XPL_BUILD
++static struct mtd_info *nand;
++static u8 *block, *verify, *touch_image;
++static u32 fill;
++static u64 physical;
++static u32 saved_flags;
++
++static void nand_close(void)
++{
++	if (nand) { nand->flags = saved_flags; put_mtd_device(nand); nand = NULL; }
++	free(block); free(verify); block = verify = NULL;
++	free(touch_image); touch_image = NULL;
++}
++
++static int nand_begin(void)
++{
++	const char *name = target == 1 ? "boot" : target == 2 ? "rootfs" : "uboot";
++	u64 good = 0, pos;
++	int ret;
++	if (target == 5) return total <= 32 * 1024 * 1024 ? 0 : -EFBIG;
++	if (target == 6) {
++		if (total > CH32_SWIO_FLASH_SIZE || total % 4) return -EINVAL;
++		touch_image = malloc(total);
++		return touch_image ? 0 : -ENOMEM;
++	}
++	if (target < 1 || target > 3) return -EINVAL;
++	if (target == 2 && total % 131072) return -EINVAL;
++	mtd_probe_devices();
++	nand = get_mtd_device_nm(name);
++	if (IS_ERR(nand)) { ret = PTR_ERR(nand); nand = NULL; return ret; }
++	saved_flags = nand->flags;
++	if (nand->type != MTD_NANDFLASH || !nand->erasesize ||
++					nand->size % nand->erasesize || total > nand->size) return -EINVAL;
++	for (pos = 0; pos < nand->size; pos += nand->erasesize) {
++		ret = mtd_block_isbad(nand, pos);
++		if (ret < 0) return ret;
++		if (!ret) good += nand->erasesize;
++	}
++	if (total > good) return -ENOSPC;
++	block = malloc(nand->erasesize); verify = malloc(nand->erasesize);
++	if (!block || !verify) return -ENOMEM;
++	memset(block, 0xff, nand->erasesize); fill = 0; physical = 0;
++	return 0;
++}
++
++static int next_good(void)
++{
++	int ret;
++	while (physical < nand->size) {
++		ret = mtd_block_isbad(nand, physical);
++		if (ret <= 0) return ret;
++		physical += nand->erasesize;
++	}
++	return -ENOSPC;
++}
++
++static int flush_block(bool erase_only)
++{
++	struct erase_info erase = {0};
++	size_t done, len;
++	int ret = next_good();
++	if (ret) return ret;
++	erase.addr = physical; erase.len = nand->erasesize;
++	/* Only this whitelisted partition is writable, only during the operation. */
++	nand->flags |= MTD_WRITEABLE;
++	ret = mtd_erase(nand, &erase);
++	if (!ret && !erase_only) {
++		len = ALIGN(fill, nand->writesize);
++		ret = mtd_write(nand, physical, len, &done, block);
++		if (!ret && done != len) ret = -EIO;
++		if (!ret) {
++			ret = mtd_read(nand, physical, len, &done, verify);
++			if (mtd_is_bitflip(ret)) ret = 0;
++			if (!ret && (done != len || memcmp(block, verify, len))) ret = -EIO;
++		}
++	}
++	nand->flags = saved_flags;
++	if (ret) return ret;
++	physical += nand->erasesize;
++	if (!erase_only) { durable += fill; fill = 0; memset(block, 0xff, nand->erasesize); }
++	return 0;
++}
++#endif
++
++static int accept_begin(void)
++{
++	if (rx.seq != 1 || rx.offset || rx.length != 40 || !rx.session) return -EINVAL;
++	memcpy(&total, rx.data, 4); memcpy(&target, rx.data + 4, 4);
++	if (!total) return -EINVAL;
++	memcpy(expected, rx.data + 8, 32);
++	session = rx.session; consumed = durable = 0; seq = 0;
++	sha256_starts(&hash);
++#ifdef CONFIG_XPL_BUILD
++	return target == 4 && total <= OTA_MAX ? 0 : -EINVAL;
++#else
++	return nand_begin();
++#endif
++}
++
++static int accept_data(void)
++{
++	if (!rx.length || rx.offset != consumed || rx.length > total - consumed) return -EINVAL;
++#ifdef CONFIG_XPL_BUILD
++	memcpy(OTA_RAM + consumed, rx.data, rx.length);
++#else
++	if (target == 6) {
++		memcpy(touch_image + consumed, rx.data, rx.length);
++	} else if (target != 5) {
++		u32 off = 0;
++		while (off < rx.length) {
++			u32 n = min_t(u32, rx.length - off, nand->erasesize - fill);
++			memcpy(block + fill, rx.data + off, n); fill += n; off += n;
++			if (fill == nand->erasesize) { int ret = flush_block(false); if (ret) return ret; }
++		}
++	}
++#endif
++	sha256_update(&hash, rx.data, rx.length);
++	consumed += rx.length;
++	return 0;
++}
++
++static int accept_end(void)
++{
++	u8 digest[32];
++	int ret = 0;
++	if (rx.length || rx.offset != total || consumed != total) return -EINVAL;
++	sha256_finish(&hash, digest);
++	if (memcmp(digest, expected, 32)) return -EBADMSG;
++#ifdef CONFIG_XPL_BUILD
++	if (total < sizeof(struct fdt_header) || fdt_check_header(OTA_RAM) ||
++					fdt_totalsize(OTA_RAM) > total) return -EINVAL;
++#endif
++#ifndef CONFIG_XPL_BUILD
++	if (target == 6) {
++		ret = ch32_swio_flash(touch_image, total);
++		if (!ret) durable = total;
++		return ret;
++	}
++	if (nand && fill) ret = flush_block(false);
++	while (!ret && target == 2 && physical < nand->size) {
++		ret = flush_block(true);
++		if (ret == -ENOSPC && physical == nand->size) ret = 0;
++	}
++#endif
++	return ret;
++}
++
++/* A repeated response is ACKed again; it never advances the NAND cursor. */
++static int ota_receive(bool probe)
++{
++	unsigned long progress;
++	bool active = false, completed = false;
++	u32 last_crc = 0;
++	int ret;
++	session = seq = consumed = durable = 0;
++	ret = ota_spi_init(); if (ret) return ret;
++	memset(&tx, 0, sizeof(tx)); tx.op = 1;
++	tx.arg = IS_ENABLED(CONFIG_XPL_BUILD) ? 1 : 2;
++	progress = get_timer(0);
++	for (;;) {
++		if (get_timer(progress) >= (probe && !active ?
++				OTA_PROBE_TIMEOUT_MS : OTA_IDLE_TIMEOUT_MS)) {
++			ret = -ETIMEDOUT;
++			break;
++		}
++		ret = ota_xfer();
++		if (ret)
++			continue;
++#ifndef CONFIG_XPL_BUILD
++		if (ctrlc()) { ret = -ECANCELED; break; }
++#endif
++		if (rx.op == 13) { ret = -ECANCELED; break; }
++		if (rx.op == 0) {
++			if (rx.arg > 1 || rx.length || rx.session || rx.seq ||
++			    rx.offset || rx.status) { ret = -EINVAL; break; }
++			if (probe && !active && !rx.arg) {
++				ret = IS_ENABLED(CONFIG_XPL_BUILD) ? -ENOENT : 0;
++				break;
++			}
++			if (rx.arg == 1 && !active) {
++				active = true; probe = false;
++				progress = get_timer(0);
++			}
++			if (tx.op != 3) tx.op = 1;
++			continue;
++		}
++		if (active && session && rx.session == session && rx.seq == seq) {
++			if (rx.crc != last_crc) { ret = -EINVAL; break; }
++			continue;
++		}
++		if (rx.op == 10 && (!session || (completed && rx.session != session))) {
++#ifndef CONFIG_XPL_BUILD
++			nand_close();
++#endif
++			active = true; completed = false; probe = false; ret = accept_begin();
++		} else if (completed || rx.session != session || rx.seq != seq + 1 || !session) {
++			ret = -EINVAL;
++		} else if (rx.op == 11) ret = accept_data();
++		else if (rx.op == 12) ret = accept_end();
++		else ret = -EINVAL;
++		if (ret) break;
++		progress = get_timer(0); seq = rx.seq; last_crc = rx.crc;
++		memset(&tx, 0, sizeof(tx)); tx.op = 3; tx.session = session;
++		tx.seq = seq; tx.offset = consumed; tx.arg = durable;
++		if (rx.op == 12) {
++			completed = true;
++			/* Push END ACK physically before SPL can jump or U-Boot returns. */
++			ret = ota_xfer();
++#ifndef CONFIG_XPL_BUILD
++			if (ret == -EBADMSG) ret = 0;
++#endif
++#ifdef CONFIG_XPL_BUILD
++			/* IDLE proves the peer consumed END ACK before we change boot stage. */
++			while ((ret || rx.op != 0) &&
++			       get_timer(progress) < OTA_IDLE_TIMEOUT_MS)
++				ret = ota_xfer();
++			if (ret || rx.op != 0) ret = -ETIMEDOUT;
++			break;
++#else
++			if (ret) break;
++			printf("BMC OTA verified: target %u, %u bytes\n", target, total);
++			nand_close();
++			/* END is still replayable while the host prepares the next image. */
++#endif
++		}
++	}
++	if (ret && !(IS_ENABLED(CONFIG_XPL_BUILD) && ret == -ENOENT)) {
++		memset(&tx, 0, sizeof(tx)); tx.op = 4; tx.session = session;
++		tx.seq = seq; tx.offset = consumed; tx.arg = durable; tx.status = -ret;
++		if (rx.session && rx.op >= 10 && rx.op <= 13) {
++			tx.session = rx.session;
++			tx.seq = rx.seq;
++		}
++		ota_xfer();
++	}
++#ifndef CONFIG_XPL_BUILD
++	nand_close();
++	env_set("bmcota_active", active ? "1" : "0");
++#endif
++	return ret;
++}
++
++#ifdef CONFIG_XPL_BUILD
++static ulong ota_read(struct spl_load_info *load, ulong offset, ulong count, void *buf)
++{
++	ulong available, padded;
++
++	if (total > OTA_MAX || offset > total) return 0;
++	padded = ((ulong)total + 3) & ~3UL;
++	if (count > padded - offset) return 0;
++	available = total - offset;
++	if (available > count) available = count;
++	memcpy(buf, OTA_RAM + offset, available);
++	/* The FIT loader rounds its metadata read to four bytes. */
++	memset((u8 *)buf + available, 0, count - available);
++	return count;
++}
++static int ota_load(struct spl_image_info *image, struct spl_boot_device *bootdev)
++{
++	struct spl_load_info load;
++	int ret = ota_receive(true);
++
++	if (ret == -ENOENT)
++		return ret;
++	if (!ret) {
++		spl_load_init(&load, ota_read, NULL, 1);
++		ret = spl_load(image, bootdev, &load, total, 0);
++	}
++	/* An update must never continue through an old or partially written NAND. */
++	if (ret) {
++		printf("BMC update failed: %d; refusing NAND fallback\n", ret);
++		hang();
++	}
++	return 0;
++}
++SPL_LOAD_IMAGE_METHOD("BMC update probe", 0, BOOT_DEVICE_BOARD, ota_load);
++#else
++static int do_bmcota(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
++{
++	int ret;
++	if (argc > 2 || (argc == 2 && strcmp(argv[1], "probe"))) return CMD_RET_USAGE;
++	ret = ota_receive(argc == 2);
++	if (ret) printf("BMC OTA stopped: %d; restart upload from offset zero\n", ret);
++	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++U_BOOT_CMD(bmcota, 2, 0, do_bmcota, "receive BMC SPI0 firmware update", "[probe]");
++#endif
 diff --git a/board/sunxi/board-riscv.c b/board/sunxi/board-riscv.c
 new file mode 100644
-index 00000000..f9b3d408
+index 00000000..b9a14142
 --- /dev/null
 +++ b/board/sunxi/board-riscv.c
-@@ -0,0 +1,802 @@
+@@ -0,0 +1,818 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * Board code for the RISC-V sunxi SoCs (Allwinner D1/D1s).
@@ -1140,6 +1573,10 @@ index 00000000..f9b3d408
 +{
 +	int boot_source = sunxi_get_boot_source();
 +
++	/* SPI NAND backup copies encode their index above the low media nibble. */
++	if ((boot_source & 0xf) == SUNXI_BOOTED_FROM_SPI_NAND)
++		boot_source = SUNXI_BOOTED_FROM_SPI_NAND;
++
 +	switch (boot_source) {
 +	case SUNXI_INVALID_BOOT_SOURCE:
 +		return BOOT_DEVICE_BOARD;
@@ -1209,6 +1646,18 @@ index 00000000..f9b3d408
 +u32 spl_boot_device(void)
 +{
 +	return sunxi_get_boot_device();
++}
++
++void board_boot_order(u32 *spl_boot_list)
++{
++	u32 boot = spl_boot_device();
++
++	if (IS_ENABLED(CONFIG_SPL_BMC_OTA) && boot == BOOT_DEVICE_NAND) {
++		spl_boot_list[0] = BOOT_DEVICE_BOARD;
++		spl_boot_list[1] = BOOT_DEVICE_NAND;
++	} else {
++		spl_boot_list[0] = boot;
++	}
 +}
 +
 +/*
@@ -1833,12 +2282,407 @@ index 00000000..f9b3d408
 +#endif
 +
 +#endif /* CONFIG_XPL_BUILD */
+diff --git a/board/sunxi/ch32_swio.c b/board/sunxi/ch32_swio.c
+new file mode 100644
+index 00000000..6151a77b
+--- /dev/null
++++ b/board/sunxi/ch32_swio.c
+@@ -0,0 +1,389 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * SWIO framing and debug/flash sequences adapted from minichlink/ch32fun
++ * and the eprv uopbridge SWIO implementation.
++ * Copyright 2023 Charles Lohr
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++#include <ch32_swio.h>
++#include <cyclic.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/string.h>
++#include <stdio.h>
++#include <asm/io.h>
++#include <asm/system.h>
++
++#define PG_CFG1 0x02000124UL
++#define PG_DATA 0x02000130UL
++#define PG_PULL 0x02000144UL
++#define SWIO (1U << 13)
++#define RST (1U << 15)
++#define PIN_CFG ((15U << 20) | (15U << 28))
++#define PIN_PULL ((3U << 26) | (3U << 30))
++#define FLASH_BASE 0x08000000U
++#define FLASH_REG 0x40022000U
++#define PAGE_SIZE 256U
++#define TRY(expr) do { int err_ = (expr); if (err_) return err_; } while (0)
++
++static u32 frame_low, frame_high, frame_input, frame_output;
++static u32 saved_cfg, saved_data, saved_pull;
++static unsigned long saved_irq;
++
++static inline u64 ticks(void)
++{
++	u64 value;
++
++	asm volatile("rdtime %0" : "=r"(value));
++	return value;
++}
++
++static __always_inline void wait_ticks(unsigned int count)
++{
++	u64 start = ticks();
++
++	while (ticks() - start < count)
++		;
++}
++
++static __always_inline void bit_store(ulong addr, u32 value)
++{
++	*(volatile u32 *)addr = value;
++	asm volatile("fence iorw, iorw" ::: "memory");
++}
++
++static bool line_high(void)
++{
++	return !!(readl((void *)PG_DATA) & SWIO);
++}
++
++static int wait_high(void)
++{
++	u64 start = ticks();
++
++	while (!line_high())
++		if (ticks() - start >= 24 * 50)
++			return -ETIMEDOUT;
++	return 0;
++}
++
++static void release(void)
++{
++	clrbits_le32((void *)PG_CFG1, PIN_CFG);
++	clrbits_le32((void *)PG_PULL, PIN_PULL);
++}
++
++static void reset_target(void)
++{
++	release();
++	clrbits_le32((void *)PG_DATA, RST);
++	setbits_le32((void *)PG_CFG1, 1U << 28);
++	udelay(1000);
++	clrbits_le32((void *)PG_CFG1, 15U << 28);
++}
++
++static void send_bit(bool bit)
++{
++	/* These are added 24 MHz waits, not desired physical pulse widths. */
++	bit_store(PG_DATA, frame_low);
++	wait_ticks(bit ? 3 : 18);
++	bit_store(PG_DATA, frame_high);
++	wait_ticks(4);
++}
++
++static int frame_begin(u8 reg, bool write)
++{
++	unsigned int mask;
++
++	clrbits_le32((void *)PG_CFG1, 15U << 20);
++	TRY(wait_high());
++	/* Per-bit read-modify-write makes the short pulse too long for V006. */
++	frame_low = readl((void *)PG_DATA) & ~SWIO;
++	frame_high = frame_low | SWIO;
++	frame_input = readl((void *)PG_CFG1) & ~(15U << 20);
++	frame_output = frame_input | (1U << 20);
++	bit_store(PG_DATA, frame_high);
++	bit_store(PG_CFG1, frame_output);
++	send_bit(true);
++	for (mask = 64; mask; mask >>= 1)
++		send_bit(reg & mask);
++	send_bit(write);
++	return 0;
++}
++
++static int dmi_write(u8 reg, u32 value)
++{
++	u32 mask;
++
++	TRY(frame_begin(reg, true));
++	for (mask = 1U << 31; mask; mask >>= 1)
++		send_bit(value & mask);
++	wait_ticks(24 * 8);
++	return 0;
++}
++
++static int dmi_read(u8 reg, u32 *value)
++{
++	u32 result = 0;
++	unsigned int i;
++
++	TRY(frame_begin(reg, false));
++	for (i = 0; i < 32; i++) {
++		bit_store(PG_DATA, frame_low);
++		wait_ticks(2);
++		bit_store(PG_CFG1, frame_input);
++		wait_ticks(4);
++		result = (result << 1) | line_high();
++		TRY(wait_high());
++		bit_store(PG_DATA, frame_high);
++		bit_store(PG_CFG1, frame_output);
++		wait_ticks(4);
++	}
++	wait_ticks(24 * 8);
++	*value = result;
++	return 0;
++}
++
++static int command(u32 cmd)
++{
++	u64 start;
++	u32 status;
++
++	TRY(dmi_write(0x17, cmd));
++	start = ticks();
++	do {
++		TRY(dmi_read(0x16, &status));
++		if (!(status & (1U << 12)))
++			return status & 0x700 ? -EIO : 0;
++	} while (ticks() - start < 24 * 100000);
++	return -ETIMEDOUT;
++}
++
++static int mem_read(u32 addr, u32 *value)
++{
++	TRY(dmi_write(0x20, 0x90024000)); /* c.lw x8,0(x8); c.ebreak */
++	TRY(dmi_write(0x04, addr));
++	TRY(command(0x00271008));
++	TRY(command(0x00221008));
++	return dmi_read(0x04, value);
++}
++
++static int mem_write(u32 addr, u32 value)
++{
++	TRY(dmi_write(0x20, 0x0084a023)); /* sw x8,0(x9) */
++	TRY(dmi_write(0x21, 0x00100073)); /* ebreak */
++	TRY(dmi_write(0x04, addr));
++	TRY(command(0x00231009));
++	TRY(dmi_write(0x04, value));
++	return command(0x00271008);
++}
++
++static int connect_target(void)
++{
++	u32 value;
++	int i;
++
++	reset_target();
++	udelay(16000);
++	TRY(wait_high());
++	for (i = 0; i < 2; i++) {
++		TRY(dmi_write(0x7e, 0x5aa50400));
++		TRY(dmi_write(0x7d, 0x5aa50400));
++	}
++	for (i = 0; i < 3; i++)
++		TRY(dmi_write(0x10, 0x80000001));
++	TRY(dmi_read(0x11, &value));
++	if (!value || value == ~0U || !(value & (1U << 9)))
++		return -ENODEV;
++	TRY(dmi_write(0x18, 0));
++	TRY(dmi_write(0x16, 0x08000700));
++	TRY(mem_read(0x1ffff704, &value));
++	if (value != 0x00620620) {
++		printf("CH32: unsupported chip %08x\n", value);
++		return -ENODEV;
++	}
++	TRY(mem_read(FLASH_REG + 0x1c, &value));
++	if (value & 2)
++		return -EACCES;
++	TRY(mem_read(FLASH_REG + 0x20, &value));
++	if (value != ~0U)
++		return -EACCES;
++	return 0;
++}
++
++static void session_begin(void)
++{
++	/* RISC-V disable_interrupts() is a stub; save the actual S-mode CSR. */
++	local_irq_save(saved_irq);
++	saved_cfg = readl((void *)PG_CFG1);
++	saved_data = readl((void *)PG_DATA);
++	saved_pull = readl((void *)PG_PULL);
++}
++
++static void session_end(void)
++{
++	int reset_ret, resume_ret;
++
++	/* NRST need not clear haltreq. Hold it while dropping the debug halt,
++	 * so a failed debug reset cannot resume an old PC with modified x8/x9.
++	 */
++	release();
++	clrbits_le32((void *)PG_DATA, RST);
++	setbits_le32((void *)PG_CFG1, 1U << 28);
++	udelay(1000);
++	reset_ret = dmi_write(0x10, 0x80000003);
++	resume_ret = dmi_write(0x10, 0x40000001);
++	udelay(1000);
++	release();
++	clrsetbits_le32((void *)PG_DATA, SWIO | RST, saved_data & (SWIO | RST));
++	clrsetbits_le32((void *)PG_PULL, PIN_PULL, saved_pull & PIN_PULL);
++	clrsetbits_le32((void *)PG_CFG1, PIN_CFG, saved_cfg & PIN_CFG);
++	local_irq_restore(saved_irq);
++	if (reset_ret || resume_ret)
++		printf("CH32: debug reset/resume failed; target restart unconfirmed\n");
++}
++
++static int flash_wait(void)
++{
++	u64 start = ticks();
++	u32 value;
++
++	do {
++		TRY(mem_read(FLASH_REG + 0x0c, &value));
++		if (!(value & 3))
++			return value & 0x14 ? -EIO : 0;
++	} while (ticks() - start < 24 * 100000);
++	return -ETIMEDOUT;
++}
++
++static int unlock_flash(void)
++{
++	u32 value;
++
++	/* Do not unlock option bytes or the boot area. */
++	TRY(mem_write(FLASH_REG + 4, 0x45670123));
++	TRY(mem_write(FLASH_REG + 4, 0xcdef89ab));
++	TRY(mem_write(FLASH_REG + 0x24, 0x45670123));
++	TRY(mem_write(FLASH_REG + 0x24, 0xcdef89ab));
++	TRY(mem_read(FLASH_REG + 0x10, &value));
++	if (value & 0x8080)
++		return -EACCES;
++	TRY(mem_write(FLASH_REG + 0x0c, 0x34));
++	return flash_wait();
++}
++
++static int program_page(u32 addr, const u8 *page)
++{
++	u32 i, value, expected;
++
++	TRY(mem_write(FLASH_REG + 0x10, 0x00020000));
++	TRY(mem_write(FLASH_REG + 0x14, addr));
++	TRY(mem_write(FLASH_REG + 0x10, 0x00020040));
++	TRY(flash_wait());
++	TRY(mem_write(FLASH_REG + 0x10, 0x00010000));
++	TRY(mem_write(FLASH_REG + 0x10, 0x00090000));
++	TRY(flash_wait());
++	for (i = 0; i < PAGE_SIZE; i += 4) {
++		memcpy(&value, page + i, 4);
++		TRY(mem_write(addr + i, value));
++		TRY(mem_write(FLASH_REG + 0x10, 0x00050000));
++		TRY(flash_wait());
++	}
++	TRY(mem_write(FLASH_REG + 0x14, addr));
++	TRY(mem_write(FLASH_REG + 0x10, 0x00010040));
++	TRY(flash_wait());
++	TRY(mem_write(FLASH_REG + 0x10, 0));
++	for (i = 0; i < PAGE_SIZE; i += 4) {
++		TRY(mem_read(addr + i, &value));
++		memcpy(&expected, page + i, 4);
++		if (value != expected) {
++			printf("CH32: verify failed at %08x\n", addr + i);
++			return -EIO;
++		}
++	}
++	return 0;
++}
++
++int ch32_swio_probe(void)
++{
++	int ret;
++
++	session_begin();
++	ret = connect_target();
++	session_end();
++	if (!ret)
++		printf("CH32V006 00620620, 62 KiB main flash, read protection off\n");
++	return ret;
++}
++
++int ch32_swio_read(void *data, size_t len)
++{
++	size_t offset, count;
++	u32 value;
++	int ret;
++
++	if (!data || !len || len > CH32_SWIO_FLASH_SIZE)
++		return -EINVAL;
++	session_begin();
++	ret = connect_target();
++	for (offset = 0; !ret && offset < len; offset += 4) {
++		if (!(offset % PAGE_SIZE)) schedule();
++		ret = mem_read(FLASH_BASE + offset, &value);
++		count = len - offset < 4 ? len - offset : 4;
++		if (!ret)
++			memcpy((u8 *)data + offset, &value, count);
++	}
++	session_end();
++	return ret;
++}
++
++int ch32_swio_flash(const void *data, size_t len)
++{
++	u8 page[PAGE_SIZE];
++	size_t offset, count, i;
++	u32 value;
++	int ret;
++
++	if (!data || !len || (len & 3) || len > CH32_SWIO_FLASH_SIZE)
++		return -EINVAL;
++	session_begin();
++	ret = connect_target();
++	if (!ret)
++		ret = unlock_flash();
++	for (offset = 0; !ret && offset < len; offset += PAGE_SIZE) {
++		schedule();
++		count = len - offset < PAGE_SIZE ? len - offset : PAGE_SIZE;
++		/* Preserve bytes outside the image in the final erase page. */
++		if (count < PAGE_SIZE) {
++			for (i = 0; i < PAGE_SIZE; i += 4) {
++				ret = mem_read(FLASH_BASE + offset + i, &value);
++				if (ret)
++					break;
++				memcpy(page + i, &value, 4);
++			}
++			if (ret)
++				break;
++		}
++		memcpy(page, (const u8 *)data + offset, count);
++		ret = program_page(FLASH_BASE + offset, page);
++		if (!ret && (!(offset % 4096) || offset + count == len))
++			printf("CH32 verified %zu/%zu bytes\n", offset + count, len);
++	}
++	session_end();
++	return ret;
++}
 diff --git a/board/sunxi/spl_spinand_sunxi.c b/board/sunxi/spl_spinand_sunxi.c
 new file mode 100644
-index 00000000..10b1cc1c
+index 00000000..a6184531
 --- /dev/null
 +++ b/board/sunxi/spl_spinand_sunxi.c
-@@ -0,0 +1,387 @@
+@@ -0,0 +1,413 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * SPL loader for SPI NAND on the RISC-V sunxi SoCs (Allwinner D1/D1s).
@@ -1888,21 +2732,28 @@ index 00000000..10b1cc1c
 +#define readb(a)	readb((const volatile void __iomem *)(ulong)(a))
 +#define writeb(v, a)	writeb((v), (volatile void __iomem *)(ulong)(a))
 +
++#if CONFIG_IS_ENABLED(SPINAND_SUNXI_SPI1)
++#define SPINAND_BUS 1
++#else
++#define SPINAND_BUS 0
++#endif
++
 +/* CCU */
 +#define CCU_BASE			0x02001000UL
-+#define CCU_SPI0_CLK_REG		(CCU_BASE + 0x940)
++#define CCU_SPI_CLK_REG		(CCU_BASE + 0x940 + 4 * SPINAND_BUS)
 +#define CCU_SPI_BGR_REG			(CCU_BASE + 0x96c)
-+#define CCU_SPI0_GATE			BIT(0)
-+#define CCU_SPI0_RST			BIT(16)
++#define CCU_SPI_GATE			BIT(SPINAND_BUS)
++#define CCU_SPI_RST			BIT(16 + SPINAND_BUS)
 +#define CCU_CLK_ENABLE			BIT(31)
 +#define CCU_CLK_SRC_HOSC		(0 << 24)
 +
 +/* pinctrl: SPI0 is PC2..PC5, function 2 */
 +#define PIO_BASE			0x02000000UL
 +#define PIO_PC_CFG0_REG			(PIO_BASE + 0x60)
++#define PIO_PD_CFG1_REG			(PIO_BASE + 0x94)
 +
 +/* SPI0 */
-+#define SPI_BASE			0x04025000UL
++#define SPI_BASE			(0x04025000UL + 0x1000 * SPINAND_BUS)
 +#define SPI_GCR				(SPI_BASE + 0x04)
 +#define SPI_TCR				(SPI_BASE + 0x08)
 +#define SPI_IER				(SPI_BASE + 0x10)
@@ -1943,6 +2794,7 @@ index 00000000..10b1cc1c
 +#define SPINAND_FEATURE_CONFIG		0xb0
 +#define SPINAND_FEATURE_STATUS		0xc0
 +#define SPINAND_CFG_ECC_EN		BIT(4)
++#define WINBOND_CFG_BUF_READ		BIT(3)
 +#define SPINAND_STATUS_BUSY		BIT(0)
 +
 +/*
@@ -2046,19 +2898,24 @@ index 00000000..10b1cc1c
 +	int timeout;
 +	u32 val;
 +
-+	/* SPI0 pins: PC2..PC5 to function 2 */
++#if CONFIG_IS_ENABLED(SPINAND_SUNXI_SPI1)
++	/* The BROM's SPI0 link ends here; subsequent reads target the real NAND. */
++	val = readl(PIO_PD_CFG1_REG);
++	val = (val & ~0x00ffff00) | 0x00444400;
++	writel(val, PIO_PD_CFG1_REG);
++#else
 +	val = readl(PIO_PC_CFG0_REG);
-+	val &= ~0x00ffff00;
-+	val |= 0x00222200;
++	val = (val & ~0x00ffff00) | 0x00222200;
 +	writel(val, PIO_PC_CFG0_REG);
++#endif
 +
 +	/* 24MHz straight off the oscillator: no PLL, and no sample tuning */
-+	writel(CCU_CLK_ENABLE | CCU_CLK_SRC_HOSC, CCU_SPI0_CLK_REG);
++	writel(CCU_CLK_ENABLE | CCU_CLK_SRC_HOSC, CCU_SPI_CLK_REG);
 +
 +	/* ungate and release reset */
 +	val = readl(CCU_SPI_BGR_REG);
-+	writel(val & ~CCU_SPI0_RST, CCU_SPI_BGR_REG);
-+	writel(val | CCU_SPI0_GATE | CCU_SPI0_RST, CCU_SPI_BGR_REG);
++	writel(val & ~CCU_SPI_RST, CCU_SPI_BGR_REG);
++	writel(val | CCU_SPI_GATE | CCU_SPI_RST, CCU_SPI_BGR_REG);
 +
 +	writel(SPI_GCR_SOFT_RST | SPI_GCR_TXPAUSE_EN | SPI_GCR_MASTER |
 +	       SPI_GCR_ENABLE, SPI_GCR);
@@ -2106,7 +2963,7 @@ index 00000000..10b1cc1c
 +		printf("SPI NAND: no chip (id %02x %02x)\n", id[0], id[1]);
 +		return -ENODEV;
 +	}
-+	printf("SPI NAND: id %02x %02x\n", id[0], id[1]);
++	printf("SPI%u NAND: id %02x %02x\n", SPINAND_BUS, id[0], id[1]);
 +
 +	/*
 +	 * Leave the on-die ECC engine on. It is what makes a plain read
@@ -2115,7 +2972,8 @@ index 00000000..10b1cc1c
 +	 */
 +	spinand_set_feature(SPINAND_FEATURE_CONFIG,
 +			    spinand_get_feature(SPINAND_FEATURE_CONFIG) |
-+			    SPINAND_CFG_ECC_EN);
++			    SPINAND_CFG_ECC_EN |
++			    (id[0] == 0xef ? WINBOND_CFG_BUF_READ : 0));
 +
 +	return 0;
 +}
@@ -2159,37 +3017,49 @@ index 00000000..10b1cc1c
 +	return marker != 0xff;
 +}
 +
-+/*
-+ * Read `len` bytes starting at `offs`, which must be block aligned. Bad
-+ * blocks are skipped, so the data lands contiguously in memory while its
-+ * physical extent on the chip grows -- exactly what a written image does.
-+ */
++/* FIT callbacks use byte offsets, including offsets within a page. */
 +static int spinand_read(u32 offs, void *dst, u32 len)
 +{
-+	u32 block = offs / SPINAND_BLOCK_SIZE;
++	u32 block = CONFIG_SYS_SPINAND_U_BOOT_OFFS / SPINAND_BLOCK_SIZE;
++	u32 skip;
 +	u8 *out = dst;
-+	u32 done = 0;
 +
-+	while (done < len) {
-+		u32 page, i;
++	if (offs < CONFIG_SYS_SPINAND_U_BOOT_OFFS)
++		return -EINVAL;
++	skip = offs - CONFIG_SYS_SPINAND_U_BOOT_OFFS;
++
++	/* Bad-block scanning must not consume the following partition. */
++	while (len && block < ((CONFIG_SYS_SPINAND_U_BOOT_OFFS +
++			       CONFIG_SYS_SPINAND_U_BOOT_SIZE) / SPINAND_BLOCK_SIZE)) {
++		u32 page, column;
 +
 +		if (spinand_block_is_bad(block)) {
 +			block++;
 +			continue;
 +		}
++		if (skip >= SPINAND_BLOCK_SIZE) {
++			skip -= SPINAND_BLOCK_SIZE;
++			block++;
++			continue;
++		}
 +
-+		page = block * SPINAND_PAGES_PER_BLOCK;
-+		for (i = 0; i < SPINAND_PAGES_PER_BLOCK && done < len; i++) {
-+			u32 chunk = min_t(u32, SPINAND_PAGE_SIZE, len - done);
++		page = skip / SPINAND_PAGE_SIZE;
++		column = skip % SPINAND_PAGE_SIZE;
++		skip = 0;
++		for (; page < SPINAND_PAGES_PER_BLOCK && len; page++) {
++			u32 chunk = min_t(u32, SPINAND_PAGE_SIZE - column, len);
 +
-+			if (spinand_read_page(page + i, 0, out + done, chunk))
++			if (spinand_read_page(block * SPINAND_PAGES_PER_BLOCK +
++					      page, column, out, chunk))
 +				return -EIO;
-+			done += chunk;
++			out += chunk;
++			len -= chunk;
++			column = 0;
 +		}
 +		block++;
 +	}
 +
-+	return 0;
++	return len ? -ENOSPC : 0;
 +}
 +
 +static ulong spl_spinand_read(struct spl_load_info *load, ulong sector,
@@ -2248,6 +3118,26 @@ index 5fa94098..43b89729 100644
  	default y if ARCH_SC5XX && (SC59X_64 || SC59X)
  	default y if ARCH_SC5XX && SC58X
  	default y if ARCH_SC5XX && SC57X
+diff --git a/include/ch32_swio.h b/include/ch32_swio.h
+new file mode 100644
+index 00000000..3e839acd
+--- /dev/null
++++ b/include/ch32_swio.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef __CH32_SWIO_H
++#define __CH32_SWIO_H
++
++#include <linux/types.h>
++
++#define CH32_SWIO_FLASH_SIZE 63488U
++
++/* Each operation resets the target on entry and exit. No option-byte writes. */
++int ch32_swio_probe(void);
++int ch32_swio_read(void *data, size_t len);
++int ch32_swio_flash(const void *data, size_t len);
++
++#endif
 diff --git a/include/configs/sun20i.h b/include/configs/sun20i.h
 new file mode 100644
 index 00000000..e8ef1b6c

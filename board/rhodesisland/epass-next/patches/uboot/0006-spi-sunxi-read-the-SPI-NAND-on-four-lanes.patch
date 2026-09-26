@@ -26,7 +26,7 @@ the reasoning is commented there. The SPL is unaffected -- its loader muxes
 PC2..PC5 itself and reads single-lane.
 ---
 diff --git a/drivers/spi/spi-sunxi.c b/drivers/spi/spi-sunxi.c
-index 7702f85e..b2394f1b 100644
+index 7702f85e..e28103b2 100644
 --- a/drivers/spi/spi-sunxi.c
 +++ b/drivers/spi/spi-sunxi.c
 @@ -22,6 +22,7 @@
@@ -261,3 +261,50 @@ index 7702f85e..b2394f1b 100644
  };
  
  static const struct sun4i_spi_variant sun4i_a10_spi_variant = {
+@@ -679,17 +852,7 @@ static const struct sun4i_spi_variant sun50i_r329_spi_variant = {
+ 	.has_burst_ctl		= true,
+ };
+ 
+-/*
+- * Same block as the R329, but with the mod clock filled in. Kept as its own
+- * entry rather than added to the R329 variant because the CCU layout around
+- * it is per-SoC, and D1 is the one that has been measured.
+- *
+- * 0x940 is SPI0's mod clock specifically, so this variant must never bind to
+- * SPI1 (whose clock is 0x944). It does not: D1's SPI1 is the DBI-capable
+- * block, and its dts node is compatible with "allwinner,sun20i-d1-spi-dbi"
+- * and the R329 strings, never with the "allwinner,sun20i-d1-spi" matched
+- * below. Adding an instance here means revisiting that.
+- */
++/* D1 module clocks are instance-specific; SPI1 also exposes DBI. */
+ static const struct sun4i_spi_variant sun20i_d1_spi_variant = {
+ 	.regs			= sun6i_spi_regs,
+ 	.bits			= sun6i_spi_bits,
+@@ -700,6 +863,16 @@ static const struct sun4i_spi_variant sun20i_d1_spi_variant = {
+ 	.max_rate		= 100000000,
+ };
+ 
++static const struct sun4i_spi_variant sun20i_d1_spi1_variant = {
++	.regs			= sun6i_spi_regs,
++	.bits			= sun6i_spi_bits,
++	.fifo_depth		= 64,
++	.has_soft_reset		= true,
++	.has_burst_ctl		= true,
++	.mod_clk_off		= 0x944,
++	.max_rate		= 100000000,
++};
++
+ static const struct udevice_id sun4i_spi_ids[] = {
+ 	{
+ 	  .compatible = "allwinner,sun4i-a10-spi",
+@@ -717,6 +890,10 @@ static const struct udevice_id sun4i_spi_ids[] = {
+ 	  .compatible = "allwinner,sun20i-d1-spi",
+ 	  .data = (ulong)&sun20i_d1_spi_variant,
+ 	},
++	{
++	  .compatible = "allwinner,sun20i-d1-spi-dbi",
++	  .data = (ulong)&sun20i_d1_spi1_variant,
++	},
+ 	{
+ 	  .compatible = "allwinner,sun50i-r329-spi",
+ 	  .data = (ulong)&sun50i_r329_spi_variant,

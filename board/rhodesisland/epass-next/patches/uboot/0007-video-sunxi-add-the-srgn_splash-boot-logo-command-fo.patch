@@ -1,19 +1,11 @@
 From: shirogane <artoriapendragon123@gmail.com>
 Subject: [PATCH 7/7] video: sunxi: add the srgn_splash boot logo command for the D1s
 
-The previous generation showed a logo from the moment U-Boot could scan it
-out and handed the live pipeline to the kernel with a set of driver patches
-that skipped every destructive reset. This board does it the standard way
-instead: srgn_splash brings up the whole D1 display pipeline (DE2 mixer0,
-tcon_top, TCON LCD0 in 8080/DSI mode, the DSI host, the D-PHY) and runs the
-panel's DCS init sequence, then describes the framebuffer to the kernel as a
-/chosen simple-framebuffer node plus a no-map reserved-memory carveout.
-Linux's built-in simpledrm adopts it with zero kernel patches, and the real
-sun4i DRM stack -- built as modules, loaded by the app supervisor -- replaces
-it right before the app draws its first frame. The one thing that cannot be
-avoided without patching the kernel is the ~0.4s blank while the ST7703 goes
-through its mandatory reset and sleep-out; deferring the module load parks
-that blank next to the app's startup instead of the middle of the boot.
+srgn_splash retains scanout until the Linux DRM modules take over near
+APP startup. D1 mixer and DSI drivers stop inherited DMA and reset the
+shared host state at takeover. Explicit cleanup remains on reinitialization
+and error paths. The /chosen bus has identity address translation so
+simpledrm can acquire and later release the framebuffer reservation.
 
 Panel parameters live in the merged control FDT (srgn,panel-timing,
 srgn,dsi-lanes, srgn,init-sequence, plus the reset-gpios and backlight pwms
@@ -72,10 +64,10 @@ index 43216733..b0a805d5 100644
 +obj-$(CONFIG_SRGN_SPLASH) += srgn_splash.o
 diff --git a/drivers/video/sunxi/srgn_splash.c b/drivers/video/sunxi/srgn_splash.c
 new file mode 100644
-index 00000000..190d1ce2
+index 00000000..4e95e16d
 --- /dev/null
 +++ b/drivers/video/sunxi/srgn_splash.c
-@@ -0,0 +1,1088 @@
+@@ -0,0 +1,1146 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * srgn_splash - boot logo scanout for the Arknights ePass Next (D1s).
@@ -86,10 +78,11 @@ index 00000000..190d1ce2
 + *   PLL_PERIPH0 -> DE clk -> DE2 mixer0 (UI channel, RGB565 scanout)
 + *   mixer0 -> tcon_top -> tcon_lcd0 -> DSI host -> D-PHY -> panel
 + *
-+ * then leaves it scanning a caller-provided RGB565 framebuffer and
++ * then scans a caller-provided RGB565 framebuffer until Linux DRM takeover and
 + * describes it to the kernel as a standard /chosen simple-framebuffer
-+ * node plus a /reserved-memory carveout. Linux simpledrm picks it up;
-+ * the real sun4i-drm stack replaces it whenever its modules get loaded.
++ * node plus a /reserved-memory carveout. The native D1 DRM components stop
++ * firmware DMA before removing simpledrm and reset the DSI host before
++ * starting their own scanout.
 + * The carveout deliberately has no "no-map": the pages keep their
 + * struct page and linear mapping, so the srgn,free-on-takeover hook in
 + * simpledrm can hand them back to the page allocator once the takeover
@@ -108,6 +101,7 @@ index 00000000..190d1ce2
 +#include <cpu_func.h>
 +#include <env.h>
 +#include <fdt_support.h>
++#include <init.h>
 +#include <lmb.h>
 +#include <linux/delay.h>
 +#include <linux/iopoll.h>
@@ -329,7 +323,7 @@ index 00000000..190d1ce2
 +#define PIO_BANK_D		3
 +
 +#define PIN_FUNC_DSI		4	/* PD0-PD9 */
-+#define PIN_FUNC_PWM4		5	/* PD20 */
++#define PIN_FUNC_PWM5		5	/* PG4 */
 +#define PIN_FUNC_GPIO_OUT	1
 +
 +/* D1 PWM block (matches the pwm-sun20i kernel driver) */
@@ -369,6 +363,8 @@ index 00000000..190d1ce2
 +	u32 pwm_period_ns;
 +};
 +
++static bool splash_hw_owned;
++
 +static void reg_setclr(void __iomem *addr, u32 set, u32 clr)
 +{
 +	writel((readl(addr) & ~clr) | set, addr);
@@ -377,7 +373,7 @@ index 00000000..190d1ce2
 +/* ---- MIPI packet helpers (ECC + reflected CRC16, kernel crc_ccitt) */
 +
 +static const u32 dsi_ecc_array[6] = {
-+	0x00f12cb7, 0x00f2555b, 0x0074e66d, 0x00b8e38e, 0x00dff0f0, 0x00eeff00,
++	0x00f12cb7, 0x00f2555b, 0x00749a6d, 0x00b8e38e, 0x00df03f0, 0x00effc00,
 +};
 +
 +static u8 dsi_ecc(u32 data)
@@ -612,8 +608,8 @@ index 00000000..190d1ce2
 +{
 +	int i;
 +
-+	/* PD0-PD9: DSI pads, drive level 3 (dts asks for 30 mA) */
-+	for (i = 0; i <= 9; i++) {
++	/* Two pads per data lane plus the clock pair. */
++	for (i = 0; i < (p->lanes + 1) * 2; i++) {
 +		pio_set_func(PIO_BANK_D, i, PIN_FUNC_DSI);
 +		pio_set_drive(PIO_BANK_D, i, 3);
 +	}
@@ -932,7 +928,7 @@ index 00000000..190d1ce2
 +	/* PLL: 24 MHz * N / div = per-lane bit clock, VCO kept near 2 GHz */
 +	div = DIV_ROUND_UP(rate, 264000000UL);	/* order_base_2() by hand */
 +	div = 16 >> (div > 1 ? ilog2(div - 1) + 1 : 0);
-+	n = rate / 24000000UL * div;
++	n = rate * div / 24000000UL;
 +
 +	writel(DPHY_PLL_REG0_CP36_EN | DPHY_PLL_REG0_LDO_EN |
 +	       DPHY_PLL_REG0_EN_LVS | DPHY_PLL_REG0_PLL_EN |
@@ -1010,7 +1006,7 @@ index 00000000..190d1ce2
 +	if (p->pwm_ch < 0)
 +		return;
 +
-+	pio_set_func(PIO_BANK_D, 20, PIN_FUNC_PWM4);
++	pio_set_func(6, 4, PIN_FUNC_PWM5);
 +
 +	/* 24 MHz source, no prescaler: cycles = period / 41.67ns */
 +	cycles = p->pwm_period_ns / 42;
@@ -1025,6 +1021,42 @@ index 00000000..190d1ce2
 +}
 +
 +/* ---- kernel handover ---------------------------------------------------- */
++
++static void splash_quiesce_devices(void)
++{
++	if (!splash_hw_owned)
++		return;
++
++	dsi_inst_abort();
++	writel(0, D1_DSI_BASE + DSI_TCON_DRQ);
++	clrbits_le32(D1_TCON_LCD0_BASE + TCON0_CTL, TCON0_CTL_EN);
++	clrbits_le32(D1_TCON_LCD0_BASE + TCON_GCTL, TCON_GCTL_EN);
++	writel(0, D1_TCON_LCD0_BASE + TCON_GINT0);
++	clrbits_le32(D1_TCON_LCD0_BASE + TCON0_DCLK, TCON0_DCLK_GATE);
++	writel(0, D1_MIXER0_BASE + MIXER_GLOBAL_CTL);
++	/* Reset stops DMA even if buffered layer changes cannot latch now. */
++	clrbits_le32(D1_DE2_CCU_BASE + DE2_RST, BIT(0));
++	udelay(1);
++
++	writel(0, D1_DSI_BASE + DSI_CTL);
++	writel(0, D1_DPHY_BASE + DPHY_GCTL);
++	writel(0, D1_DPHY_BASE + DPHY_ANA0);
++	writel(0, D1_DPHY_BASE + DPHY_ANA1);
++	writel(0, D1_DPHY_BASE + DPHY_ANA2);
++	writel(0, D1_DPHY_BASE + DPHY_ANA3);
++	writel(0, D1_DPHY_BASE + DPHY_ANA4);
++	writel(0, D1_DPHY_BASE + DPHY_COMBO_REG0);
++	clrbits_le32(D1_DPHY_BASE + DPHY_PLL_REG0,
++		     DPHY_PLL_REG0_PLL_EN | DPHY_PLL_REG0_LDO_EN |
++		     DPHY_PLL_REG0_CP36_EN | DPHY_PLL_REG0_EN_LVS);
++
++	/* Linux shares this reset and only deasserts it during probe. */
++	clrbits_le32(D1_CCU_BASE + CCU_DSI_BGR, CCU_BGR_RST);
++	readl(D1_CCU_BASE + CCU_DSI_BGR);
++	udelay(1);
++	splash_hw_owned = false;
++}
++
 +
 +static int splash_fdt_setup(void *fdt, struct splash_panel *p, ulong fb)
 +{
@@ -1068,6 +1100,16 @@ index 00000000..190d1ce2
 +		if (chosen < 0)
 +			return chosen;
 +	}
++	/* Linux needs an address translation through /chosen for the fb reg. */
++	ret = fdt_setprop_u32(fdt, chosen, "#address-cells", 1);
++	if (ret)
++		return ret;
++	ret = fdt_setprop_u32(fdt, chosen, "#size-cells", 1);
++	if (ret)
++		return ret;
++	ret = fdt_setprop_empty(fdt, chosen, "ranges");
++	if (ret)
++		return ret;
 +	snprintf(name, sizeof(name), "framebuffer@%lx", fb);
 +	node = fdt_add_subnode(fdt, chosen, name);
 +	if (node < 0)
@@ -1093,8 +1135,10 @@ index 00000000..190d1ce2
 +	{
 +		phys_addr_t fb_addr = fb;
 +
-+		lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &fb_addr, size,
-+			      LMB_NONE);
++		ret = lmb_alloc_mem(LMB_MEM_ALLOC_ADDR, 0, &fb_addr, size,
++				    LMB_NONE);
++		if (ret)
++			return ret;
 +	}
 +
 +	return 0;
@@ -1126,17 +1170,22 @@ index 00000000..190d1ce2
 +	/* make sure the mixer sees the logo, not stale cache lines */
 +	flush_dcache_range(fb, fb + panel.hact * panel.vact * 2);
 +
++	splash_quiesce_devices();
++
 +	if (splash_clocks_on(&panel))
 +		return CMD_RET_FAILURE;
 +
++	splash_hw_owned = true;
 +	splash_pinmux(&panel);
 +	splash_mixer_setup(&panel, fb);
 +	splash_tcon_setup(&panel);
 +	splash_dsi_setup(&panel);
 +	splash_dphy_on(&panel);
 +
-+	if (splash_panel_init(&panel))
++	if (splash_panel_init(&panel)) {
++		splash_quiesce_devices();
 +		return CMD_RET_FAILURE;
++	}
 +
 +	dsi_start(DSI_START_HSC);
 +	udelay(1000);
@@ -1147,7 +1196,8 @@ index 00000000..190d1ce2
 +	splash_backlight_on(&panel);
 +
 +	if (splash_fdt_setup(fdt, &panel, fb)) {
-+		printf("srgn_splash: fdt handover failed (still displaying)\n");
++		printf("srgn_splash: fdt handover failed\n");
++		splash_quiesce_devices();
 +		return CMD_RET_FAILURE;
 +	}
 +

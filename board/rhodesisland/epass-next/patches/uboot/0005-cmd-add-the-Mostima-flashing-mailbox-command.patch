@@ -29,10 +29,35 @@ flasher drives both:
   0x10  n  env text, for "env import -t"
 ---
 diff --git a/cmd/Kconfig b/cmd/Kconfig
-index c71c6824..18d76273 100644
+index c71c6824..2cfd7b1a 100644
 --- a/cmd/Kconfig
 +++ b/cmd/Kconfig
-@@ -1477,6 +1477,25 @@ config CMD_MISC
+@@ -1,3 +1,10 @@
++config CH32_SWIO
++	bool "D1 CH32V006 touch-controller SWIO programmer"
++	depends on TARGET_SUN20I_D1 && RISCV
++	help
++	  Program the CH32V006 main flash through PG13 SWIO and PG15 reset.
++	  Uses the fixed 24 MHz D1 timebase. Option bytes are never modified.
++
+ menuconfig CMDLINE
+ 	bool "Command line interface"
+ 	default y
+@@ -11,6 +18,13 @@ menuconfig CMDLINE
+ 
+ if CMDLINE
+ 
++config CMD_CH32
++	bool "ch32 - inspect/read/program CH32V006 touch firmware"
++	depends on CH32_SWIO
++	help
++	  Provides ch32 info, ch32 read <addr> <len>, and
++	  ch32 write <addr> <len>. Length and RAM addresses are hexadecimal.
++
+ config HUSH_PARSER
+ 	bool "Use hush shell"
+ 	help
+@@ -1477,6 +1491,25 @@ config CMD_MISC
  	  a MISC uclass driver. The command provides listing all MISC devices
  	  as well as read and write functionalities via their drivers.
  
@@ -59,10 +84,16 @@ index c71c6824..18d76273 100644
  	bool "mmc"
  	depends on MMC
 diff --git a/cmd/Makefile b/cmd/Makefile
-index bbbdfcc4..3fca9da1 100644
+index bbbdfcc4..e0f8b8ab 100644
 --- a/cmd/Makefile
 +++ b/cmd/Makefile
-@@ -119,6 +119,7 @@ obj-$(CONFIG_CMD_MISC) += misc.o
+@@ -1,4 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0+
++obj-$(CONFIG_CMD_CH32) += ch32.o
+ #
+ # (C) Copyright 2004-2006
+ # Wolfgang Denk, DENX Software Engineering, wd@denx.de.
+@@ -119,6 +120,7 @@ obj-$(CONFIG_CMD_MISC) += misc.o
  obj-$(CONFIG_CMD_MDIO) += mdio.o
  obj-$(CONFIG_CMD_PAUSE) += pause.o
  obj-$(CONFIG_CMD_SLEEP) += sleep.o
@@ -70,6 +101,55 @@ index bbbdfcc4..3fca9da1 100644
  obj-$(CONFIG_CMD_MMC) += mmc.o
  obj-$(CONFIG_CMD_OPTEE_RPMB) += optee_rpmb.o
  obj-$(CONFIG_CMD_OPTEE) += optee.o
+diff --git a/cmd/ch32.c b/cmd/ch32.c
+new file mode 100644
+index 00000000..ec85a195
+--- /dev/null
++++ b/cmd/ch32.c
+@@ -0,0 +1,43 @@
++// SPDX-License-Identifier: MIT
++#include <ch32_swio.h>
++#include <command.h>
++#include <mapmem.h>
++#include <linux/string.h>
++#include <vsprintf.h>
++
++static int do_ch32(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
++{
++	ulong addr, len;
++	void *data;
++	int ret;
++
++	if (argc == 2 && !strcmp(argv[1], "info")) {
++		ret = ch32_swio_probe();
++	} else if (argc == 4 && (!strcmp(argv[1], "read") ||
++				 !strcmp(argv[1], "write"))) {
++		if (strict_strtoul(argv[2], 16, &addr) ||
++		    strict_strtoul(argv[3], 16, &len) || !len ||
++		    len > CH32_SWIO_FLASH_SIZE || addr + len < addr)
++			return CMD_RET_USAGE;
++		data = map_sysmem(addr, len);
++		if (!strcmp(argv[1], "read"))
++			ret = ch32_swio_read(data, len);
++		else
++			ret = ch32_swio_flash(data, len);
++		unmap_sysmem(data);
++	} else {
++		return CMD_RET_USAGE;
++	}
++	if (ret)
++		printf("CH32 operation failed: %d\n", ret);
++	else
++		printf("CH32 operation complete\n");
++	return ret ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
++}
++
++U_BOOT_CMD(ch32, 4, 0, do_ch32, "CH32V006 touch-controller programmer",
++	"info\n"
++	"ch32 read <RAM-address> <length>\n"
++	"ch32 write <RAM-address> <length>\n"
++	"  Main flash starts at 08000000; maximum length f800; values are hex.\n"
++	"  Every operation resets the target; writes verify every page.");
 diff --git a/cmd/mstmchk.c b/cmd/mstmchk.c
 new file mode 100644
 index 00000000..a20457fd

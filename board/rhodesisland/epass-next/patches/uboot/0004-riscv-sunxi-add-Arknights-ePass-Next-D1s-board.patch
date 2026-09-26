@@ -14,20 +14,21 @@ at build time via BR2_TARGET_UBOOT_CUSTOM_DTS_PATH, so editing it does not
 require re-patching the tree. It includes sun20i-d1s.dtsi from dts/upstream;
 the Makefile entry for it comes with the platform patch.
 
-Console is UART3 on PB6/PB7 (function 7), which is also what
+Console is UART3 on PG8/PG9 (function 5), which is also what
 SUNXI_SPL_EARLY_UART programs -- xfel writes SRAM as data and never
 invalidates the icache, so configuring the UART from a helper payload
 leaves stale instructions behind at 0x20000.
 ---
 diff --git a/configs/epass_next_defconfig b/configs/epass_next_defconfig
 new file mode 100644
-index 00000000..fb5f8962
+index 00000000..72b9cc39
 --- /dev/null
 +++ b/configs/epass_next_defconfig
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,132 @@
 +CONFIG_RISCV=y
 +CONFIG_HAS_CUSTOM_SYS_INIT_SP_ADDR=y
 +CONFIG_CUSTOM_SYS_INIT_SP_ADDR=0x43e00000
++CONFIG_STACK_SIZE=0x100000
 +CONFIG_DEFAULT_DEVICE_TREE="sun20i-d1s-epass-next"
 +# 64MB of in-package DDR2 at 528MHz
 +CONFIG_DRAM_CLK=528
@@ -36,7 +37,11 @@ index 00000000..fb5f8962
 +# down from 0x48000 tramples it, so returning to FEL never works. SPL code ends
 +# well below 0x40000, leaving plenty of stack.
 +CONFIG_SPL_STACK=0x40000
-+# Console is uart3 on PB6/PB7; sunxi UART regs are 4 bytes apart (shift 2)
++# RISC-V reserves both the CPU stack and early heap below SPL_STACK. Keep
++# their GD boundary above the ROM-loaded SPL, including its appended DTB.
++CONFIG_STACK_SIZE_SHIFT=13
++CONFIG_SPL_SYS_MALLOC_F_LEN=0x2000
++# Console is uart3 on PG8/PG9; sunxi UART regs are 4 bytes apart (shift 2)
 +CONFIG_DEBUG_UART_BASE=0x02500c00
 +CONFIG_DEBUG_UART_CLOCK=24000000
 +CONFIG_DRAM_SUNXI_ODT_EN=0x0
@@ -49,7 +54,8 @@ index 00000000..fb5f8962
 +CONFIG_TARGET_SUN20I_D1=y
 +CONFIG_SPL_RETURN_TO_FEL=y
 +CONFIG_SUNXI_SPL_EARLY_UART=y
-+CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2=y
++CONFIG_SUNXI_SPL_UART3_PG=y
++# CONFIG_SUNXI_DRAM_VCC_AXP209_DCDC2 is not set
 +CONFIG_ARCH_RV64I=y
 +CONFIG_RISCV_SMODE=y
 +# CONFIG_SPL_SMP is not set
@@ -95,6 +101,7 @@ index 00000000..fb5f8962
 +# The SPI NAND, reachable from U-Boot proper this time. The SPL has its own
 +# minimal reader (SPL_SPINAND_SUNXI); this is the full MTD stack, which is
 +# what the environment, the kernel FIT and DFU all go through.
++CONFIG_SPL_SPINAND_SUNXI_SPI1=y
 +CONFIG_SPI=y
 +CONFIG_DM_SPI=y
 +CONFIG_SPI_SUNXI=y
@@ -136,6 +143,9 @@ index 00000000..fb5f8962
 +#               why the mailbox cannot simply go at the end
 +CONFIG_CMD_MSTMCHK=y
 +CONFIG_MSTMCHK_ADDR=0x40100000
++CONFIG_BMC_OTA=y
++CONFIG_CMD_CH32=y
++CONFIG_SPL_BMC_OTA=y
 +
 +# imxtract pulls a named image out of a FIT; fdt apply layers the screen and
 +# option overlays onto the base tree. Both are what bootcmd is built from.
