@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/*
+ * Mainboard R0.3 and fpc_keys, with matching FPC pin numbers connected.
+ * PG6/PG7 reach SDA/SCL in the reverse order of the hardware I2C2 mux.
+ */
+/ {
+	key_fpc_i2c: i2c-key-fpc {
+		compatible = "i2c-gpio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		sda-gpios = <&pio 6 6 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		scl-gpios = <&pio 6 7 (GPIO_ACTIVE_HIGH | GPIO_OPEN_DRAIN)>;
+		i2c-gpio,delay-us = <5>;
+		i2c-gpio,timeout-ms = <25>;
+
+		touch_slider_r03: touch-slider@2a {
+			compatible = "epass,ch32-touch-slider";
+			reg = <0x2a>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&key_fpc_irq_pin>;
+			interrupt-parent = <&pio>;
+			interrupts = <6 14 IRQ_TYPE_LEVEL_LOW>;
+
+			// swipe-keycodes = <KEY_LEFT KEY_RIGHT>;
+		};
+	};
+};
+
+&i2c2 {
+	status = "disabled";
+};
+
+&pio {
+
+	key_fpc_irq_pin: key-fpc-irq-pin {
+		pins = "PG14";
+		function = "gpio_in";
+		bias-pull-up;
+	};
+};

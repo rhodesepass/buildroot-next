@@ -6,11 +6,7 @@
  * key GPIOs, the backlight PWM channel, the panel reset line -- lives in
  * base/devicetree-<rev>.dts instead, and the panel itself in screen/.
  *
- * D1s port of the T113-s3 board. The two SoCs are pin compatible, but the
- * in-package DRAM is not: T113-s3 carries DDR3 (1.35V), D1s carries DDR2
- * (1.8V). AXP209 DCDC2 feeds VCC-DRAM, so it must be raised accordingly --
- * the SPL does this before touching the DRAM controller, and reg_dcdc2 below
- * must agree with it or the supply drops the moment the PMIC driver probes.
+ * The mainboard uses EA3036 fixed rails, including 1.8V DDR2 supply.
  */
 
 #include "sun20i-d1s.dtsi"
@@ -219,127 +215,52 @@
 	vcc-pf-supply = <&reg_vcc3v3>;
 	vcc-pg-supply = <&reg_vcc3v3>;
 
+	dsi_3lane_pins: dsi-3lane-pins {
+		pins = "PD0", "PD1", "PD2", "PD3", "PD4", "PD5", "PD6", "PD7";
+		function = "dsi";
+		drive-strength = <30>;
+	};
+	uart3_pg_pins: uart3-pg-pins {
+		pins = "PG8", "PG9";
+		function = "uart3";
+	};
 	/omit-if-no-ref/
-	i2c0_pb_pins: i2c0-pb-pins {
-		pins = "PB2", "PB3";
-		function = "i2c0";
+	i2c2_pg_pins: i2c2-pg-pins {
+		pins = "PG6", "PG7";
+		function = "i2c2";
 	};
 
 	/omit-if-no-ref/
-	pwm4_pd_pin: pwm4-pd-pin {
-		pins = "PD20";
-		function = "pwm4";
+	pwm5_pg_pin: pwm5-pg-pin {
+		pins = "PG4";
+		function = "pwm5";
 	};
 
-	/*
-	 * The dtsi's spi0_pins is CLK/CS/MOSI/MISO only, which is all a
-	 * single-lane bus needs. Quad also drives PC6 (WP, becoming IO2) and
-	 * PC7 (HOLD, becoming IO3); both mux to spi0 at the same function
-	 * value as the other four, so one group covers the whole bus.
-	 *
-	 * The drive strength is not cosmetic: the pads come out of reset at
-	 * 10mA and this bus runs at 100MHz. The BSP sets 20mA here, and pulls
-	 * up CS/WP/HOLD so a lane is never floating while the controller has
-	 * it configured as an input between bursts.
-	 */
-	spi0_quad_pins: spi0-quad-pins {
-		pins = "PC2", "PC4", "PC5";
-		function = "spi0";
+	/* CS, WP and HOLD need pull-ups while the bus is idle. */
+	spi1_quad_pins: spi1-quad-pins {
+		pins = "PD11", "PD12", "PD13";
+		function = "spi1";
 		drive-strength = <20>;
 	};
 
-	spi0_quad_pu_pins: spi0-quad-pu-pins {
-		pins = "PC3", "PC6", "PC7";
-		function = "spi0";
+	spi1_quad_pu_pins: spi1-quad-pu-pins {
+		pins = "PD10", "PD15", "PD14";
+		function = "spi1";
 		drive-strength = <20>;
 		bias-pull-up;
 	};
 };
 
-&i2c0 {
-	pinctrl-0 = <&i2c0_pb_pins>;
+/* n0.2 selects GPIO I2C to match the FPC SCL/SDA pin order. */
+&i2c2 {
+	pinctrl-0 = <&i2c2_pg_pins>;
 	pinctrl-names = "default";
+	clock-frequency = <100000>;
 	status = "okay";
-
-	axp209: pmic@34 {
-		compatible = "x-powers,axp209";
-		reg = <0x34>;
-		interrupt-parent = <&pio>;
-		interrupts = <1 4 IRQ_TYPE_EDGE_FALLING>; /* PB4 */
-		interrupt-controller;
-		#interrupt-cells = <1>;
-
-		/*
-		 * PEK is wired to the panel's "0" key, not a power button, so
-		 * the driver must report KEY_0 instead of its fixed KEY_POWER.
-		 * Needs the axp20x-pek keycode patch; without it the property
-		 * is ignored and the key comes out as KEY_POWER.
-		 */
-		x-powers,pek-keycode = <KEY_0>;
-
-		axp_adc: adc {
-			compatible = "x-powers,axp209-adc";
-			#io-channel-cells = <1>;
-		};
-
-		axp_gpio: gpio {
-			compatible = "x-powers,axp209-gpio";
-			gpio-controller;
-			#gpio-cells = <2>;
-		};
-
-		regulators {
-			x-powers,dcdc-freq = <1500>;
-
-			/*
-			 * VCC-DRAM. The D1s has in-package DDR2, which wants
-			 * 1.8V -- NOT the 1.35V the T113-s3's DDR3 used. This
-			 * must match what the SPL programmed, otherwise the
-			 * regulator core drops it back and the DRAM dies.
-			 */
-			reg_dcdc2: dcdc2 {
-				regulator-name = "vcc-dram";
-				regulator-min-microvolt = <1800000>;
-				regulator-max-microvolt = <1800000>;
-				regulator-always-on;
-			};
-
-			reg_dcdc3: dcdc3 {
-				regulator-name = "vcc-3v3-pmic";
-				regulator-min-microvolt = <3300000>;
-				regulator-max-microvolt = <3300000>;
-				regulator-always-on;
-			};
-
-			reg_ldo1: ldo1 {
-				regulator-name = "vcc-rtc";
-				regulator-always-on;
-				regulator-min-microvolt = <1300000>;
-				regulator-max-microvolt = <1300000>;
-			};
-
-			reg_ldo2: ldo2 {
-				regulator-name = "avcc";
-			};
-
-			reg_ldo3: ldo3 {
-				regulator-name = "ldo3";
-			};
-
-			reg_ldo4: ldo4 {
-				regulator-name = "ldo4";
-			};
-
-			reg_ldo5: ldo5 {
-				regulator-name = "ldo5";
-				status = "disabled";
-			};
-		};
-	};
 };
 
 &pwm {
-	pinctrl-0 = <&pwm4_pd_pin>;
+	pinctrl-0 = <&pwm5_pg_pin>;
 	pinctrl-names = "default";
 	status = "okay";
 };
@@ -366,7 +287,7 @@
 	#address-cells = <1>;
 	#size-cells = <0>;
 
-	pinctrl-0 = <&dsi_4lane_pins>;
+	pinctrl-0 = <&dsi_3lane_pins>;
 	pinctrl-names = "default";
 	status = "okay";
 
@@ -411,8 +332,8 @@
 	status = "okay";
 };
 
-&spi0 {
-	pinctrl-0 = <&spi0_quad_pins>, <&spi0_quad_pu_pins>;
+&spi1 {
+	pinctrl-0 = <&spi1_quad_pins>, <&spi1_quad_pu_pins>;
 	pinctrl-names = "default";
 	status = "okay";
 
@@ -505,7 +426,7 @@
 };
 
 &uart3 {
-	pinctrl-0 = <&uart3_pb_pins>;
+	pinctrl-0 = <&uart3_pg_pins>;
 	pinctrl-names = "default";
 	status = "okay";
 };
@@ -517,16 +438,15 @@
 
 &usbphy {
 	usb0_vbus-supply = <&reg_vcc5v>;
-	usb1_vbus-supply = <&reg_vcc5v>;
 	status = "okay";
 };
 
 &ehci1 {
-	status = "okay";
+	status = "disabled";
 };
 
 &ohci1 {
-	status = "okay";
+	status = "disabled";
 };
 
 &wdt {

@@ -1,0 +1,617 @@
+From: ePass contributors <epass@localhost>
+Subject: [PATCH] Input: add CH32 I2C touch slider
+
+Build the existing touch driver in the kernel tree.
+
+Signed-off-by: ePass contributors <epass@localhost>
+---
+--- /dev/null
++++ b/drivers/input/misc/ch32_touch_slider.c
+@@ -0,0 +1,396 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/i2c.h>
++#include <linux/input.h>
++#include <linux/interrupt.h>
++#include <linux/jiffies.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/property.h>
++#include <linux/workqueue.h>
++
++#include "ch32_touch_snapshot.h"
++
++#define CH32_TK_POLL_MS 10
++#define CH32_TK_ACTIVE_CHECK_MS 50
++#define CH32_TK_IDLE_CHECK_MS 1000
++#define CH32_TK_FAILURE_RELEASE_MS 100
++
++#define CH32_TK_INPUT_VALID BIT(0)
++#define CH32_TK_INPUT_MULTI BIT(1)
++#define CH32_TK_INPUT_CANCEL BIT(2)
++
++struct ch32_tk {
++	struct i2c_client *client;
++	struct input_dev *input;
++	struct mutex lock;
++	struct delayed_work work;
++	struct ch32_tk_snapshot previous;
++	u32 keycodes[CH32_TK_CHANNELS];
++	u32 swipe_keycodes[2];
++	u16 reported_keys;
++	unsigned long failed_since;
++	bool has_keys;
++	bool has_swipe_keys;
++	bool touching;
++	bool history_valid;
++	bool failed;
++	bool released_on_error;
++	bool discard_contact;
++	bool irq_masked;
++	bool stopped;
++};
++
++static int ch32_tk_read(struct ch32_tk *tk, struct ch32_tk_snapshot *snapshot)
++{
++	u8 reg = TOUCH_REG_FRAME;
++	u8 raw[CH32_TK_FRAME_SIZE];
++	struct i2c_msg msgs[] = {
++		{ .addr = tk->client->addr, .len = 1, .buf = &reg },
++		{ .addr = tk->client->addr, .flags = I2C_M_RD,
++		  .len = sizeof(raw), .buf = raw },
++	};
++	int ret;
++
++	ret = i2c_transfer(tk->client->adapter, msgs, ARRAY_SIZE(msgs));
++	if (ret < 0)
++		return ret;
++	if (ret != ARRAY_SIZE(msgs))
++		return -EIO;
++	return ch32_tk_decode(raw, sizeof(raw), snapshot);
++}
++
++static int ch32_tk_ack(struct ch32_tk *tk, u32 seq)
++{
++	u8 data[] = { TOUCH_REG_ACK, seq, seq >> 8, seq >> 16, seq >> 24 };
++	int ret;
++
++	ret = i2c_master_send(tk->client, data, sizeof(data));
++	if (ret < 0)
++		return ret;
++	return ret == sizeof(data) ? 0 : -EIO;
++}
++
++static void ch32_tk_release(struct ch32_tk *tk)
++{
++	unsigned int i;
++
++	tk->discard_contact = true;
++	input_report_abs(tk->input, ABS_MISC, CH32_TK_INPUT_CANCEL);
++	input_report_key(tk->input, BTN_TOUCH, 0);
++	for (i = 0; tk->has_keys && i < CH32_TK_CHANNELS; i++)
++		if (tk->keycodes[i] != KEY_RESERVED)
++			input_report_key(tk->input, tk->keycodes[i], 0);
++	input_sync(tk->input);
++	tk->reported_keys = 0;
++	tk->touching = false;
++}
++
++static void ch32_tk_report(struct ch32_tk *tk,
++			   const struct ch32_tk_snapshot *snapshot,
++			   bool allow_swipes)
++{
++	u32 swipes[2] = { 0, 0 };
++	u16 keymask = snapshot->keymask;
++	u16 changed;
++	u32 state = 0;
++	unsigned int i, n;
++	bool touch = snapshot->status & CH32_TK_TOUCH;
++
++	if (tk->history_valid &&
++	    (!ch32_tk_continuous(&tk->previous, snapshot) ||
++	     ch32_tk_contact_changed(&tk->previous, snapshot)))
++		ch32_tk_release(tk);
++	if (allow_swipes && tk->has_swipe_keys && tk->history_valid &&
++	    (snapshot->status & CH32_TK_READY))
++		ch32_tk_swipe_delta(&tk->previous, snapshot, swipes);
++
++	changed = keymask ^ tk->reported_keys;
++	if (snapshot->status & CH32_TK_POS_VALID)
++		state |= CH32_TK_INPUT_VALID;
++	if (snapshot->status & CH32_TK_MULTI)
++		state |= CH32_TK_INPUT_MULTI;
++	if (tk->discard_contact)
++		state |= CH32_TK_INPUT_CANCEL;
++	input_report_abs(tk->input, ABS_MISC, state);
++	input_report_key(tk->input, BTN_TOUCH, touch);
++	if (snapshot->status & CH32_TK_POS_VALID)
++		input_report_abs(tk->input, ABS_X, snapshot->position);
++	for (i = 0; tk->has_keys && i < CH32_TK_CHANNELS; i++) {
++		if (!(changed & BIT(i)) || tk->keycodes[i] == KEY_RESERVED)
++			continue;
++		input_event(tk->input, EV_MSC, MSC_SCAN, i);
++		input_report_key(tk->input, tk->keycodes[i], keymask & BIT(i));
++	}
++	input_sync(tk->input);
++
++	for (i = 0; i < ARRAY_SIZE(swipes); i++) {
++		for (n = 0; n < swipes[i]; n++) {
++			input_report_key(tk->input, tk->swipe_keycodes[i], 1);
++			input_sync(tk->input);
++			input_report_key(tk->input, tk->swipe_keycodes[i], 0);
++			input_sync(tk->input);
++		}
++	}
++	tk->reported_keys = keymask;
++	tk->touching = touch;
++	/* A recovered contact must reach real idle before gestures can restart. */
++	if (!touch)
++		tk->discard_contact = false;
++	tk->previous = *snapshot;
++	tk->history_valid = true;
++}
++
++static void ch32_tk_mask_irq(struct ch32_tk *tk)
++{
++	if (tk->client->irq && !tk->irq_masked) {
++		disable_irq_nosync(tk->client->irq);
++		tk->irq_masked = true;
++	}
++}
++
++static void ch32_tk_work(struct work_struct *work)
++{
++	struct ch32_tk *tk = container_of(to_delayed_work(work),
++					struct ch32_tk, work);
++	struct ch32_tk_snapshot snapshot;
++	unsigned int delay_ms = CH32_TK_POLL_MS;
++	int ret;
++
++	mutex_lock(&tk->lock);
++	if (tk->stopped)
++		goto out;
++	ch32_tk_mask_irq(tk);
++
++	ret = ch32_tk_read(tk, &snapshot);
++	if (ret)
++		goto failed;
++	ret = ch32_tk_ack(tk, snapshot.seq);
++	if (ret)
++		goto failed;
++
++	if (tk->released_on_error)
++		tk->history_valid = false;
++	/* Do not expose a confirming release before the transaction succeeds. */
++	ch32_tk_report(tk, &snapshot, !tk->released_on_error);
++	tk->failed = false;
++	tk->released_on_error = false;
++	if (tk->client->irq) {
++		tk->irq_masked = false;
++		enable_irq(tk->client->irq);
++		if (snapshot.status & CH32_TK_READY)
++			delay_ms = tk->touching ? CH32_TK_ACTIVE_CHECK_MS :
++				   CH32_TK_IDLE_CHECK_MS;
++	}
++	goto schedule;
++
++failed:
++	if (!tk->failed) {
++		tk->failed = true;
++		tk->failed_since = jiffies;
++	}
++	tk->discard_contact = true;
++	input_report_abs(tk->input, ABS_MISC, CH32_TK_INPUT_CANCEL);
++	input_sync(tk->input);
++	if (!tk->released_on_error &&
++	    time_after_eq(jiffies, tk->failed_since +
++			  msecs_to_jiffies(CH32_TK_FAILURE_RELEASE_MS))) {
++		ch32_tk_release(tk);
++		tk->history_valid = false;
++		tk->released_on_error = true;
++		dev_warn_ratelimited(&tk->client->dev,
++			"touch communication failed (%d), released inputs\n", ret);
++	}
++	/* The unacknowledged low IRQ must stay masked while the bus recovers. */
++schedule:
++	mod_delayed_work(system_wq, &tk->work, msecs_to_jiffies(delay_ms));
++out:
++	mutex_unlock(&tk->lock);
++}
++
++static irqreturn_t ch32_tk_irq(int irq, void *data)
++{
++	struct ch32_tk *tk = data;
++
++	mutex_lock(&tk->lock);
++	if (!tk->stopped) {
++		ch32_tk_mask_irq(tk);
++		mod_delayed_work(system_wq, &tk->work, 0);
++	}
++	mutex_unlock(&tk->lock);
++	return IRQ_HANDLED;
++}
++
++static void ch32_tk_stop(void *data)
++{
++	struct ch32_tk *tk = data;
++
++	mutex_lock(&tk->lock);
++	tk->stopped = true;
++	ch32_tk_mask_irq(tk);
++	mutex_unlock(&tk->lock);
++	cancel_delayed_work_sync(&tk->work);
++	if (tk->client->irq)
++		synchronize_irq(tk->client->irq);
++	ch32_tk_release(tk);
++}
++
++static int ch32_tk_read_keycodes(struct ch32_tk *tk)
++{
++	struct device *dev = &tk->client->dev;
++	unsigned int i, j;
++	int ret;
++
++	if (device_property_present(dev, "linux,keycodes")) {
++		ret = device_property_count_u32(dev, "linux,keycodes");
++		if (ret != CH32_TK_CHANNELS)
++			return -EINVAL;
++		ret = device_property_read_u32_array(dev, "linux,keycodes",
++						    tk->keycodes, CH32_TK_CHANNELS);
++		if (ret)
++			return ret;
++		tk->has_keys = true;
++	}
++	if (device_property_present(dev, "swipe-keycodes")) {
++		ret = device_property_count_u32(dev, "swipe-keycodes");
++		if (ret != ARRAY_SIZE(tk->swipe_keycodes))
++			return -EINVAL;
++		ret = device_property_read_u32_array(dev, "swipe-keycodes",
++						    tk->swipe_keycodes, 2);
++		if (ret)
++			return ret;
++		tk->has_swipe_keys = true;
++	}
++	for (i = 0; i < CH32_TK_CHANNELS; i++) {
++		if (tk->keycodes[i] > KEY_MAX || tk->keycodes[i] == BTN_TOUCH)
++			return -EINVAL;
++		for (j = 0; j < i; j++)
++			if (tk->keycodes[i] && tk->keycodes[i] == tk->keycodes[j])
++				return -EINVAL;
++	}
++	for (i = 0; tk->has_swipe_keys && i < 2; i++) {
++		if (!tk->swipe_keycodes[i] || tk->swipe_keycodes[i] > KEY_MAX ||
++		    tk->swipe_keycodes[i] == BTN_TOUCH ||
++		    (i && tk->swipe_keycodes[i] == tk->swipe_keycodes[0]))
++			return -EINVAL;
++		for (j = 0; j < CH32_TK_CHANNELS; j++)
++			if (tk->swipe_keycodes[i] == tk->keycodes[j])
++				return -EINVAL;
++	}
++	return 0;
++}
++
++static int ch32_tk_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct ch32_tk_snapshot snapshot;
++	struct ch32_tk *tk;
++	unsigned int i;
++	int ret;
++
++	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
++		return dev_err_probe(dev, -EOPNOTSUPP, "needs raw I2C transfers\n");
++	tk = devm_kzalloc(dev, sizeof(*tk), GFP_KERNEL);
++	if (!tk)
++		return -ENOMEM;
++	tk->client = client;
++	tk->stopped = true;
++	mutex_init(&tk->lock);
++	INIT_DELAYED_WORK(&tk->work, ch32_tk_work);
++	i2c_set_clientdata(client, tk);
++	ret = ch32_tk_read(tk, &snapshot);
++	if (ret)
++		return dev_err_probe(dev, ret, "invalid touch snapshot\n");
++	if (client->irq && !(snapshot.caps & CH32_TK_CAP_IRQ))
++		return dev_err_probe(dev, -EPROTO, "firmware has no IRQ support\n");
++	ret = ch32_tk_read_keycodes(tk);
++	if (ret)
++		return dev_err_probe(dev, ret, "invalid or overlapping keycodes\n");
++	if (tk->has_swipe_keys && !(snapshot.caps & CH32_TK_CAP_GESTURES))
++		return dev_err_probe(dev, -EPROTO, "firmware has no gesture support\n");
++
++	tk->input = devm_input_allocate_device(dev);
++	if (!tk->input)
++		return -ENOMEM;
++	tk->input->name = "CH32 touch slider";
++	tk->input->id.bustype = BUS_I2C;
++	input_set_capability(tk->input, EV_KEY, BTN_TOUCH);
++	input_set_abs_params(tk->input, ABS_X, 0, CH32_TK_MAX_POSITION, 0, 0);
++	input_set_abs_params(tk->input, ABS_MISC, 0, 7, 0, 0);
++	if (tk->has_keys) {
++		input_set_capability(tk->input, EV_MSC, MSC_SCAN);
++		for (i = 0; i < CH32_TK_CHANNELS; i++)
++			if (tk->keycodes[i])
++				input_set_capability(tk->input, EV_KEY, tk->keycodes[i]);
++	}
++	if (tk->has_swipe_keys)
++		for (i = 0; i < ARRAY_SIZE(tk->swipe_keycodes); i++)
++			input_set_capability(tk->input, EV_KEY, tk->swipe_keycodes[i]);
++	ret = input_register_device(tk->input);
++	if (ret)
++		return ret;
++
++	if (client->irq) {
++		ret = devm_request_threaded_irq(dev, client->irq, NULL, ch32_tk_irq,
++						IRQF_ONESHOT | IRQF_TRIGGER_LOW |
++						IRQF_NO_AUTOEN, dev_name(dev), tk);
++		if (ret)
++			return dev_err_probe(dev, ret, "cannot request touch IRQ\n");
++		tk->irq_masked = true;
++	}
++	ret = devm_add_action_or_reset(dev, ch32_tk_stop, tk);
++	if (ret)
++		return ret;
++	tk->stopped = false;
++	mod_delayed_work(system_wq, &tk->work, 0);
++	return 0;
++}
++
++static int ch32_tk_suspend(struct device *dev)
++{
++	ch32_tk_stop(i2c_get_clientdata(to_i2c_client(dev)));
++	return 0;
++}
++
++static int ch32_tk_resume(struct device *dev)
++{
++	struct ch32_tk *tk = i2c_get_clientdata(to_i2c_client(dev));
++
++	mutex_lock(&tk->lock);
++	tk->history_valid = false;
++	tk->failed = false;
++	tk->released_on_error = false;
++	tk->stopped = false;
++	mod_delayed_work(system_wq, &tk->work, 0);
++	mutex_unlock(&tk->lock);
++	return 0;
++}
++
++static DEFINE_SIMPLE_DEV_PM_OPS(ch32_tk_pm, ch32_tk_suspend, ch32_tk_resume);
++
++static const struct of_device_id ch32_tk_of_match[] = {
++	{ .compatible = "epass,ch32-touch-slider" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, ch32_tk_of_match);
++
++static const struct i2c_device_id ch32_tk_id[] = {
++	{ "ch32-touch-slider" },
++	{ }
++};
++MODULE_DEVICE_TABLE(i2c, ch32_tk_id);
++
++static struct i2c_driver ch32_tk_driver = {
++	.driver = {
++		.name = "ch32-touch-slider",
++		.of_match_table = ch32_tk_of_match,
++		.pm = pm_sleep_ptr(&ch32_tk_pm),
++	},
++	.probe = ch32_tk_probe,
++	.id_table = ch32_tk_id,
++};
++module_i2c_driver(ch32_tk_driver);
++
++MODULE_AUTHOR("ePass contributors");
++MODULE_DESCRIPTION("CH32 I2C one-dimensional capacitive touch slider");
++MODULE_LICENSE("GPL");
+--- /dev/null
++++ b/drivers/input/misc/ch32_touch_protocol.h
+@@ -0,0 +1,40 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef TOUCH_PROTOCOL_H
++#define TOUCH_PROTOCOL_H
++
++#define TOUCH_I2C_ADDRESS 0x2a
++#define TOUCH_PROTOCOL_VERSION 1
++#define TOUCH_FRAME_SIZE 64
++#define TOUCH_CHANNEL_COUNT 6
++#define TOUCH_POSITION_MAX 1023
++#define TOUCH_POSITION_INVALID 0xffff
++#define TOUCH_REG_FRAME 0x00
++#define TOUCH_REG_ACK 0x80
++
++#define TOUCH_CAP_KEYS 0x01
++#define TOUCH_CAP_POSITION 0x02
++#define TOUCH_CAP_GESTURES 0x04
++#define TOUCH_CAP_DIAGNOSTICS 0x08
++#define TOUCH_CAP_IRQ 0x10
++#define TOUCH_STATUS_READY 0x01
++#define TOUCH_STATUS_TOUCH 0x02
++#define TOUCH_STATUS_POSITION_VALID 0x04
++#define TOUCH_STATUS_MULTI 0x08
++
++#define TOUCH_OFF_CAPS 4
++#define TOUCH_OFF_STATUS 5
++#define TOUCH_OFF_CHANNELS 6
++#define TOUCH_OFF_PEAK 7
++#define TOUCH_OFF_SEQUENCE 8
++#define TOUCH_OFF_UPTIME 12
++#define TOUCH_OFF_KEY_MASK 16
++#define TOUCH_OFF_POSITION 18
++#define TOUCH_OFF_NEGATIVE_SWIPES 20
++#define TOUCH_OFF_POSITIVE_SWIPES 24
++#define TOUCH_OFF_GESTURE_TIME 28
++#define TOUCH_OFF_STRENGTH 32
++#define TOUCH_OFF_BASELINE 44
++#define TOUCH_OFF_CONTACT_COUNT 56
++#define TOUCH_OFF_SEQUENCE_END 60
++
++#endif
+--- /dev/null
++++ b/drivers/input/misc/ch32_touch_snapshot.h
+@@ -0,0 +1,139 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef CH32_TOUCH_SNAPSHOT_H
++#define CH32_TOUCH_SNAPSHOT_H
++
++#include "ch32_touch_protocol.h"
++
++#ifdef __KERNEL__
++#include <linux/errno.h>
++#include <linux/types.h>
++#else
++#include <errno.h>
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++typedef uint8_t u8;
++typedef uint16_t u16;
++typedef uint32_t u32;
++typedef int16_t s16;
++#endif
++
++#define CH32_TK_FRAME_SIZE TOUCH_FRAME_SIZE
++#define CH32_TK_CHANNELS TOUCH_CHANNEL_COUNT
++#define CH32_TK_READY TOUCH_STATUS_READY
++#define CH32_TK_TOUCH TOUCH_STATUS_TOUCH
++#define CH32_TK_POS_VALID TOUCH_STATUS_POSITION_VALID
++#define CH32_TK_MULTI TOUCH_STATUS_MULTI
++#define CH32_TK_CAP_POSITION TOUCH_CAP_POSITION
++#define CH32_TK_CAP_GESTURES TOUCH_CAP_GESTURES
++#define CH32_TK_CAP_IRQ TOUCH_CAP_IRQ
++#define CH32_TK_MAX_POSITION TOUCH_POSITION_MAX
++#define CH32_TK_INVALID_POSITION TOUCH_POSITION_INVALID
++#define CH32_TK_MAX_SWIPE_BURST 8
++
++struct ch32_tk_snapshot {
++	u8 caps;
++	u8 status;
++	u8 peak;
++	u32 seq;
++	u32 uptime_ms;
++	u16 keymask;
++	u16 position;
++	u32 swipes[2];
++	u32 last_gesture_ms;
++	s16 strength[CH32_TK_CHANNELS];
++	u16 baseline[CH32_TK_CHANNELS];
++	u32 contact_count;
++};
++
++static inline u16 ch32_tk_get_le16(const u8 *p)
++{
++	return (u16)p[0] | (u16)p[1] << 8;
++}
++
++static inline u32 ch32_tk_get_le32(const u8 *p)
++{
++	return (u32)p[0] | (u32)p[1] << 8 | (u32)p[2] << 16 |
++	       (u32)p[3] << 24;
++}
++
++static inline int ch32_tk_decode(const u8 *raw, size_t len,
++				 struct ch32_tk_snapshot *out)
++{
++	unsigned int i;
++
++	if (len != CH32_TK_FRAME_SIZE)
++		return -EMSGSIZE;
++	if (raw[0] != 'T' || raw[1] != 'K' || raw[2] != TOUCH_PROTOCOL_VERSION ||
++	    raw[3] != CH32_TK_FRAME_SIZE || raw[TOUCH_OFF_CHANNELS] != CH32_TK_CHANNELS ||
++	    !(raw[TOUCH_OFF_CAPS] & CH32_TK_CAP_POSITION) || (raw[TOUCH_OFF_STATUS] & ~0x0f) ||
++	    (raw[TOUCH_OFF_PEAK] >= CH32_TK_CHANNELS && raw[TOUCH_OFF_PEAK] != 0xff))
++		return -EPROTO;
++	if (ch32_tk_get_le32(raw + TOUCH_OFF_SEQUENCE) != ch32_tk_get_le32(raw + TOUCH_OFF_SEQUENCE_END))
++		return -EAGAIN;
++
++	out->caps = raw[TOUCH_OFF_CAPS];
++	out->status = raw[TOUCH_OFF_STATUS];
++	out->peak = raw[TOUCH_OFF_PEAK];
++	out->seq = ch32_tk_get_le32(raw + TOUCH_OFF_SEQUENCE);
++	out->uptime_ms = ch32_tk_get_le32(raw + TOUCH_OFF_UPTIME);
++	out->keymask = ch32_tk_get_le16(raw + TOUCH_OFF_KEY_MASK);
++	out->position = ch32_tk_get_le16(raw + TOUCH_OFF_POSITION);
++	if (out->keymask & ~0x3f)
++		return -EPROTO;
++	if (out->status & CH32_TK_POS_VALID) {
++		if (!(out->status & CH32_TK_TOUCH) ||
++		    out->position > CH32_TK_MAX_POSITION)
++			return -EPROTO;
++	} else if (out->position != CH32_TK_INVALID_POSITION) {
++		return -EPROTO;
++	}
++	if (!(out->status & CH32_TK_READY) &&
++	    ((out->status & (CH32_TK_TOUCH | CH32_TK_MULTI)) || out->keymask))
++		return -EPROTO;
++	out->swipes[0] = ch32_tk_get_le32(raw + TOUCH_OFF_NEGATIVE_SWIPES);
++	out->swipes[1] = ch32_tk_get_le32(raw + TOUCH_OFF_POSITIVE_SWIPES);
++	out->last_gesture_ms = ch32_tk_get_le32(raw + TOUCH_OFF_GESTURE_TIME);
++	for (i = 0; i < CH32_TK_CHANNELS; i++) {
++		out->strength[i] = (s16)ch32_tk_get_le16(raw + TOUCH_OFF_STRENGTH + i * 2);
++		out->baseline[i] = ch32_tk_get_le16(raw + TOUCH_OFF_BASELINE + i * 2);
++	}
++	out->contact_count = ch32_tk_get_le32(raw + TOUCH_OFF_CONTACT_COUNT);
++	return 0;
++}
++
++static inline bool ch32_tk_continuous(const struct ch32_tk_snapshot *old,
++				     const struct ch32_tk_snapshot *now)
++{
++	return (u32)(now->uptime_ms - old->uptime_ms) < 0x80000000U &&
++	       (u32)(now->seq - old->seq) < 0x80000000U;
++}
++
++static inline bool ch32_tk_contact_changed(const struct ch32_tk_snapshot *old,
++					 const struct ch32_tk_snapshot *now)
++{
++	return (old->status & CH32_TK_TOUCH) &&
++	       (now->status & CH32_TK_TOUCH) &&
++	       old->contact_count != now->contact_count;
++}
++
++static inline bool ch32_tk_swipe_delta(const struct ch32_tk_snapshot *old,
++				      const struct ch32_tk_snapshot *now,
++				      u32 delta[2])
++{
++	u32 negative = now->swipes[0] - old->swipes[0];
++	u32 positive = now->swipes[1] - old->swipes[1];
++
++	delta[0] = 0;
++	delta[1] = 0;
++	if (!ch32_tk_continuous(old, now) ||
++	    negative > CH32_TK_MAX_SWIPE_BURST ||
++	    positive > CH32_TK_MAX_SWIPE_BURST ||
++	    negative + positive > CH32_TK_MAX_SWIPE_BURST)
++		return false;
++	delta[0] = negative;
++	delta[1] = positive;
++	return true;
++}
++
++#endif
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -12,6 +12,13 @@
+ 	  If unsure, say Y.
+ 
+ if INPUT_MISC
++
++config INPUT_CH32_TOUCH_SLIDER
++	tristate "CH32 I2C touch slider"
++	depends on I2C
++	help
++	  Support the ePass CH32V006 six-electrode touch slider.
++	  Reports touch position and optional key and swipe events.
+ 
+ config INPUT_88PM860X_ONKEY
+ 	tristate "88PM860x ONKEY support"
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -5,6 +5,7 @@
+ 
+ # Each configuration option enables a list of files.
+ 
++obj-$(CONFIG_INPUT_CH32_TOUCH_SLIDER) += ch32_touch_slider.o
+ obj-$(CONFIG_INPUT_88PM860X_ONKEY)	+= 88pm860x_onkey.o
+ obj-$(CONFIG_INPUT_88PM80X_ONKEY)	+= 88pm80x_onkey.o
+ obj-$(CONFIG_INPUT_88PM886_ONKEY)	+= 88pm886-onkey.o

@@ -18,6 +18,9 @@ set -e
 BOARD_DIR="$(dirname "$0")"
 BINARIES_DIR="${BINARIES_DIR:-$1}"
 
+cmp "${BUILD_DIR}/linux-7.1.6/drivers/input/misc/ch32_touch_protocol.h" \
+	"${BOARD_DIR}/src/touch_protocol.h"
+
 SPL_OFF=$((0x0))
 UBOOT_OFF=$((0x40000))
 BOOTENV_OFF=$((0x140000))

@@ -14,45 +14,30 @@
 /dts-v1/;
 
 #include "epass-next.dtsi"
+#include "ch32-touch-slider.dtsi"
 
 / {
 	model = "Arknights ePass Next n0.2 (D1s)";
 
+	keys {
+		compatible = "gpio-keys";
+
+		power {
+			label = "Power";
+			linux,code = <KEY_0>;
+			/* gpiod owns both mux and pull to avoid a competing pinctrl claim. */
+			gpios = <&pio 6 10 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
+			debounce-interval = <20>;
+		};
+	};
+
 	backlight: backlight {
 		compatible = "pwm-backlight";
-		/* PWM4 on PD20 */
-		pwms = <&pwm 4 50000 0>;
+		/* LCD_PWM on PG4 */
+		pwms = <&pwm 5 50000 0>;
 		brightness-levels = <0 4 8 16 32 64 128 196 220 255>;
 		default-brightness-level = <9>;
 		power-supply = <&reg_vcc3v3>;
-	};
-
-	gpio-keys {
-		compatible = "gpio-keys";
-
-		switch-1 {
-			label = "sw1";
-			linux,code = <KEY_1>;
-			gpios = <&pio 6 6 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		};
-
-		switch-2 {
-			label = "sw2";
-			linux,code = <KEY_2>;
-			gpios = <&pio 6 7 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		};
-
-		switch-3 {
-			label = "sw3";
-			linux,code = <KEY_3>;
-			gpios = <&pio 6 8 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		};
-
-		switch-4 {
-			label = "sw4";
-			linux,code = <KEY_4>;
-			gpios = <&pio 6 9 (GPIO_ACTIVE_LOW | GPIO_PULL_UP)>;
-		};
 	};
 };
 
@@ -69,8 +54,20 @@
 	 */
 	panel: panel@0 {
 		reg = <0>;
-		reset-gpios = <&pio 3 21 GPIO_ACTIVE_LOW>;	/* PD21 */
+		reset-gpios = <&pio 6 12 GPIO_ACTIVE_LOW>;
 		iovcc-supply = <&reg_vcc3v3>;
 		vcc-supply = <&reg_vcc3v3>;
+	};
+};
+
+&spi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_pins>;
+	status = "okay";
+
+	bmc@0 {
+		compatible = "epass,bmc";
+		reg = <0>;
+		spi-max-frequency = <2000000>;
 	};
 };

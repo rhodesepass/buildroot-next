@@ -1,3 +1,6 @@
+Linux board wiring now includes built-in BMC runtime and CH32 touch drivers.
+post-image compares the touch protocol header; deploy kernel and rootfs together.
+
 Boot integration: SPI0 BMC SPL, SPI1 NAND, PG8/PG9 UART3, external FIT OTA,
 CH32 SWIO updates, and post-image SPL SRAM overlap checks.
 

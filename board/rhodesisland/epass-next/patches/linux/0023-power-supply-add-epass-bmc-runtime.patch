@@ -1,0 +1,428 @@
+From: ePass maintainers
+Subject: [PATCH] power: supply: add guarded ePass BMC SPI runtime
+
+Expose battery and firmware state, require userspace readiness, and notify
+the BMC only during final power-off preparation.
+
+diff --git a/drivers/power/supply/Kconfig b/drivers/power/supply/Kconfig
+index 83392ed6a..e5f4019b3 100644
+--- a/drivers/power/supply/Kconfig
++++ b/drivers/power/supply/Kconfig
+@@ -1165,4 +1165,12 @@ config MACSMC_POWER
+ 
+ 	  Say Y or M here if you have an Apple Silicon based Mac.
+ 
++config BATTERY_EPASS_BMC
++	tristate "ePass BMC battery and power control"
++	depends on SPI
++	select CRC32
++	help
++	  Read the ePass BMC battery and firmware state over SPI and request
++	  guarded power-off after userspace explicitly confirms boot readiness.
++
+ endif # POWER_SUPPLY
+diff --git a/drivers/power/supply/Makefile b/drivers/power/supply/Makefile
+index 7ee839dca..751b0c54a 100644
+--- a/drivers/power/supply/Makefile
++++ b/drivers/power/supply/Makefile
+@@ -131,3 +131,4 @@ obj-$(CONFIG_CHARGER_QCOM_SMB2)	+= qcom_smbx.o
+ obj-$(CONFIG_FUEL_GAUGE_MM8013)	+= mm8013.o
+ obj-$(CONFIG_MACSMC_POWER)	+= macsmc-power.o
+ obj-$(CONFIG_CHARGER_MAX77759)	+= max77759_charger.o
++obj-$(CONFIG_BATTERY_EPASS_BMC)	+= epass_bmc.o
+diff --git a/drivers/power/supply/epass_bmc.c b/drivers/power/supply/epass_bmc.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/power/supply/epass_bmc.c
+@@ -0,0 +1,357 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include <linux/crc32.h>
++#include <linux/delay.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/power_supply.h>
++#include <linux/random.h>
++#include <linux/reboot.h>
++#include <linux/spi/spi.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#define BMC_FRAME_SIZE 2052
++#define BMC_CRC_OFFSET 2048
++#define BMC_MAGIC 0x31434d42
++#define BMC_GET 1
++#define BMC_READY 2
++#define BMC_POWEROFF 3
++#define BMC_RESPONSE BIT(31)
++#define BMC_BATTERY_VALID BIT(1)
++#define BMC_CHARGING BIT(2)
++#define BMC_FULL BIT(3)
++#define BMC_EXTERNAL_POWER BIT(4)
++
++struct epass_bmc {
++	struct spi_device *spi;
++	struct power_supply *psy;
++	struct mutex lock;
++	struct delayed_work poll;
++	u8 *tx;
++	u8 *rx;
++	u32 sequence;
++	u32 epoch;
++	u32 flags;
++	u32 state;
++	u32 millivolts;
++	u32 capacity;
++	char version[33];
++	unsigned long updated;
++	bool valid;
++	bool ready;
++	bool stopping;
++};
++
++static bool bmc_fresh(struct epass_bmc *bmc)
++{
++	return bmc->valid && time_before(jiffies, bmc->updated + 6 * HZ);
++}
++
++static int bmc_transfer(struct epass_bmc *bmc)
++{
++	struct spi_transfer transfer = {
++		.tx_buf = bmc->tx,
++		.rx_buf = bmc->rx,
++		.len = BMC_FRAME_SIZE,
++	};
++
++	return spi_sync_transfer(bmc->spi, &transfer, 1);
++}
++
++/* The slave publishes replies asynchronously; zero frames never issue commands. */
++static int bmc_command(struct epass_bmc *bmc, u32 op)
++{
++	u32 sequence = ++bmc->sequence;
++	u32 epoch = bmc->epoch;
++	int ret, attempt;
++
++	if (!sequence)
++		sequence = ++bmc->sequence;
++	memset(bmc->tx, 0, BMC_FRAME_SIZE);
++	put_unaligned_le32(BMC_MAGIC, bmc->tx);
++	put_unaligned_le32(1, bmc->tx + 4);
++	put_unaligned_le32(sequence, bmc->tx + 8);
++	put_unaligned_le32(op, bmc->tx + 12);
++	put_unaligned_le32(op == BMC_GET ? 0 : epoch, bmc->tx + 16);
++	put_unaligned_le32(crc32_le(~0, bmc->tx, BMC_CRC_OFFSET) ^ ~0,
++			   bmc->tx + BMC_CRC_OFFSET);
++	ret = bmc_transfer(bmc);
++	if (ret)
++		return ret;
++	memset(bmc->tx, 0, BMC_FRAME_SIZE);
++	for (attempt = 0; attempt < 15; attempt++) {
++		msleep(20);
++		ret = bmc_transfer(bmc);
++		if (ret)
++			return ret;
++		if (get_unaligned_le32(bmc->rx) != BMC_MAGIC ||
++		    get_unaligned_le32(bmc->rx + 4) != 1 ||
++		    get_unaligned_le32(bmc->rx + 8) != sequence ||
++		    get_unaligned_le32(bmc->rx + 12) != (op | BMC_RESPONSE) ||
++		    get_unaligned_le32(bmc->rx + BMC_CRC_OFFSET) !=
++		    (crc32_le(~0, bmc->rx, BMC_CRC_OFFSET) ^ ~0))
++			continue;
++		if (op != BMC_GET && get_unaligned_le32(bmc->rx + 16) != epoch)
++			return -ESTALE;
++		ret = get_unaligned_le32(bmc->rx + 20);
++		if (ret)
++			return ret == 2 ? -EACCES : -EPROTO;
++		if (bmc->epoch != get_unaligned_le32(bmc->rx + 16))
++			bmc->ready = false;
++		bmc->epoch = get_unaligned_le32(bmc->rx + 16);
++		bmc->state = get_unaligned_le32(bmc->rx + 24);
++		bmc->flags = get_unaligned_le32(bmc->rx + 28);
++		bmc->millivolts = get_unaligned_le32(bmc->rx + 32);
++		bmc->capacity = get_unaligned_le32(bmc->rx + 36);
++		memcpy(bmc->version, bmc->rx + 64, 32);
++		bmc->version[32] = '\0';
++		bmc->updated = jiffies;
++		bmc->valid = true;
++		if (op == BMC_READY)
++			bmc->ready = true;
++		return 0;
++	}
++	return -ETIMEDOUT;
++}
++
++static void bmc_poll(struct work_struct *work)
++{
++	struct epass_bmc *bmc = container_of(to_delayed_work(work),
++					    struct epass_bmc, poll);
++	int ret;
++
++	mutex_lock(&bmc->lock);
++	ret = bmc_command(bmc, BMC_GET);
++	if (ret)
++		bmc->valid = false;
++	mutex_unlock(&bmc->lock);
++	if (ret)
++		dev_warn_ratelimited(&bmc->spi->dev, "BMC status unavailable: %d\n", ret);
++	power_supply_changed(bmc->psy);
++	if (!READ_ONCE(bmc->stopping))
++		schedule_delayed_work(&bmc->poll, 2 * HZ);
++}
++
++static enum power_supply_property bmc_properties[] = {
++	POWER_SUPPLY_PROP_SCOPE,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++};
++
++static int bmc_get_property(struct power_supply *psy,
++			    enum power_supply_property property,
++			    union power_supply_propval *value)
++{
++	struct epass_bmc *bmc = power_supply_get_drvdata(psy);
++	int ret = 0;
++
++	if (property == POWER_SUPPLY_PROP_SCOPE) {
++		value->intval = POWER_SUPPLY_SCOPE_SYSTEM;
++		return 0;
++	}
++	mutex_lock(&bmc->lock);
++	if (!bmc_fresh(bmc)) {
++		ret = -ENODATA;
++		goto out;
++	}
++	if (property == POWER_SUPPLY_PROP_STATUS &&
++	    (bmc->flags & BMC_EXTERNAL_POWER)) {
++		value->intval = bmc->flags & BMC_FULL ? POWER_SUPPLY_STATUS_FULL :
++			bmc->flags & BMC_CHARGING ? POWER_SUPPLY_STATUS_CHARGING :
++			POWER_SUPPLY_STATUS_NOT_CHARGING;
++		goto out;
++	}
++	if (!(bmc->flags & BMC_BATTERY_VALID) ||
++	    bmc->capacity > 100 || bmc->millivolts > 20000) {
++		ret = -ENODATA;
++		goto out;
++	}
++	switch (property) {
++	case POWER_SUPPLY_PROP_CAPACITY:
++		value->intval = bmc->capacity;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		value->intval = bmc->millivolts * 1000;
++		break;
++	case POWER_SUPPLY_PROP_STATUS:
++		value->intval = bmc->flags & BMC_FULL ? POWER_SUPPLY_STATUS_FULL :
++			bmc->flags & BMC_CHARGING ? POWER_SUPPLY_STATUS_CHARGING :
++			bmc->flags & BMC_EXTERNAL_POWER ? POWER_SUPPLY_STATUS_NOT_CHARGING :
++			POWER_SUPPLY_STATUS_DISCHARGING;
++		break;
++	default:
++		ret = -EINVAL;
++	}
++out:
++	mutex_unlock(&bmc->lock);
++	return ret;
++}
++
++static ssize_t bmc_attribute_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct epass_bmc *bmc = power_supply_get_drvdata(dev_get_drvdata(dev));
++	ssize_t ret;
++
++	mutex_lock(&bmc->lock);
++	if (!bmc_fresh(bmc))
++		ret = -ENODATA;
++	else if (!strcmp(attr->attr.name, "bmc_version"))
++		ret = sysfs_emit(buf, "%s\n", bmc->version);
++	else if (!strcmp(attr->attr.name, "boot_epoch"))
++		ret = sysfs_emit(buf, "%u\n", bmc->epoch);
++	else if (!strcmp(attr->attr.name, "power_state"))
++		ret = sysfs_emit(buf, "%u\n", bmc->state);
++	else
++		ret = sysfs_emit(buf, "%u\n", bmc->ready);
++	mutex_unlock(&bmc->lock);
++	return ret;
++}
++
++static ssize_t boot_ready_store(struct device *dev, struct device_attribute *attr,
++				const char *buf, size_t count)
++{
++	struct epass_bmc *bmc = power_supply_get_drvdata(dev_get_drvdata(dev));
++	unsigned int value;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &value);
++	if (ret || value != 1)
++		return -EINVAL;
++	mutex_lock(&bmc->lock);
++	if (bmc->stopping)
++		ret = -ESHUTDOWN;
++	else if (!bmc_fresh(bmc))
++		ret = -ENODATA;
++	else
++		ret = bmc_command(bmc, BMC_READY);
++	mutex_unlock(&bmc->lock);
++	return ret ? ret : count;
++}
++
++static DEVICE_ATTR(bmc_version, 0444, bmc_attribute_show, NULL);
++static DEVICE_ATTR(boot_epoch, 0444, bmc_attribute_show, NULL);
++static DEVICE_ATTR(power_state, 0444, bmc_attribute_show, NULL);
++static DEVICE_ATTR(boot_ready, 0644, bmc_attribute_show, boot_ready_store);
++
++static struct attribute *bmc_attrs[] = {
++	&dev_attr_bmc_version.attr,
++	&dev_attr_boot_epoch.attr,
++	&dev_attr_power_state.attr,
++	&dev_attr_boot_ready.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(bmc);
++
++static const struct power_supply_desc bmc_desc = {
++	.name = "epass-bmc",
++	.type = POWER_SUPPLY_TYPE_BATTERY,
++	.properties = bmc_properties,
++	.num_properties = ARRAY_SIZE(bmc_properties),
++	.get_property = bmc_get_property,
++};
++
++static void bmc_stop(void *data)
++{
++	struct epass_bmc *bmc = data;
++
++	WRITE_ONCE(bmc->stopping, true);
++	cancel_delayed_work_sync(&bmc->poll);
++}
++
++static void bmc_shutdown(struct spi_device *spi)
++{
++	bmc_stop(spi_get_drvdata(spi));
++}
++
++static int bmc_poweroff_prepare(struct sys_off_data *data)
++{
++	struct epass_bmc *bmc = data->cb_data;
++	int ret;
++
++	bmc_stop(bmc);
++	mutex_lock(&bmc->lock);
++	ret = bmc_command(bmc, BMC_GET);
++	if (!ret)
++		ret = bmc_command(bmc, BMC_POWEROFF);
++	mutex_unlock(&bmc->lock);
++	if (ret)
++		dev_err(&bmc->spi->dev, "BMC poweroff refused/unavailable (%d); keeping power\n", ret);
++	return NOTIFY_DONE;
++}
++
++/* SPI sleeps, so the actual request must run in the prepare callback. */
++static int bmc_poweroff(struct sys_off_data *data)
++{
++	return NOTIFY_DONE;
++}
++
++static int bmc_probe(struct spi_device *spi)
++{
++	struct power_supply_config config = {};
++	struct epass_bmc *bmc;
++	int ret;
++
++	bmc = devm_kzalloc(&spi->dev, sizeof(*bmc), GFP_KERNEL);
++	if (!bmc)
++		return -ENOMEM;
++	bmc->tx = devm_kzalloc(&spi->dev, BMC_FRAME_SIZE, GFP_KERNEL);
++	bmc->rx = devm_kzalloc(&spi->dev, BMC_FRAME_SIZE, GFP_KERNEL);
++	if (!bmc->tx || !bmc->rx)
++		return -ENOMEM;
++	bmc->spi = spi;
++	bmc->sequence = get_random_u32();
++	mutex_init(&bmc->lock);
++	INIT_DELAYED_WORK(&bmc->poll, bmc_poll);
++	spi_set_drvdata(spi, bmc);
++	spi->bits_per_word = 8;
++	ret = spi_setup(spi);
++	if (ret)
++		return ret;
++	config.drv_data = bmc;
++	config.fwnode = dev_fwnode(&spi->dev);
++	config.attr_grp = bmc_groups;
++	bmc->psy = devm_power_supply_register(&spi->dev, &bmc_desc, &config);
++	if (IS_ERR(bmc->psy))
++		return PTR_ERR(bmc->psy);
++	ret = devm_register_sys_off_handler(&spi->dev, SYS_OFF_MODE_POWER_OFF_PREPARE,
++					  SYS_OFF_PRIO_DEFAULT, bmc_poweroff_prepare, bmc);
++	if (ret)
++		return ret;
++	ret = devm_register_sys_off_handler(&spi->dev, SYS_OFF_MODE_POWER_OFF,
++					  SYS_OFF_PRIO_DEFAULT, bmc_poweroff, bmc);
++	if (ret)
++		return ret;
++	ret = devm_add_action_or_reset(&spi->dev, bmc_stop, bmc);
++	if (ret)
++		return ret;
++	schedule_delayed_work(&bmc->poll, 0);
++	return 0;
++}
++
++static const struct of_device_id bmc_of_match[] = {
++	{ .compatible = "epass,bmc" },
++	{}
++};
++MODULE_DEVICE_TABLE(of, bmc_of_match);
++
++static const struct spi_device_id bmc_ids[] = {
++	{ "bmc" },
++	{}
++};
++MODULE_DEVICE_TABLE(spi, bmc_ids);
++
++static struct spi_driver bmc_driver = {
++	.driver = {
++		.name = "epass-bmc",
++		.of_match_table = bmc_of_match,
++	},
++	.probe = bmc_probe,
++	.shutdown = bmc_shutdown,
++	.id_table = bmc_ids,
++};
++module_spi_driver(bmc_driver);
++
++MODULE_DESCRIPTION("ePass BMC battery and guarded power control");
++MODULE_LICENSE("GPL");
+diff --git a/Documentation/ABI/testing/sysfs-driver-epass-bmc b/Documentation/ABI/testing/sysfs-driver-epass-bmc
+new file mode 100644
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-driver-epass-bmc
+@@ -0,0 +1,29 @@
++What: /sys/class/power_supply/epass-bmc/bmc_version
++Date: September 2026
++Description:
++        Read-only BMC firmware version, at most 32 ASCII characters.
++        Returns ENODATA when telemetry is unavailable or older than 6 seconds.
++
++What: /sys/class/power_supply/epass-bmc/boot_epoch
++Date: September 2026
++Description:
++        Read-only unsigned boot epoch returned by the BMC. Each APP boot or
++        BMC restart invalidates earlier readiness. Returns ENODATA when stale.
++
++What: /sys/class/power_supply/epass-bmc/power_state
++Date: September 2026
++Description:
++        Read-only numeric state: 0 recovery/booting, 1 running, 2 stopping,
++        3 powered off. Returns ENODATA when telemetry is unavailable or stale.
++
++What: /sys/class/power_supply/epass-bmc/boot_ready
++Date: September 2026
++Description:
++        Writing 1 explicitly confirms that the APP has completed startup and
++        sends a synchronous READY request with the latest known boot epoch.
++        Only the root user can write. Writes fail if the BMC rejects the epoch,
++        times out, or shutdown has started. No other value is accepted.
++        Reading returns 1 only after a successful READY in the current epoch,
++        otherwise 0; unavailable or stale telemetry returns ENODATA.
++        Polling never automatically grants readiness. Userspace must observe
++        epoch changes and explicitly acknowledge readiness again.

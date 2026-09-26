@@ -1,5 +1,8 @@
 # ePass Next（Allwinner D1s）
 
+Linux 设备树与现板引脚对齐，内建 BMC 电量/READY/关机驱动及 CH32 触摸驱动；
+触摸协议头在 post-image 与实际内核源码比对，内核与 rootfs 应成套更新。
+
 启动链按现板接线使用 SPI0 BMC SPL、SPI1 NAND 和 PG8/PG9 UART3；
 统一外部 FIT OTA，增加 CH32 SWIO 更新和 SPL SRAM 布局校验。
 
