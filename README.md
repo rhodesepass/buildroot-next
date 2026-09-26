@@ -1,5 +1,8 @@
 # ePass Next（Allwinner D1s）
 
+修复 D1 codec 路由、HPLDO/DAC/RAMP 上电顺序，以及 TinyALSA SYNC_PTR
+状态查询误写 appl_ptr 导致的播放提前结束。
+
 Linux 设备树与现板引脚对齐，内建 BMC 电量/READY/关机驱动及 CH32 触摸驱动；
 触摸协议头在 post-image 与实际内核源码比对，内核与 rootfs 应成套更新。
 

@@ -1,3 +1,6 @@
+Audio fixes cover D1 codec routes and HPLDO/DAC/RAMP sequencing plus TinyALSA
+SYNC_PTR status queries preserving the application pointer.
+
 Linux board wiring now includes built-in BMC runtime and CH32 touch drivers.
 post-image compares the touch protocol header; deploy kernel and rootfs together.
 

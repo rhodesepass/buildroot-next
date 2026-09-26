@@ -66,7 +66,7 @@ new file mode 100644
 index 000000000..a6f68e563
 --- /dev/null
 +++ b/sound/soc/sunxi/sun20i-d1-codec-analog.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,259 @@
 +// SPDX-License-Identifier: GPL-2.0+
 +/*
 + * This driver supports the analog controls for the internal codec
@@ -75,6 +75,7 @@ index 000000000..a6f68e563
 + * Based on sun50i-codec-analog.c
 + */
 +
++#include <linux/delay.h>
 +#include <linux/io.h>
 +#include <linux/kernel.h>
 +#include <linux/module.h>
@@ -100,6 +101,8 @@ index 000000000..a6f68e563
 +#define SUN20I_D1_ADDA_DAC			(0x10)
 +#define SUN20I_D1_ADDA_DAC_DACL_EN			(15)
 +#define SUN20I_D1_ADDA_DAC_DACR_EN			(14)
++#define SUN20I_D1_ADDA_DAC_DACL_UNMUTE		(12)
++#define SUN20I_D1_ADDA_DAC_DACR_UNMUTE		(10)
 +
 +#define SUN20I_D1_ADDA_MICBIAS			(0x18)
 +#define SUN20I_D1_ADDA_MICBIAS_MMICBIASEN		(7)
@@ -109,6 +112,9 @@ index 000000000..a6f68e563
 +
 +#define SUN20I_D1_ADDA_HP2			(0x40)
 +#define SUN20I_D1_ADDA_HP2_HEADPHONE_GAIN		(28)
++
++#define SUN20I_D1_ADDA_POWER			(0x48)
++#define SUN20I_D1_ADDA_POWER_HPLDO_EN		(30)
 +
 +#define SUN20I_D1_ADDA_ADC_CUR_REG		(0x4C)
 +
@@ -163,7 +169,34 @@ index 000000000..a6f68e563
 +		      sun20i_d1_codec_mic3_src_enum),
 +};
 +
++static int sun20i_d1_codec_dac_power_event(struct snd_soc_dapm_widget *w,
++					 struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_component *component = snd_soc_dapm_to_component(w->dapm);
++	unsigned int mask = BIT(SUN20I_D1_ADDA_DAC_DACL_UNMUTE) |
++			    BIT(SUN20I_D1_ADDA_DAC_DACR_UNMUTE);
++	int ret;
++
++	/* The BSP lets HPLDO settle before unmuting either analog DAC. */
++	if (event == SND_SOC_DAPM_POST_PMU)
++		msleep(30);
++	ret = snd_soc_component_update_bits(component, SUN20I_D1_ADDA_DAC,
++			mask, event == SND_SOC_DAPM_POST_PMU ? mask : 0);
++	return ret < 0 ? ret : 0;
++}
++
++static int sun20i_d1_codec_ramp_event(struct snd_soc_dapm_widget *w,
++				    struct snd_kcontrol *kcontrol, int event)
++{
++	/* Match the BSP's automatic headphone ramp settling time. */
++	msleep(100);
++	return 0;
++}
++
 +static const struct snd_soc_dapm_widget sun20i_d1_codec_widgets[] = {
++	SND_SOC_DAPM_SUPPLY_S("DAC Analog Power", -1, SUN20I_D1_ADDA_POWER,
++		SUN20I_D1_ADDA_POWER_HPLDO_EN, 0, sun20i_d1_codec_dac_power_event,
++		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_PRE_PMD),
 +	/* DAC */
 +	SND_SOC_DAPM_DAC("Left DAC", NULL, SUN20I_D1_ADDA_DAC,
 +			 SUN20I_D1_ADDA_DAC_DACL_EN, 0),
@@ -187,8 +220,10 @@ index 000000000..a6f68e563
 +
 +	/* Headphone */
 +	SND_SOC_DAPM_OUTPUT("HP"),
-+	SND_SOC_DAPM_SUPPLY("RAMP Enable", SUN20I_D1_ADDA_RAMP,
-+			    SUN20I_D1_ADDA_RAMP_RD_EN, 0, NULL, 0),
++	SND_SOC_DAPM_OUT_DRV_E("Headphone Ramp", SUN20I_D1_ADDA_RAMP,
++		SUN20I_D1_ADDA_RAMP_RD_EN, 0, NULL, 0,
++		sun20i_d1_codec_ramp_event,
++		SND_SOC_DAPM_POST_PMU | SND_SOC_DAPM_POST_PMD),
 +
 +	/* Line input */
 +	SND_SOC_DAPM_INPUT("LINEIN"),
@@ -209,10 +244,13 @@ index 000000000..a6f68e563
 +};
 +
 +static const struct snd_soc_dapm_route sun20i_d1_codec_routes[] = {
++	{ "Left DAC", NULL, "DAC Analog Power" },
++	{ "Right DAC", NULL, "DAC Analog Power" },
++
 +	/* Headphone Routes */
-+	{ "HP", NULL, "Left DAC" },
-+	{ "HP", NULL, "Right DAC" },
-+	{ "HP", NULL, "RAMP Enable" },
++	{ "Headphone Ramp", NULL, "Left DAC" },
++	{ "Headphone Ramp", NULL, "Right DAC" },
++	{ "HP", NULL, "Headphone Ramp" },
 +
 +	/* Line input Routes */
 +	{ "ADC1", NULL, "ADC1 Mixer" },
@@ -599,12 +637,12 @@ index 93f511fb6..ba064c1de 100644
  
 +static const struct snd_soc_dapm_route sun20i_d1_codec_card_routes[] = {
 +	/* ADC Routes */
-+	{ "Left ADC", NULL, "ADC Enable" },
-+	{ "Right ADC", NULL, "ADC Enable" },
-+	{ "Left ADC", NULL, "ADC1 CH Enable" },
-+	{ "Right ADC", NULL, "ADC2 CH Enable" },
-+	{ "Codec Capture", NULL, "Left ADC" },
-+	{ "Codec Capture", NULL, "Right ADC" },
++	{ "ADC1", NULL, "ADC Enable" },
++	{ "ADC2", NULL, "ADC Enable" },
++	{ "ADC1", NULL, "ADC1 CH Enable" },
++	{ "ADC2", NULL, "ADC2 CH Enable" },
++	{ "Codec Capture", NULL, "ADC1" },
++	{ "Codec Capture", NULL, "ADC2" },
 +
 +	/* DAC Routes */
 +	{ "Left DAC", NULL, "DAC Enable" },

@@ -1,0 +1,33 @@
+From: ePass maintainers <epass@localhost>
+Subject: [PATCH] pcm: preserve the RW application pointer in state queries
+
+On architectures without status/control mmap, pcm_state() uses SYNC_PTR.
+Passing zero flags writes the cached application pointer back to the
+kernel. RW transfers advance only the kernel pointer, so the state query
+before the next transfer rewinds it and can prevent playback from ever
+reaching its start threshold.
+
+Read the current kernel control values for RW streams. Keep the existing
+pointer commit behavior for MMAP streams.
+
+Upstream: Not submitted
+Signed-off-by: ePass maintainers <epass@localhost>
+---
+ src/pcm.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/pcm.c b/src/pcm.c
+--- a/src/pcm.c
++++ b/src/pcm.c
+@@ -1404,7 +1404,10 @@
+ 
+ int pcm_state(struct pcm *pcm)
+ {
+-    int err = pcm_sync_ptr(pcm, 0);
++    /* RW ioctls advance the kernel appl_ptr, not our fallback copy. */
++    int flags = (pcm->flags & PCM_MMAP) ? 0 :
++        SNDRV_PCM_SYNC_PTR_APPL | SNDRV_PCM_SYNC_PTR_AVAIL_MIN;
++    int err = pcm_sync_ptr(pcm, flags);
+     if (err < 0)
+         return err;
+ 
